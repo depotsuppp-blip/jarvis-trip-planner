@@ -1,0 +1,161 @@
+# Jarvis - Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+# (or just run setup.bat, which does this for you inside a venv)
+
+# --- Core numerics -----------------------------------------------------
+# Backs audio frame handling in wake_word_engine.py (np.frombuffer, etc.)
+numpy>=1.24.0
+
+# --- Wake word detection (Module 1) -------------------------------------
+# Offline wake word engine. Ships the model *definitions*; the model
+# *files* are a separate one-time download - run `python train_jarvis.py`
+# (or openwakeword.utils.download_models()) or loading will fail with
+# NO_SUCHFILE.
+openwakeword>=0.6.0
+
+# ONNX runtime backend used by openWakeWord (WakeWordEngine defaults to
+# inference_framework="onnx").
+onnxruntime>=1.16.0
+
+# Microphone capture (PyAudio). Ships prebuilt wheels for Windows, so no
+# separate PortAudio/build-tools install is required on this platform.
+# Also required by SpeechRecognition's Microphone class.
+pyaudio>=0.2.13
+
+# --- Voice I/O (Module 3) -----------------------------------------------
+# The TTS side is a three-tier hybrid: ElevenLabs for short replies,
+# Edge-TTS for long ones, pyttsx3 when there is no network at all. Only
+# the third tier is required - the first two each degrade to the next.
+#
+# Tier 2: Microsoft Edge's neural voices over a free web socket API.
+# Jarvis uses en-GB-RyanNeural. No account and no API key needed.
+edge-tts>=7.0.0
+
+# Tier 3: local, offline text-to-speech. Drives SAPI5 on Windows,
+# NSSpeech on macOS, espeak on Linux. Pulls pywin32/comtypes on Windows.
+# This is the floor the other two fall back to, so keep it installed.
+pyttsx3>=2.90
+
+# Tier 1 (ElevenLabs) needs no dedicated SDK - voice_engine.py calls the
+# REST endpoint through httpx, which is declared under "Configuration"
+# below because it is shared with the Anthropic SDK.
+#
+# Audio playback needs no package either: MP3 is played through Windows'
+# built-in MCI interface (winmm) via ctypes, with ffplay/afplay/mpg123/
+# mpv as the fallback on other platforms.
+
+# Offline speech-to-text (Kaldi-based). Runs entirely on-device - no
+# API keys, no accounts, no audio ever leaves the machine.
+#
+# The pip package ships NO model weights. The ~40 MB English model is a
+# separate one-time download; without it, voice_engine.py falls back to
+# typed input. Fetch it with:
+#
+#     python vosk_manager.py
+#
+# NOTE: the SpeechRecognition package was deliberately REMOVED from this
+# project. Its default backend uploaded recorded audio to Google, which
+# broke the offline guarantee. Nothing imports it any more.
+vosk>=0.3.45
+
+# --- ACTIVE-mode speech-to-text (Module 9) ------------------------------
+# Bilingual (Thai + English) transcription for commands, via CTranslate2.
+# This is the second half of the hybrid STT stack: Vosk spots the wake
+# word cheaply while idle, Whisper transcribes the actual commands.
+#
+# CPU-only by default - it pulls ctranslate2 and av, NOT torch, so the
+# install stays small. A CUDA build of ctranslate2 is what enables
+# JARVIS_WHISPER_DEVICE=cuda; nothing else changes.
+#
+# Ships no weights either: the ~460 MB "small" model is downloaded once
+# into .models/whisper on first use. Fetch it ahead of time with:
+#
+#     python whisper_manager.py
+#
+# Without it, ACTIVE mode falls back to Vosk and English-only commands.
+faster-whisper>=1.0.0
+
+# --- On-demand vision (Module 11) ---------------------------------------
+# Screen capture for the "what am I looking at?" tool. Strictly on
+# demand: one screenshot is taken at the moment the tool is called, sent
+# to the vision model, and dropped. Nothing is captured in the
+# background, and nothing is kept between questions.
+#
+# mss does the capture (fast, no Win32/X boilerplate), Pillow does the
+# downscale and the JPEG encode. Both are optional: without them the
+# analyze_screen tool says it cannot see, and the assistant runs on.
+# Set JARVIS_VISION=0 to disable capture without uninstalling anything.
+mss>=9.0.0
+pillow>=10.0.0
+
+# --- Conversational brain / supervisor (Module 5) -----------------------
+# Two interchangeable LLM providers. Install both; llm_brain.py picks
+# Anthropic when ANTHROPIC_API_KEY is set and falls over to Gemini when
+# that key is missing or rejected.
+#
+# Anthropic SDK. Targets "claude-sonnet-5". NOTE: "claude-3-5-sonnet"
+# was retired on 2025-10-28 and now returns HTTP 404 - do not switch
+# back to it.
+anthropic>=0.40.0
+
+# Google's current Gen AI SDK. This is "google-genai", NOT the older
+# "google-generativeai" package - the two have different import paths
+# ("from google import genai" vs "import google.generativeai") and
+# incompatible request shapes. llm_brain.py is written against the
+# newer one; installing the old package will not satisfy it.
+google-genai>=1.0.0
+
+# Also the Gemini SDK for the Trip Planner Agent (plugins/trip_planner.py) -
+# it used to depend on the separate, older "google-generativeai" package
+# (google.generativeai.GenerativeModel), which was migrated off after that
+# package announced it "will no longer be receiving updates or bug fixes."
+# There is exactly one Gemini SDK in this project's dependency tree now;
+# do not reintroduce google-generativeai without a specific reason.
+
+# NOTE ON THE OFFLINE GUARANTEE: the network boundary has moved. Wake
+# word detection and speech-to-text are still 100% on-device, but
+# speech *out* now has cloud tiers (see Module 3). Set
+# JARVIS_TTS_OFFLINE_ONLY=1 in .env to force the mouth offline too.
+
+# --- Automation bridge (Module 6) ---------------------------------------
+# HTTP client used by n8n_trigger.py to POST to n8n Production Webhooks.
+# Timeouts are always passed explicitly; requests has no default one, and
+# a hung webhook would otherwise freeze the assistant mid-command.
+#
+# Also the HTTP client for plugins/trip_planner.py's Phase 1 sub-agents
+# (Open-Meteo, Google Geocoding/Places/Directions) - already declared
+# here, so the Trip Planner Agent needs no new HTTP dependency.
+requests>=2.31.0
+
+# --- Database connector (Module 7) --------------------------------------
+# PostgreSQL driver for db_connector.py. The "-binary" build ships
+# prebuilt wheels, so no local PostgreSQL headers or C compiler are
+# needed - which matters on Windows. Swap to plain "psycopg2" only if
+# you are building against a specific libpq.
+#
+# The connector opens read-only sessions and runs only the statements
+# registered in SAFE_QUERIES; point it at a SELECT-only role anyway.
+psycopg2-binary>=2.9.9
+
+# --- Configuration ------------------------------------------------------
+# Loads credentials (API keys, n8n webhook URLs, database password) from
+# a local .env file so none of them are hardcoded into a source file.
+# Copy .env.example to .env to configure.
+python-dotenv>=1.0.0
+
+# Async HTTP client. Used directly by voice_engine.py for the ElevenLabs
+# REST call - async so synthesis never blocks the assistant loop. The
+# anthropic SDK already vendors it as a dependency; it is pinned here
+# explicitly because this project now imports it in its own right.
+httpx>=0.27.0
+
+# --- Optional: custom wake word training --------------------------------
+# Only needed to train your own model from scratch (see train_jarvis.py
+# --check). The pretrained "hey_jarvis" model needs none of this.
+#
+# torch>=2.0.0
+# torchinfo>=1.8.0
+# torchmetrics>=1.0.0
+# pyyaml>=6.0
+# scipy>=1.10.0

@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n_stable
+    ports:
+      - "5678:5678" # ล็อกพอร์ตให้ชัดเจน หมดปัญหาเข้าไม่ได้
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://127.0.0.1:5678/ # สำคัญมากสำหรับการยิง Webhook
+    volumes:
+      - n8n_data:/home/node/.n8n # บันทึกข้อมูลถาวร คอนเทนเนอร์ลบ ข้อมูลก็ไม่หาย
+    restart: always # เปิดคอมมาปุ๊บ ให้มันรันเองเลย (ถ้าระบบ Docker รันอยู่)
+
+volumes:
+  n8n_data:

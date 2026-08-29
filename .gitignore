@@ -1,0 +1,23 @@
+# --- Secrets ------------------------------------------------------------
+# .env holds a live Anthropic API key. Never commit it.
+# .env.example is the safe, checked-in template.
+.env
+*.key
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# --- Jarvis runtime artifacts -------------------------------------------
+# Downloaded Vosk speech model (~70 MB, refetch with: python vosk_manager.py)
+.models/
+
+# Local session memory
+memory.json
+
+# Custom wake word training output
+jarvis_training_output/
+my_jarvis.yaml
