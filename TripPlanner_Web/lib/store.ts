@@ -1,67 +1,14 @@
 /**
- * Mock "database" for the Trip Planner foundation.
- *
- * Backed by two flat JSON files under .data/ (created on first write) rather
- * than a bare in-memory array or object: Next.js's dev server reloads route
- * handler modules on file changes, which would silently wipe a plain
- * module-level array between edits. A file on disk survives that, and a
- * real database can replace these functions later without touching any
- * caller - every route handler only ever imports the functions below, never
- * the file paths themselves.
+ * Persistence for the Trip Planner foundation, backed by Postgres (Neon)
+ * via Prisma - see prisma/schema.prisma. This used to be two flat JSON
+ * files under .data/, which worked in local dev (writable disk) but
+ * crashed in production: Vercel serverless functions have a read-only
+ * filesystem outside of /tmp, and /tmp itself is ephemeral and not
+ * shared across instances, so votes would vanish or 500 depending on
+ * which instance handled the next request.
  */
 
-import { promises as fs } from "fs";
-import path from "path";
-
-const DATA_DIR = path.join(process.cwd(), ".data");
-
-async function ensureDataDir(): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-}
-
-async function readJsonFile<T>(filename: string, fallback: T): Promise<T> {
-  await ensureDataDir();
-  const filePath = path.join(DATA_DIR, filename);
-  try {
-    const raw = await fs.readFile(filePath, "utf-8");
-    return JSON.parse(raw) as T;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return fallback;
-    }
-    throw error;
-  }
-}
-
-async function writeJsonFile<T>(filename: string, data: T): Promise<void> {
-  await ensureDataDir();
-  const filePath = path.join(DATA_DIR, filename);
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
-}
-
-/**
- * Serializes read-modify-write cycles per file within this process, so
- * two requests racing each other (e.g. a double-tap POST /api/poll/[id])
- * can't both read the same starting state and each write back a result
- * that drops the other's change. Only holds within one server
- * instance/process - a real database's transactions would be needed for
- * a cross-instance guarantee, which this mock store deliberately defers
- * (see the module docstring above).
- */
-const writeQueues = new Map<string, Promise<unknown>>();
-
-async function withFileLock<T>(filename: string, fn: () => Promise<T>): Promise<T> {
-  const previous = writeQueues.get(filename) ?? Promise.resolve();
-  const run = previous.then(fn, fn);
-  writeQueues.set(
-    filename,
-    run.then(
-      () => undefined,
-      () => undefined
-    )
-  );
-  return run;
-}
+import { prisma } from "./prisma";
 
 // ---------------------------------------------------------------------
 // Consensus poll votes - one trip id maps to a list of friends' entries
@@ -83,11 +30,20 @@ export interface PollVote {
   submittedAt: string;
 }
 
-const POLLS_FILE = "polls.json";
-
 export async function getPollVotes(tripId: string): Promise<PollVote[]> {
-  const all = await readJsonFile<Record<string, PollVote[]>>(POLLS_FILE, {});
-  return all[tripId] ?? [];
+  const rows = await prisma.pollVote.findMany({
+    where: { tripId },
+    orderBy: { submittedAt: "asc" },
+  });
+  return rows.map((row) => ({
+    name: row.name,
+    lineUserId: row.lineUserId,
+    startDate: row.startDate,
+    endDate: row.endDate,
+    wishlist: row.wishlist,
+    vibes: row.vibes,
+    submittedAt: row.submittedAt.toISOString(),
+  }));
 }
 
 /**
@@ -99,29 +55,52 @@ export async function getPollVotes(tripId: string): Promise<PollVote[]> {
  * side) are matched by name instead, since that self-reported string
  * is the only identity an anonymous submission has.
  */
-function isSameVoter(a: PollVote, b: PollVote): boolean {
-  if (a.lineUserId || b.lineUserId) {
-    return a.lineUserId === b.lineUserId && a.lineUserId !== "";
-  }
-  return a.name.trim().toLowerCase() === b.name.trim().toLowerCase();
+function isSameVoterName(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
 export async function addPollVote(
   tripId: string,
   vote: PollVote
 ): Promise<PollVote[]> {
-  return withFileLock(POLLS_FILE, async () => {
-    const all = await readJsonFile<Record<string, PollVote[]>>(POLLS_FILE, {});
-    // One vote per voter per trip - a resubmission (a double-tap on the
-    // button, or someone changing their mind and voting again) replaces
-    // their previous entry instead of appending a duplicate. See
-    // isSameVoter for what "per voter" means for an anonymous vote.
-    const existing = (all[tripId] ?? []).filter((v) => !isSameVoter(v, vote));
-    const votes = [...existing, vote];
-    all[tripId] = votes;
-    await writeJsonFile(POLLS_FILE, all);
-    return votes;
+  // One vote per voter per trip - a resubmission (a double-tap on the
+  // button, or someone changing their mind and voting again) replaces
+  // their previous entry instead of appending a duplicate. Delete +
+  // create run in one DB transaction so a concurrent read never
+  // observes a voter with zero or two rows.
+  await prisma.$transaction(async (tx) => {
+    if (vote.lineUserId) {
+      await tx.pollVote.deleteMany({
+        where: { tripId, lineUserId: vote.lineUserId },
+      });
+    } else {
+      const anonymousRows = await tx.pollVote.findMany({
+        where: { tripId, lineUserId: "" },
+        select: { id: true, name: true },
+      });
+      const staleIds = anonymousRows
+        .filter((row) => isSameVoterName(row.name, vote.name))
+        .map((row) => row.id);
+      if (staleIds.length > 0) {
+        await tx.pollVote.deleteMany({ where: { id: { in: staleIds } } });
+      }
+    }
+
+    await tx.pollVote.create({
+      data: {
+        tripId,
+        name: vote.name,
+        lineUserId: vote.lineUserId,
+        startDate: vote.startDate,
+        endDate: vote.endDate,
+        wishlist: vote.wishlist,
+        vibes: vote.vibes,
+        submittedAt: new Date(vote.submittedAt),
+      },
+    });
   });
+
+  return getPollVotes(tripId);
 }
 
 // ---------------------------------------------------------------------
@@ -133,22 +112,20 @@ export interface TripDraft {
   updatedAt: string;
 }
 
-const DRAFTS_FILE = "drafts.json";
-
 export async function getDraft(tripId: string): Promise<TripDraft | null> {
-  const all = await readJsonFile<Record<string, TripDraft>>(DRAFTS_FILE, {});
-  return all[tripId] ?? null;
+  const row = await prisma.tripDraft.findUnique({ where: { tripId } });
+  if (!row) return null;
+  return { text: row.text, updatedAt: row.updatedAt.toISOString() };
 }
 
 export async function saveDraft(
   tripId: string,
   text: string
 ): Promise<TripDraft> {
-  return withFileLock(DRAFTS_FILE, async () => {
-    const all = await readJsonFile<Record<string, TripDraft>>(DRAFTS_FILE, {});
-    const draft: TripDraft = { text, updatedAt: new Date().toISOString() };
-    all[tripId] = draft;
-    await writeJsonFile(DRAFTS_FILE, all);
-    return draft;
+  const row = await prisma.tripDraft.upsert({
+    where: { tripId },
+    create: { tripId, text },
+    update: { text },
   });
+  return { text: row.text, updatedAt: row.updatedAt.toISOString() };
 }

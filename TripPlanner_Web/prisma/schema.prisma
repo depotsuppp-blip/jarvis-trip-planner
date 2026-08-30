@@ -1,0 +1,31 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// One row per voter per trip - see isSameVoter in lib/store.ts for how a
+// resubmission (same lineUserId, or same name for an anonymous voter) is
+// deduped by deleting the prior row before inserting the new one.
+model PollVote {
+  id          String   @id @default(cuid())
+  tripId      String
+  name        String
+  lineUserId  String   @default("")
+  startDate   String   @default("")
+  endDate     String   @default("")
+  wishlist    String   @default("")
+  vibes       String[] @default([])
+  submittedAt DateTime @default(now())
+
+  @@index([tripId])
+}
+
+// One row per trip - the solo draft board's evolving text blob.
+model TripDraft {
+  tripId    String   @id
+  text      String
+  updatedAt DateTime @updatedAt
+}

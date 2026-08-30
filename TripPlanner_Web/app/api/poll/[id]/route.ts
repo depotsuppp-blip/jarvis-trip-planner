@@ -90,19 +90,30 @@ function verifyHmacSignature(request: NextRequest, id: string): string | null {
 export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
 
-  const authError = verifyHmacSignature(request, id);
-  if (authError) {
-    return NextResponse.json({ error: authError }, { status: 401 });
-  }
+  try {
+    const authError = verifyHmacSignature(request, id);
+    if (authError) {
+      return NextResponse.json({ error: authError }, { status: 401 });
+    }
 
-  const votes = await getPollVotes(id);
-  // `summary` is additive - existing consumers (the Poll and Dashboard
-  // pages) keep reading `votes` unchanged. It exists so a consumer that
-  // just wants totals - notably plugins/trip_planner.py's
-  // finalize_trip_plan_async on the Python side - gets one clean object
-  // instead of re-implementing this same tallying logic in a second
-  // language.
-  return NextResponse.json({ tripId: id, votes, summary: summarizePollVotes(votes) });
+    const votes = await getPollVotes(id);
+    // `summary` is additive - existing consumers (the Poll and Dashboard
+    // pages) keep reading `votes` unchanged. It exists so a consumer that
+    // just wants totals - notably plugins/trip_planner.py's
+    // finalize_trip_plan_async on the Python side - gets one clean object
+    // instead of re-implementing this same tallying logic in a second
+    // language.
+    return NextResponse.json({ tripId: id, votes, summary: summarizePollVotes(votes) });
+  } catch (error) {
+    // An uncaught throw here (e.g. a corrupted .data/polls.json, a disk
+    // error) previously escaped as a bare connection drop instead of a
+    // JSON response - see the same rationale on POST below.
+    console.error(`GET /api/poll/${id} failed:`, error);
+    return NextResponse.json(
+      { error: "Something went wrong while loading this poll." },
+      { status: 500 }
+    );
+  }
 }
 
 /**
@@ -121,6 +132,25 @@ function clientIp(request: NextRequest): string {
 export async function POST(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
 
+  try {
+    return await handlePollVote(request, id);
+  } catch (error) {
+    // Last-resort net: anything unexpected here (a corrupted
+    // .data/polls.json, a disk/fs error inside addPollVote, etc.) used to
+    // escape as an unhandled exception - which Vercel/Next.js surfaces to
+    // the browser as a connection drop (ERR_ABORTED) with no response
+    // body at all, not a normal 500. Logging the full error server-side
+    // and always returning JSON keeps the frontend able to show the user
+    // something instead of a silent failure.
+    console.error(`POST /api/poll/${id} failed:`, error);
+    return NextResponse.json(
+      { error: "Something went wrong while submitting your vote. Please try again." },
+      { status: 500 }
+    );
+  }
+}
+
+async function handlePollVote(request: NextRequest, id: string): Promise<NextResponse> {
   // A LINE session is now optional, not required - see
   // app/trip/poll/[id]/page.tsx, which no longer forces a liff.login()
   // redirect before voting is possible (that redirect proved unreliable
