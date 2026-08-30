@@ -8,6 +8,7 @@
  * which instance handled the next request.
  */
 
+import crypto from "crypto";
 import { prisma } from "./prisma";
 
 // ---------------------------------------------------------------------
@@ -47,6 +48,23 @@ export async function getPollVotes(tripId: string): Promise<PollVote[]> {
 }
 
 /**
+ * "line:<lineUserId>" or "anon:<anonId>" - whichever identity this vote
+ * actually carries - or a one-off value that can never collide when
+ * neither is available (an old cached client that predates anonId, or
+ * localStorage unavailable), so that submission is simply never deduped
+ * rather than colliding with an unrelated voter. See voterKey's comment
+ * in prisma/schema.prisma for why this can't just be lineUserId or
+ * anonId directly: both default to "" and every anonymous row would
+ * otherwise collide with every other anonymous row on lineUserId="" (and
+ * likewise every verified row on anonId="").
+ */
+function computeVoterKey(lineUserId: string, anonId: string): string {
+  if (lineUserId) return `line:${lineUserId}`;
+  if (anonId) return `anon:${anonId}`;
+  return `once:${crypto.randomUUID()}`;
+}
+
+/**
  * anonId is the dedup key for a resubmission with no verified LINE
  * session - a client-generated UUID persisted in the voter's browser
  * localStorage (see anonVoterId: in app/trip/poll/[id]/page.tsx), NOT
@@ -60,40 +78,40 @@ export async function addPollVote(
   vote: PollVote,
   anonId: string
 ): Promise<PollVote[]> {
+  const resolvedAnonId = vote.lineUserId ? "" : anonId;
+  const voterKey = computeVoterKey(vote.lineUserId, resolvedAnonId);
+
   // One vote per voter per trip - a resubmission (a double-tap on the
   // button, or someone changing their mind and voting again) replaces
-  // their previous entry instead of appending a duplicate. Delete +
-  // create run in one DB transaction so a concurrent read never
-  // observes a voter with zero or two rows.
-  await prisma.$transaction(async (tx) => {
-    if (vote.lineUserId) {
-      await tx.pollVote.deleteMany({
-        where: { tripId, lineUserId: vote.lineUserId },
-      });
-    } else if (anonId) {
-      await tx.pollVote.deleteMany({
-        where: { tripId, lineUserId: "", anonId },
-      });
-    }
-    // No lineUserId AND no anonId (e.g. an old cached client that
-    // predates anonId, or localStorage unavailable) - nothing to key a
-    // dedup lookup off, so this submission is simply never matched
-    // against a prior one. It still inserts below like a first-time
-    // vote, rather than being rejected.
-
-    await tx.pollVote.create({
-      data: {
-        tripId,
-        name: vote.name,
-        lineUserId: vote.lineUserId,
-        anonId: vote.lineUserId ? "" : anonId,
-        startDate: vote.startDate,
-        endDate: vote.endDate,
-        wishlist: vote.wishlist,
-        vibes: vote.vibes,
-        submittedAt: new Date(vote.submittedAt),
-      },
-    });
+  // their previous entry instead of appending a duplicate. This is a
+  // single atomic INSERT ... ON CONFLICT DO UPDATE against the
+  // @@unique([tripId, voterKey]) constraint in prisma/schema.prisma, so
+  // two concurrent requests from the same voter (a genuine double-tap
+  // firing overlapping requests) can't both pass a "no existing row"
+  // check and each insert - the database itself serializes them, unlike
+  // an application-level check-then-write.
+  await prisma.pollVote.upsert({
+    where: { tripId_voterKey: { tripId, voterKey } },
+    create: {
+      tripId,
+      voterKey,
+      name: vote.name,
+      lineUserId: vote.lineUserId,
+      anonId: resolvedAnonId,
+      startDate: vote.startDate,
+      endDate: vote.endDate,
+      wishlist: vote.wishlist,
+      vibes: vote.vibes,
+      submittedAt: new Date(vote.submittedAt),
+    },
+    update: {
+      name: vote.name,
+      startDate: vote.startDate,
+      endDate: vote.endDate,
+      wishlist: vote.wishlist,
+      vibes: vote.vibes,
+      submittedAt: new Date(vote.submittedAt),
+    },
   });
 
   return getPollVotes(tripId);

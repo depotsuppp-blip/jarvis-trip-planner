@@ -6,29 +6,39 @@ datasource db {
   provider = "postgresql"
 }
 
-// One row per voter per trip - see isSameAnonVoter/lineUserId matching in
-// lib/store.ts for how a resubmission (same lineUserId for a verified
-// voter, same anonId for an anonymous one - never the typed name, which
-// two different people can share) is deduped by deleting the prior row
-// before inserting the new one.
+// One row per voter per trip. A resubmission (double-tap, or genuinely
+// changing your mind) replaces the prior row rather than appending a
+// duplicate - enforced by the database itself via @@unique([tripId,
+// voterKey]) and addPollVote's upsert() in lib/store.ts, not just an
+// application-level check-then-write, so two concurrent requests from
+// the same voter can't race past each other into two rows.
 model PollVote {
   id          String   @id @default(cuid())
   tripId      String
   name        String
   lineUserId  String   @default("")
   /// Client-generated UUID, persisted in the voter's browser localStorage
-  /// (see anonVoterId: in app/trip/poll/[id]/page.tsx) - the dedup key
-  /// for a voter with no verified LINE session. Empty for a verified
-  /// vote, where lineUserId is the key instead.
+  /// (see anonVoterId: in app/trip/poll/[id]/page.tsx) - identifies a
+  /// voter with no verified LINE session. Empty for a verified vote,
+  /// where lineUserId is the identity instead.
   anonId      String   @default("")
+  /// "line:<lineUserId>" or "anon:<anonId>" - whichever identity this
+  /// row actually has - or a one-off "once:<random>" when neither is
+  /// available (an old cached client, or localStorage unavailable), so
+  /// that row never collides with anything and is simply never deduped.
+  /// This, not lineUserId or anonId alone, is what @@unique enforces:
+  /// both of those default to "" and every anonymous row would otherwise
+  /// collide on lineUserId="" (and likewise every verified row on
+  /// anonId=""), so neither column alone can carry a real DB constraint.
+  voterKey    String
   startDate   String   @default("")
   endDate     String   @default("")
   wishlist    String   @default("")
   vibes       String[] @default([])
   submittedAt DateTime @default(now())
 
+  @@unique([tripId, voterKey])
   @@index([tripId])
-  @@index([tripId, anonId])
 }
 
 // One row per trip - the solo draft board's evolving text blob.
