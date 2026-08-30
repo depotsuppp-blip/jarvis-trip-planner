@@ -16,6 +16,19 @@ interface PollVote {
   submittedAt: string;
 }
 
+interface ItineraryDay {
+  day: number;
+  summary: string;
+  activities: string[];
+  meals: string[];
+}
+
+interface Itinerary {
+  destination: string;
+  days: ItineraryDay[];
+  notes: string;
+}
+
 const fieldClass =
   "mt-1.5 w-full rounded-2xl border border-white/10 bg-[#222222] px-4 py-3.5 text-base text-white placeholder:text-zinc-500 shadow-inner shadow-black/20 outline-none transition focus:border-white/25 focus:bg-[#262626] focus:ring-4 focus:ring-white/5";
 const labelClass = "text-xs font-semibold uppercase tracking-wider text-zinc-400";
@@ -156,6 +169,7 @@ export default function TripPollPage({
   const [isAdmin, setIsAdmin] = useState(true);
   const [isLocking, setIsLocking] = useState(false);
   const [lockError, setLockError] = useState("");
+  const [generatedPlan, setGeneratedPlan] = useState<Itinerary | null>(null);
 
   function toggleVibe(vibe: string) {
     setVibes((prev) =>
@@ -352,11 +366,23 @@ export default function TripPollPage({
         body: JSON.stringify({ trip_id: id }),
       });
 
+      const data = await response.json().catch(() => null);
+
       if (!response.ok) {
-        throw new Error("Trigger request failed.");
+        throw new Error(
+          typeof data?.error === "string" ? data.error : "Trigger request failed."
+        );
       }
-    } catch {
-      setLockError("Couldn't start plan generation. Please try again.");
+
+      if (data?.itinerary) {
+        setGeneratedPlan(data.itinerary as Itinerary);
+      }
+    } catch (error) {
+      setLockError(
+        error instanceof Error && error.message
+          ? error.message
+          : "Couldn't start plan generation. Please try again."
+      );
     } finally {
       setIsLocking(false);
     }
@@ -378,6 +404,45 @@ export default function TripPollPage({
         {lockError && <p className="text-sm text-red-400">{lockError}</p>}
 
         <BoardingPass id={id} votes={votes} />
+
+        {generatedPlan && (
+          <section className="rounded-3xl border border-emerald-500/20 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-base font-semibold text-white">
+                Plan ready: {generatedPlan.destination}
+              </h2>
+              <span className="shrink-0 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-400/90">
+                Locked
+              </span>
+            </div>
+
+            <ul className="mt-4 space-y-4">
+              {generatedPlan.days.map((day) => (
+                <li key={day.day} className="rounded-2xl border border-white/10 bg-[#141414] p-4">
+                  <p className="text-sm font-semibold text-white">
+                    Day {day.day} - {day.summary}
+                  </p>
+                  {day.activities.length > 0 && (
+                    <p className="mt-2 text-xs text-zinc-400">
+                      <span className="text-zinc-500">Activities: </span>
+                      {day.activities.join(", ")}
+                    </p>
+                  )}
+                  {day.meals.length > 0 && (
+                    <p className="mt-1 text-xs text-zinc-400">
+                      <span className="text-zinc-500">Meals: </span>
+                      {day.meals.join(", ")}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+
+            {generatedPlan.notes && (
+              <p className="mt-4 text-sm text-zinc-300">{generatedPlan.notes}</p>
+            )}
+          </section>
+        )}
 
         <section className="rounded-3xl border border-white/10 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
           <h2 className="text-base font-semibold text-white">

@@ -41,9 +41,20 @@ model PollVote {
   @@index([tripId])
 }
 
-// One row per trip - the solo draft board's evolving text blob.
+// One row per trip - the solo draft board's evolving text blob. Also
+// doubles as storage for a locked consensus poll's generated itinerary
+// (JSON-stringified) - see app/api/trigger-jarvis/route.ts.
 model TripDraft {
   tripId    String   @id
   text      String
   updatedAt DateTime @updatedAt
+}
+
+// One row per trip that has been locked - see POST /api/trigger-jarvis.
+// Absence of a row means "not locked yet", same as PollVote/TripDraft's
+// "no row = nothing yet" convention elsewhere in this schema.
+model Poll {
+  tripId   String    @id
+  locked   Boolean   @default(false)
+  lockedAt DateTime?
 }

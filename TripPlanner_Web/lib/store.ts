@@ -143,3 +143,21 @@ export async function saveDraft(
   });
   return { text: row.text, updatedAt: row.updatedAt.toISOString() };
 }
+
+// ---------------------------------------------------------------------
+// Poll lock status - set once "Lock & Generate Plan" (POST
+// /api/trigger-jarvis) has generated an itinerary for a trip
+// ---------------------------------------------------------------------
+
+export async function isPollLocked(tripId: string): Promise<boolean> {
+  const row = await prisma.poll.findUnique({ where: { tripId } });
+  return row?.locked ?? false;
+}
+
+export async function lockPoll(tripId: string): Promise<void> {
+  await prisma.poll.upsert({
+    where: { tripId },
+    create: { tripId, locked: true, lockedAt: new Date() },
+    update: { locked: true, lockedAt: new Date() },
+  });
+}
