@@ -2,6 +2,14 @@ import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { addPollVote, getPollVotes, type PollVote } from "@/lib/store";
 import { summarizePollVotes } from "@/lib/tripSummary";
+import { verifyBearerLineToken } from "@/lib/lineAuth";
+import { checkRateLimit } from "@/lib/rateLimit";
+
+// A generous allowance for legitimate double-taps/retries while still
+// stopping a runaway client loop - this is a low-stakes vote, not the
+// costly LLM-triggering action /api/trigger-jarvis guards.
+const VOTE_RATE_LIMIT = 10;
+const VOTE_RATE_WINDOW_MS = 60_000;
 
 // params is a Promise in this Next.js version, not a plain object - see
 // node_modules/next/dist/docs/01-app/03-api-reference/03-file-conventions/route.md.
@@ -14,21 +22,38 @@ const MAX_TIMESTAMP_SKEW_SECONDS = 300;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/i;
 
 /**
- * HMAC gate for GET - the only caller today is
+ * HMAC check for GET, verified ONLY when a caller actually presents
+ * X-Ts/X-Sig headers - today that's exclusively
  * plugins/trip_planner.py's _fetch_poll_data (see that file for the
  * matching signature generation), which needs API_SECRET_KEY and
  * TRIP_API_SECRET_KEY to hold the identical shared-secret value despite
- * the different variable names on each side. Returns an error message
- * on failure, or null when the request is authenticated.
+ * the different variable names on each side.
+ *
+ * A request with NEITHER header is treated as an ordinary anonymous
+ * read, not rejected - the poll and dashboard pages themselves
+ * (app/trip/poll/[id]/page.tsx, app/trip/dashboard/[id]/page.tsx) call
+ * this same GET from the browser with no signature at all, and already
+ * display these same votes to anyone holding the trip link with no
+ * login required. Requiring a signature here without ever updating
+ * those two callers to send one made every browser load 401 - trip id
+ * unguessability is this app's actual access-control boundary for a
+ * read, same as the equally unauthenticated GET /api/draft/[id].
+ * A signature that IS present is still fully verified below, so
+ * plugins/trip_planner.py's calls are unaffected and a forged one is
+ * still rejected.
  */
 function verifyHmacSignature(request: NextRequest, id: string): string | null {
+  const ts = request.headers.get("x-ts");
+  const sig = request.headers.get("x-sig");
+  if (!ts && !sig) {
+    return null;
+  }
+
   const secret = process.env.API_SECRET_KEY;
   if (!secret) {
     return "API_SECRET_KEY is not configured.";
   }
 
-  const ts = request.headers.get("x-ts");
-  const sig = request.headers.get("x-sig");
   if (!ts || !sig) {
     return "Missing X-Ts/X-Sig headers.";
   }
@@ -81,68 +106,47 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 }
 
 /**
- * Verifies a LINE LIFF ID token against LINE's own verification endpoint
- * and returns the trusted LINE user id (claims.sub) on success. Returns
- * null on any failure - missing config, network error, non-2xx, or a
- * claim that doesn't check out - so the caller always gets a clean
- * "unauthenticated" signal rather than having to distinguish failure
- * modes itself.
+ * Best-effort caller IP for rate-limiting an anonymous vote, which has
+ * no lineUserId to key by. Vercel sets X-Forwarded-For; falls back to a
+ * single shared bucket if it's absent (e.g. local dev), which is
+ * strictly a lower bound on protection, never a hole relative to today
+ * - unauthenticated voting is new, so there was no per-caller limit at
+ * all on this path before.
  */
-async function verifyLineIdToken(idToken: string): Promise<string | null> {
-  const clientId = process.env.LINE_CHANNEL_ID;
-  if (!clientId) {
-    console.error("LINE_CHANNEL_ID is not configured; cannot verify ID tokens.");
-    return null;
-  }
-
-  let response: Response;
-  try {
-    response = await fetch("https://api.line.me/oauth2/v2.1/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ id_token: idToken, client_id: clientId }),
-    });
-  } catch {
-    return null;
-  }
-
-  if (!response.ok) {
-    return null;
-  }
-
-  const claims = await response.json().catch(() => null);
-  if (!claims || typeof claims.sub !== "string" || !claims.sub) {
-    return null;
-  }
-  if (claims.aud !== clientId) {
-    return null;
-  }
-  if (claims.iss !== "https://access.line.me") {
-    return null;
-  }
-  if (typeof claims.exp !== "number" || claims.exp * 1000 <= Date.now()) {
-    return null;
-  }
-
-  return claims.sub;
+function clientIp(request: NextRequest): string {
+  const forwarded = request.headers.get("x-forwarded-for");
+  return forwarded ? forwarded.split(",")[0].trim() : "unknown";
 }
 
 export async function POST(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
 
-  const [scheme, idToken] = (request.headers.get("authorization") || "").split(" ");
-  if (scheme !== "Bearer" || !idToken) {
-    return NextResponse.json(
-      { error: "Missing or invalid Authorization header." },
-      { status: 401 }
-    );
+  // A LINE session is now optional, not required - see
+  // app/trip/poll/[id]/page.tsx, which no longer forces a liff.login()
+  // redirect before voting is possible (that redirect proved unreliable
+  // in real testing). A header that IS present must still check out,
+  // though: a present-but-bad token fails loudly (401) rather than
+  // silently downgrading to an anonymous vote the user wouldn't know
+  // about. Only a request with NO Authorization header at all is
+  // treated as an intentional anonymous submission.
+  const authHeader = request.headers.get("authorization");
+  let lineUserId = "";
+  if (authHeader) {
+    lineUserId = (await verifyBearerLineToken(authHeader)) || "";
+    if (!lineUserId) {
+      return NextResponse.json(
+        { error: "Invalid or expired LINE ID token." },
+        { status: 401 }
+      );
+    }
   }
 
-  const lineUserId = await verifyLineIdToken(idToken);
-  if (!lineUserId) {
+  const rateLimitKey = lineUserId ? `vote:${lineUserId}` : `vote:anon:${clientIp(request)}`;
+  const rateLimit = checkRateLimit(rateLimitKey, VOTE_RATE_LIMIT, VOTE_RATE_WINDOW_MS);
+  if (!rateLimit.allowed) {
     return NextResponse.json(
-      { error: "Invalid or expired LINE ID token." },
-      { status: 401 }
+      { error: "Too many votes submitted - please wait a moment and try again." },
+      { status: 429, headers: { "Retry-After": String(rateLimit.retryAfterSeconds) } }
     );
   }
 

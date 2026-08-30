@@ -1,7 +1,7 @@
 "use client";
 
 import { use, useEffect, useState, type FormEvent } from "react";
-import liff from "@line/liff";
+import { ensureLiffInit, liff } from "@/lib/liff";
 import { PageHeader } from "@/components/PageHeader";
 import { StickyActionButton } from "@/components/StickyActionButton";
 import { computeDateRangeLabel } from "@/lib/tripSummary";
@@ -14,12 +14,6 @@ interface PollVote {
   wishlist: string;
   vibes: string[];
   submittedAt: string;
-}
-
-interface LineProfile {
-  userId: string;
-  displayName: string;
-  pictureUrl?: string;
 }
 
 const fieldClass =
@@ -128,8 +122,18 @@ export default function TripPollPage({
   const [votes, setVotes] = useState<PollVote[]>([]);
   const [isLoadingVotes, setIsLoadingVotes] = useState(true);
 
-  const [lineProfile, setLineProfile] = useState<LineProfile | null>(null);
-  const [liffError, setLiffError] = useState("");
+  // LINE identity is now a silent, best-effort enhancement, never a
+  // gate - see the initLiff effect below. `ready` only ever decides
+  // whether the name field shows a silent LINE prefill or stays empty
+  // for manual entry; it never blocks the form itself.
+  const [displayName, setDisplayName] = useState("");
+  const [idToken, setIdToken] = useState("");
+  const [ready, setReady] = useState(false);
+
+  // Soft, client-side-only double-tap guard for the unauthenticated
+  // path - see handleSubmit. Not a security control: a different
+  // browser, device, or cleared site data votes again freely.
+  const [hasVotedOnThisDevice, setHasVotedOnThisDevice] = useState(false);
 
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
@@ -155,33 +159,33 @@ export default function TripPollPage({
     let cancelled = false;
 
     async function initLiff() {
-      const liffId = process.env.NEXT_PUBLIC_LIFF_ID;
-      if (!liffId) {
-        if (!cancelled) setLiffError("LINE login isn't configured for this app.");
-        return;
+      // ensureLiffInit() wraps liff.init() and never throws - it
+      // returns false on any failure (missing NEXT_PUBLIC_LIFF_ID,
+      // strict browser tracking prevention blocking the storage LIFF
+      // needs, etc.) - see lib/liff.ts. This deliberately NEVER calls
+      // liff.login(): the mandatory login redirect used to gate voting
+      // entirely, and real testing showed it repeatedly breaking (wrong
+      // redirectUri landing users back on "/" stuck on "Logging in...").
+      // LINE identity is now a silent, best-effort attachment only - if
+      // isLoggedIn() already happens to be true (typically LINE's own
+      // in-app browser), the name field is prefilled and the vote is
+      // sent with a verified id token; otherwise voting proceeds with a
+      // manually-typed name and no token at all. Either way this never
+      // blocks the form - see `ready` below, which only ever decides
+      // between a prefilled and an empty name field.
+      const ok = await ensureLiffInit();
+      if (!cancelled && ok && liff.isLoggedIn()) {
+        try {
+          const profile = await liff.getProfile();
+          if (!cancelled) {
+            setDisplayName(profile.displayName);
+            setIdToken(liff.getIDToken() || "");
+          }
+        } catch (e) {
+          console.warn("LIFF profile fetch failed, falling back to manual name entry", e);
+        }
       }
-
-      try {
-        await liff.init({ liffId });
-        if (!liff.isLoggedIn()) {
-          // Redirects to LINE's login screen and back - nothing after
-          // this line runs in the current page load.
-          liff.login();
-          return;
-        }
-        const profile = await liff.getProfile();
-        if (!cancelled) {
-          setLineProfile({
-            userId: profile.userId,
-            displayName: profile.displayName,
-            pictureUrl: profile.pictureUrl,
-          });
-        }
-      } catch {
-        if (!cancelled) {
-          setLiffError("Couldn't sign you in with LINE. Please reopen this link from LINE.");
-        }
-      }
+      if (!cancelled) setReady(true);
     }
 
     initLiff();
@@ -189,6 +193,23 @@ export default function TripPollPage({
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    // Wrapped in a microtask (rather than reading localStorage directly
+    // in the effect body) so this reads as "synchronize with an
+    // external system," not "derive state during render" - matches
+    // loadVotes below, which defers its setState calls the same way by
+    // virtue of being async.
+    queueMicrotask(() => {
+      try {
+        setHasVotedOnThisDevice(localStorage.getItem(`voted:${id}`) === "1");
+      } catch {
+        // localStorage can be unavailable (private browsing, blocked
+        // site data) - this is only a soft double-tap safeguard, not a
+        // security control, so failing open here costs nothing real.
+      }
+    });
+  }, [id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -219,8 +240,14 @@ export default function TripPollPage({
     event.preventDefault();
     setError("");
 
-    if (!lineProfile) {
-      setError("Please wait for LINE sign-in to finish before voting.");
+    const trimmedName = displayName.trim();
+    if (!trimmedName) {
+      setError("Please enter your name to vote.");
+      return;
+    }
+
+    if (!idToken && hasVotedOnThisDevice) {
+      setError("You've already voted on this device.");
       return;
     }
 
@@ -236,22 +263,22 @@ export default function TripPollPage({
 
     setIsSubmitting(true);
     try {
-      // The trusted user id now comes from server-side verification of
-      // this token (see app/api/poll/[id]/route.ts's POST handler) - the
-      // client no longer sends lineProfile.userId at all.
-      const idToken = liff.getIDToken();
-      if (!idToken) {
-        throw new Error("LINE ID token unavailable.");
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (idToken) {
+        // A verified LINE session was silently attached - send it so
+        // the server trusts claims.sub, not just the typed name (see
+        // app/api/poll/[id]/route.ts's POST handler). Omitted entirely
+        // when there is no token: the server treats a request with NO
+        // Authorization header as an intentional anonymous vote, not an
+        // error.
+        headers.Authorization = `Bearer ${idToken}`;
       }
 
       const response = await fetch(`/api/poll/${id}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${idToken}`,
-        },
+        headers,
         body: JSON.stringify({
-          name: lineProfile.displayName,
+          name: trimmedName,
           startDate,
           endDate,
           wishlist: wishlist.trim(),
@@ -265,6 +292,16 @@ export default function TripPollPage({
 
       const data = await response.json();
       setVotes(Array.isArray(data.votes) ? data.votes : []);
+
+      if (!idToken) {
+        try {
+          localStorage.setItem(`voted:${id}`, "1");
+        } catch {
+          // The vote itself already succeeded server-side either way.
+        }
+        setHasVotedOnThisDevice(true);
+      }
+
       setStartDate("");
       setEndDate("");
       setWishlist("");
@@ -280,9 +317,20 @@ export default function TripPollPage({
     setLockError("");
     setIsLocking(true);
     try {
+      // /api/trigger-jarvis now requires proof the caller is a signed-in
+      // LINE user (see that route) - otherwise anyone holding the poll
+      // link, not just the organizer, could spam paid LLM generations.
+      const idToken = liff.getIDToken();
+      if (!idToken) {
+        throw new Error("LINE ID token unavailable.");
+      }
+
       const response = await fetch("/api/trigger-jarvis", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
         body: JSON.stringify({ trip_id: id }),
       });
 
@@ -323,30 +371,23 @@ export default function TripPollPage({
 
           <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
             <div>
-              <p className={labelClass}>Your name</p>
-              <div className={`${fieldClass} flex items-center gap-3`}>
-                {lineProfile ? (
-                  <>
-                    {lineProfile.pictureUrl ? (
-                      // eslint-disable-next-line @next/next/no-img-element -- LINE profile pictures come from an arbitrary CDN host per user, not worth configuring next/image remote patterns for.
-                      <img
-                        src={lineProfile.pictureUrl}
-                        alt=""
-                        className="h-8 w-8 shrink-0 rounded-full object-cover"
-                      />
-                    ) : (
-                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/10 text-xs font-semibold text-zinc-300">
-                        {lineProfile.displayName.trim().charAt(0).toUpperCase() || "?"}
-                      </span>
-                    )}
-                    <span className="truncate">{lineProfile.displayName}</span>
-                  </>
-                ) : (
-                  <span className="text-zinc-500">
-                    {liffError || "Signing you in with LINE..."}
-                  </span>
-                )}
-              </div>
+              <label htmlFor="voterName" className={labelClass}>
+                Your name
+              </label>
+              <input
+                id="voterName"
+                type="text"
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                placeholder={ready ? "Your name" : "Checking LINE sign-in..."}
+                maxLength={100}
+                className={fieldClass}
+              />
+              {idToken && (
+                <p className="mt-1.5 text-xs text-emerald-400/80">
+                  Signed in with LINE - your vote is linked to your account.
+                </p>
+              )}
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -423,9 +464,15 @@ export default function TripPollPage({
 
             {error && <p className="text-sm text-red-400">{error}</p>}
 
+            {!idToken && hasVotedOnThisDevice && (
+              <p className="text-sm text-zinc-400">
+                You&apos;ve already voted on this device.
+              </p>
+            )}
+
             <button
               type="submit"
-              disabled={isSubmitting}
+              disabled={isSubmitting || (!idToken && hasVotedOnThisDevice)}
               className="w-full rounded-full bg-zinc-200 px-4 py-3.5 text-base font-semibold text-zinc-900 shadow-md shadow-black/30 transition active:scale-[0.98] disabled:opacity-50"
             >
               {isSubmitting ? "Submitting..." : "Submit my vote"}
