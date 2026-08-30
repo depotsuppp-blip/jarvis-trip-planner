@@ -201,6 +201,14 @@ async function handlePollVote(request: NextRequest, id: string): Promise<NextRes
     submittedAt: new Date().toISOString(),
   };
 
-  const votes = await addPollVote(id, vote);
+  // The dedup key for a resubmission with no verified LINE session - see
+  // addPollVote's docstring for why this must be a stable client-generated
+  // id (app/trip/poll/[id]/page.tsx's anonVoterId:) and never the typed
+  // name. Capped well above a UUID's length just to keep a malformed
+  // client from writing an unbounded string.
+  const anonId =
+    typeof body.anonId === "string" ? body.anonId.trim().slice(0, 200) : "";
+
+  const votes = await addPollVote(id, vote, anonId);
   return NextResponse.json({ tripId: id, votes }, { status: 201 });
 }

@@ -47,21 +47,18 @@ export async function getPollVotes(tripId: string): Promise<PollVote[]> {
 }
 
 /**
- * Whether two vote entries represent the same voter, for dedup on
- * resubmission. Verified identities (lineUserId set) only ever match
- * the SAME verified id - a shared display name is never enough to
- * overwrite a real voter's entry, since name is spoofable and
- * lineUserId isn't. Two anonymous entries (no lineUserId on either
- * side) are matched by name instead, since that self-reported string
- * is the only identity an anonymous submission has.
+ * anonId is the dedup key for a resubmission with no verified LINE
+ * session - a client-generated UUID persisted in the voter's browser
+ * localStorage (see anonVoterId: in app/trip/poll/[id]/page.tsx), NOT
+ * the typed name. Two different people can type the same or a
+ * similarly-cased name; matching on that would silently let one
+ * overwrite the other's vote. anonId has no such collision risk in
+ * practice, same as lineUserId for a verified voter.
  */
-function isSameVoterName(a: string, b: string): boolean {
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
-}
-
 export async function addPollVote(
   tripId: string,
-  vote: PollVote
+  vote: PollVote,
+  anonId: string
 ): Promise<PollVote[]> {
   // One vote per voter per trip - a resubmission (a double-tap on the
   // button, or someone changing their mind and voting again) replaces
@@ -73,24 +70,23 @@ export async function addPollVote(
       await tx.pollVote.deleteMany({
         where: { tripId, lineUserId: vote.lineUserId },
       });
-    } else {
-      const anonymousRows = await tx.pollVote.findMany({
-        where: { tripId, lineUserId: "" },
-        select: { id: true, name: true },
+    } else if (anonId) {
+      await tx.pollVote.deleteMany({
+        where: { tripId, lineUserId: "", anonId },
       });
-      const staleIds = anonymousRows
-        .filter((row) => isSameVoterName(row.name, vote.name))
-        .map((row) => row.id);
-      if (staleIds.length > 0) {
-        await tx.pollVote.deleteMany({ where: { id: { in: staleIds } } });
-      }
     }
+    // No lineUserId AND no anonId (e.g. an old cached client that
+    // predates anonId, or localStorage unavailable) - nothing to key a
+    // dedup lookup off, so this submission is simply never matched
+    // against a prior one. It still inserts below like a first-time
+    // vote, rather than being rejected.
 
     await tx.pollVote.create({
       data: {
         tripId,
         name: vote.name,
         lineUserId: vote.lineUserId,
+        anonId: vote.lineUserId ? "" : anonId,
         startDate: vote.startDate,
         endDate: vote.endDate,
         wishlist: vote.wishlist,

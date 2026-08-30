@@ -130,10 +130,18 @@ export default function TripPollPage({
   const [idToken, setIdToken] = useState("");
   const [ready, setReady] = useState(false);
 
-  // Soft, client-side-only double-tap guard for the unauthenticated
-  // path - see handleSubmit. Not a security control: a different
-  // browser, device, or cleared site data votes again freely.
+  // Whether this device has already voted anonymously, purely to relabel
+  // the submit button to "Update your vote" - see handleSubmit, which
+  // lets a resubmission through either way. Not a security control: a
+  // different browser, device, or cleared site data votes again freely.
   const [hasVotedOnThisDevice, setHasVotedOnThisDevice] = useState(false);
+
+  // Stable per-(device, trip) identity for an anonymous voter, generated
+  // once and persisted in localStorage - see handleSubmit and
+  // lib/store.ts's addPollVote. This, not the typed name, is what the
+  // server dedups a resubmission against: two different people can type
+  // the same name, but this id is (for practical purposes) never shared.
+  const [anonId, setAnonId] = useState("");
 
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
@@ -203,10 +211,20 @@ export default function TripPollPage({
     queueMicrotask(() => {
       try {
         setHasVotedOnThisDevice(localStorage.getItem(`voted:${id}`) === "1");
+
+        const anonIdKey = `anonVoterId:${id}`;
+        let storedAnonId = localStorage.getItem(anonIdKey);
+        if (!storedAnonId) {
+          storedAnonId = crypto.randomUUID();
+          localStorage.setItem(anonIdKey, storedAnonId);
+        }
+        setAnonId(storedAnonId);
       } catch {
         // localStorage can be unavailable (private browsing, blocked
-        // site data) - this is only a soft double-tap safeguard, not a
-        // security control, so failing open here costs nothing real.
+        // site data) - hasVotedOnThisDevice is only a UI label, not a
+        // security control, so failing open costs nothing there. An
+        // empty anonId just means this submission won't dedup against a
+        // prior one server-side (see lib/store.ts's addPollVote).
       }
     });
   }, [id]);
@@ -246,11 +264,6 @@ export default function TripPollPage({
       return;
     }
 
-    if (!idToken && hasVotedOnThisDevice) {
-      setError("You've already voted on this device.");
-      return;
-    }
-
     if (startDate && startDate < todayISO()) {
       setError("The \"From\" date can't be in the past.");
       return;
@@ -283,6 +296,11 @@ export default function TripPollPage({
           endDate,
           wishlist: wishlist.trim(),
           vibes,
+          // Only meaningful without a verified LINE session - the server
+          // ignores this field once a token is present, since lineUserId
+          // is the dedup key then instead (see lib/store.ts's
+          // addPollVote).
+          ...(idToken ? {} : { anonId }),
         }),
       });
 
@@ -466,16 +484,21 @@ export default function TripPollPage({
 
             {!idToken && hasVotedOnThisDevice && (
               <p className="text-sm text-zinc-400">
-                You&apos;ve already voted on this device.
+                You&apos;ve already voted on this device - submitting again
+                will update your entry.
               </p>
             )}
 
             <button
               type="submit"
-              disabled={isSubmitting || (!idToken && hasVotedOnThisDevice)}
+              disabled={isSubmitting}
               className="w-full rounded-full bg-zinc-200 px-4 py-3.5 text-base font-semibold text-zinc-900 shadow-md shadow-black/30 transition active:scale-[0.98] disabled:opacity-50"
             >
-              {isSubmitting ? "Submitting..." : "Submit my vote"}
+              {isSubmitting
+                ? "Submitting..."
+                : !idToken && hasVotedOnThisDevice
+                  ? "Update your vote"
+                  : "Submit my vote"}
             </button>
           </form>
         </section>

@@ -6,14 +6,21 @@ datasource db {
   provider = "postgresql"
 }
 
-// One row per voter per trip - see isSameVoter in lib/store.ts for how a
-// resubmission (same lineUserId, or same name for an anonymous voter) is
-// deduped by deleting the prior row before inserting the new one.
+// One row per voter per trip - see isSameAnonVoter/lineUserId matching in
+// lib/store.ts for how a resubmission (same lineUserId for a verified
+// voter, same anonId for an anonymous one - never the typed name, which
+// two different people can share) is deduped by deleting the prior row
+// before inserting the new one.
 model PollVote {
   id          String   @id @default(cuid())
   tripId      String
   name        String
   lineUserId  String   @default("")
+  /// Client-generated UUID, persisted in the voter's browser localStorage
+  /// (see anonVoterId: in app/trip/poll/[id]/page.tsx) - the dedup key
+  /// for a voter with no verified LINE session. Empty for a verified
+  /// vote, where lineUserId is the key instead.
+  anonId      String   @default("")
   startDate   String   @default("")
   endDate     String   @default("")
   wishlist    String   @default("")
@@ -21,6 +28,7 @@ model PollVote {
   submittedAt DateTime @default(now())
 
   @@index([tripId])
+  @@index([tripId, anonId])
 }
 
 // One row per trip - the solo draft board's evolving text blob.
