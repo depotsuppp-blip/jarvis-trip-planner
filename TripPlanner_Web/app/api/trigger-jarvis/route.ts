@@ -4,13 +4,18 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { verifyBearerLineToken } from "@/lib/lineAuth";
 import { checkRateLimit } from "@/lib/rateLimit";
-import { getDraft, getPollVotes, isPollLocked, lockPoll, saveDraft } from "@/lib/store";
+import {
+  claimPollForGeneration,
+  getDraft,
+  getPollVotes,
+  lockPoll,
+  releasePollClaim,
+  saveDraft,
+} from "@/lib/store";
 import { summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
 
-// Generating an itinerary is one Anthropic call at output_config.effort
-// "high" with adaptive thinking - comfortably longer than the platform's
-// default function timeout. Raises the ceiling on this route only; see
-// https://vercel.com/docs/functions/configuring-functions/duration.
+// A generous ceiling even though claude-haiku-4-5 typically finishes well
+// under this - see https://vercel.com/docs/functions/configuring-functions/duration.
 export const maxDuration = 60;
 
 // Locking a poll spends real LLM quota and (once LINE push-back exists -
@@ -20,16 +25,22 @@ export const maxDuration = 60;
 const TRIGGER_RATE_LIMIT = 3;
 const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
 
-// Mirrors plugins/trip_planner.py's FINALIZE_ANTHROPIC_MODEL and
-// _FINALIZE_MAX_TOKENS - the same one-shot, per-poll, high-effort call,
-// just run directly from this Vercel function instead of proxying to a
-// Jarvis-side webhook receiver that was never built (see the module
-// docstring there: "once that webhook receiver exists - it does not yet").
-// Vercel's serverless functions cannot reach Jarvis's local Python
-// backend inbound - it never accepts inbound connections by design, it
-// only ever calls OUT (to LINE, Maps, Gemini/Anthropic) - so this route
-// is now the actual finalization implementation, not a proxy to one.
-const FINALIZE_MODEL = "claude-opus-5";
+// Cost-optimization default: claude-haiku-4-5 for this structured-JSON-
+// to-itinerary transformation, escalating to claude-sonnet-5 or
+// claude-opus-5 only if testing shows Haiku's output is genuinely
+// insufficient for this specific task - not before. A live side-by-side
+// test against this exact prompt shape found Haiku's itinerary
+// thematically on-target (correctly prioritized the top-voted vibe,
+// included the requested places) but noticeably more generic/repetitive
+// than Opus's (Opus named actual streets/cafes/dishes; Haiku's first
+// three days were largely "visit local cafes" restated) - worth
+// revisiting if real usage shows that gap matters for this feature.
+//
+// No thinking/effort config below: unlike Opus 5/Sonnet 5/Fable 5, Haiku
+// 4.5 is pre-4.6-tier - output_config.effort errors outright on this
+// model, and omitting `thinking` entirely (rather than an explicit
+// {type:"disabled"}) is its correct "no extended thinking" state.
+const FINALIZE_MODEL = "claude-haiku-4-5-20251001";
 const FINALIZE_MAX_TOKENS = 4096;
 
 const ItineraryDaySchema = z.object({
@@ -100,8 +111,7 @@ async function generateItinerary(summary: PollSummary): Promise<Itinerary> {
   const response = await client.messages.parse({
     model: FINALIZE_MODEL,
     max_tokens: FINALIZE_MAX_TOKENS,
-    thinking: { type: "adaptive" },
-    output_config: { effort: "high", format: zodOutputFormat(ItinerarySchema) },
+    output_config: { format: zodOutputFormat(ItinerarySchema) },
     messages: [{ role: "user", content: buildFinalizationPrompt(summary) }],
   });
 
@@ -136,14 +146,15 @@ function parseStoredItinerary(text: string): Itinerary | null {
  * Self-contained: reads this trip's votes from Neon via Prisma, calls
  * Anthropic directly, and returns the finished itinerary in the response
  * body - no dependency on Jarvis's local Python backend, which never
- * accepts inbound connections (see FINALIZE_MODEL's comment above).
+ * accepts inbound connections.
  *
  * NOT YET DONE: pushing the result back into the LINE group chat the way
  * plugins/trip_planner.py's _finalize_trip_task does via line_notifier -
- * that needs LINE_CHANNEL_ACCESS_TOKEN and a target group/user id
- * configured in this Next.js app's own environment, which isn't there
- * yet (see this app's .env.example). The frontend receiving the plan
- * directly in this response is today's substitute.
+ * that needs LINE_CHANNEL_ACCESS_TOKEN and a target group id configured
+ * in this Next.js app's own environment (a group id specifically, not
+ * just a personal LINE_USER_ID push target - out of scope for now). The
+ * frontend receiving the plan directly in this response is today's
+ * substitute.
  */
 export async function POST(request: NextRequest) {
   // Without this, anyone who obtains a trip's poll link (forwarded into
@@ -176,33 +187,57 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    // Already locked - return the stored plan instead of spending LLM
-    // quota again. A stale/corrupt stored value (should not happen; only
-    // this route ever writes it) falls through to regenerating below
-    // rather than erroring the whole request.
-    if (await isPollLocked(tripId)) {
+    // Atomically claims this trip before spending anything - see
+    // claimPollForGeneration's docstring. Two near-simultaneous "Lock &
+    // Generate Plan" clicks resolve to exactly one "claimed" and one
+    // "in_progress" (or, if the first already finished, "locked") - never
+    // two concurrent Anthropic calls for the same trip.
+    const claim = await claimPollForGeneration(tripId);
+
+    if (claim === "locked") {
       const draft = await getDraft(tripId);
       const stored = draft ? parseStoredItinerary(draft.text) : null;
       if (stored) {
         return NextResponse.json({ tripId, locked: true, itinerary: stored });
       }
-    }
-
-    const votes = await getPollVotes(tripId);
-    if (votes.length === 0) {
+      console.error(`POST /api/trigger-jarvis: trip ${tripId} is locked but has no valid stored plan.`);
       return NextResponse.json(
-        { error: "No one has voted on this poll yet - wait for votes before locking it." },
-        { status: 400 }
+        { error: "This poll is locked but its plan could not be loaded." },
+        { status: 500 }
       );
     }
 
-    const summary = summarizePollVotes(votes);
-    const itinerary = await generateItinerary(summary);
+    if (claim === "in_progress") {
+      return NextResponse.json(
+        { error: "A plan is already being generated for this poll - please wait a moment and try again." },
+        { status: 409 }
+      );
+    }
 
-    await saveDraft(tripId, formatItineraryForStorage(itinerary));
-    await lockPoll(tripId);
+    // claim === "claimed" - this request now owns generation for this
+    // trip and must release the claim on every exit path below except
+    // success, which hands off to lockPoll instead.
+    try {
+      const votes = await getPollVotes(tripId);
+      if (votes.length === 0) {
+        await releasePollClaim(tripId);
+        return NextResponse.json(
+          { error: "No one has voted on this poll yet - wait for votes before locking it." },
+          { status: 400 }
+        );
+      }
 
-    return NextResponse.json({ tripId, locked: true, itinerary }, { status: 201 });
+      const summary = summarizePollVotes(votes);
+      const itinerary = await generateItinerary(summary);
+
+      await saveDraft(tripId, formatItineraryForStorage(itinerary));
+      await lockPoll(tripId);
+
+      return NextResponse.json({ tripId, locked: true, itinerary }, { status: 201 });
+    } catch (innerError) {
+      await releasePollClaim(tripId).catch(() => {});
+      throw innerError;
+    }
   } catch (error) {
     if (error instanceof Anthropic.RateLimitError) {
       return NextResponse.json(

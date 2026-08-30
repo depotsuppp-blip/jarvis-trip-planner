@@ -157,7 +157,67 @@ export async function isPollLocked(tripId: string): Promise<boolean> {
 export async function lockPoll(tripId: string): Promise<void> {
   await prisma.poll.upsert({
     where: { tripId },
-    create: { tripId, locked: true, lockedAt: new Date() },
-    update: { locked: true, lockedAt: new Date() },
+    create: { tripId, locked: true, lockedAt: new Date(), generating: false },
+    update: { locked: true, lockedAt: new Date(), generating: false },
+  });
+}
+
+// A claim older than this is treated as abandoned - see Poll.generating's
+// comment in prisma/schema.prisma for why (a platform-level timeout kill
+// does not reliably run a `finally` block). Comfortably longer than
+// app/api/trigger-jarvis/route.ts's maxDuration=60 cap.
+const GENERATION_CLAIM_STALE_MS = 90_000;
+
+export type PollClaimResult = "claimed" | "locked" | "in_progress";
+
+/**
+ * Atomically claims the right to generate this trip's plan, so two
+ * near-simultaneous "Lock & Generate Plan" clicks can't both pass a
+ * check-then-write race into two paid Anthropic calls. A single INSERT
+ * ... ON CONFLICT ... WHERE ... RETURNING statement, not a
+ * read-then-write - Prisma's upsert() has no conditional-update clause,
+ * so this needs raw SQL. tripId and staleCutoff are passed through
+ * Prisma's tagged-template parameterization, never string-concatenated.
+ *
+ * Returns:
+ *   "claimed"     - this call now owns the generation; the caller must
+ *                   follow up with either lockPoll (on success) or
+ *                   releasePollClaim (on failure).
+ *   "locked"      - a plan already exists; read it via getDraft instead
+ *                   of generating a new one.
+ *   "in_progress" - another request currently holds the claim; the
+ *                   caller should ask the user to wait rather than
+ *                   starting a second generation.
+ */
+export async function claimPollForGeneration(tripId: string): Promise<PollClaimResult> {
+  const staleCutoff = new Date(Date.now() - GENERATION_CLAIM_STALE_MS);
+  const claimed = await prisma.$queryRaw<{ tripId: string }[]>`
+    INSERT INTO "Poll" ("tripId", "generating", "generatingStartedAt")
+    VALUES (${tripId}, true, now())
+    ON CONFLICT ("tripId") DO UPDATE
+    SET "generating" = true, "generatingStartedAt" = now()
+    WHERE "Poll"."locked" = false
+      AND ("Poll"."generating" = false OR "Poll"."generatingStartedAt" < ${staleCutoff})
+    RETURNING "tripId"
+  `;
+  if (claimed.length > 0) {
+    return "claimed";
+  }
+
+  const existing = await prisma.poll.findUnique({ where: { tripId } });
+  return existing?.locked ? "locked" : "in_progress";
+}
+
+/**
+ * Releases a claim taken by claimPollForGeneration without marking the
+ * poll locked - call this when generation failed, so a retry isn't
+ * permanently blocked by a stuck "in_progress" claim (see
+ * GENERATION_CLAIM_STALE_MS above for the fallback if even this never
+ * runs, e.g. the instance is killed mid-request).
+ */
+export async function releasePollClaim(tripId: string): Promise<void> {
+  await prisma.poll.updateMany({
+    where: { tripId, locked: false },
+    data: { generating: false },
   });
 }

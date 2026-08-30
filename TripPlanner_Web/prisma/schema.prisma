@@ -50,11 +50,28 @@ model TripDraft {
   updatedAt DateTime @updatedAt
 }
 
-// One row per trip that has been locked - see POST /api/trigger-jarvis.
-// Absence of a row means "not locked yet", same as PollVote/TripDraft's
-// "no row = nothing yet" convention elsewhere in this schema.
+// One row per trip that has been locked, or is currently being locked -
+// see POST /api/trigger-jarvis. Absence of a row means "not locked yet
+// and no generation in flight", same as PollVote/TripDraft's "no row =
+// nothing yet" convention elsewhere in this schema.
 model Poll {
   tripId   String    @id
   locked   Boolean   @default(false)
   lockedAt DateTime?
+  /// True while a paid Anthropic call for this trip is in flight - the
+  /// claim a concurrent "Lock & Generate Plan" click checks before
+  /// spending quota a second time. Set true by an atomic INSERT ...
+  /// ON CONFLICT ... WHERE claim (claimPollForGeneration in
+  /// lib/store.ts, since Prisma's upsert() has no conditional-update
+  /// clause), cleared on both success (lockPoll) and failure
+  /// (releasePollClaim) - see generatingStartedAt for what happens if
+  /// neither ever runs.
+  generating Boolean @default(false)
+  /// When the current (or last) generation claim was taken. A claim
+  /// older than the staleness window in lib/store.ts is treated as
+  /// abandoned and reclaimable - guards against a serverless instance
+  /// being killed mid-request (a platform-level timeout kill does not
+  /// reliably run a `finally` block) leaving generating=true stuck
+  /// forever with no request left to release it.
+  generatingStartedAt DateTime?
 }
