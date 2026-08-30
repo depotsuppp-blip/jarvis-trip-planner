@@ -289,16 +289,41 @@ export default function TripPollPage({
     }
 
     setIsSubmitting(true);
+
+    // TEMPORARY DIAGNOSTIC (see the general catch below too): re-fetches
+    // the ID token fresh at submit time instead of trusting the value
+    // cached in state since page load - a real mobile LINE session
+    // reportedly fails here with no request ever reaching the server, so
+    // this isolates whether liff.getIDToken() itself throws when called
+    // at this point (vs. only ever having been exercised at mount).
+    // REVERT once the real cause is found: restore using the `idToken`
+    // state value directly and remove this block and the try/catch below.
+    let liffIdToken = "";
+    try {
+      if (liff.isLoggedIn()) {
+        liffIdToken = liff.getIDToken() || "";
+      }
+    } catch (tokenError) {
+      console.error("liff.getIDToken() failed at submit time:", tokenError);
+      setError(
+        `Debug (getIDToken): ${
+          tokenError instanceof Error ? tokenError.message : String(tokenError)
+        }`
+      );
+      setIsSubmitting(false);
+      return;
+    }
+
     try {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (idToken) {
+      if (liffIdToken) {
         // A verified LINE session was silently attached - send it so
         // the server trusts claims.sub, not just the typed name (see
         // app/api/poll/[id]/route.ts's POST handler). Omitted entirely
         // when there is no token: the server treats a request with NO
         // Authorization header as an intentional anonymous vote, not an
         // error.
-        headers.Authorization = `Bearer ${idToken}`;
+        headers.Authorization = `Bearer ${liffIdToken}`;
       }
 
       const response = await fetch(`/api/poll/${id}`, {
@@ -314,18 +339,23 @@ export default function TripPollPage({
           // ignores this field once a token is present, since lineUserId
           // is the dedup key then instead (see lib/store.ts's
           // addPollVote).
-          ...(idToken ? {} : { anonId }),
+          ...(liffIdToken ? {} : { anonId }),
         }),
       });
 
       if (!response.ok) {
-        throw new Error("Vote submission failed.");
+        const data = await response.json().catch(() => null);
+        throw new Error(
+          typeof data?.error === "string"
+            ? data.error
+            : `Vote submission failed (HTTP ${response.status}).`
+        );
       }
 
       const data = await response.json();
       setVotes(Array.isArray(data.votes) ? data.votes : []);
 
-      if (!idToken) {
+      if (!liffIdToken) {
         try {
           localStorage.setItem(`voted:${id}`, "1");
         } catch {
@@ -338,8 +368,11 @@ export default function TripPollPage({
       setEndDate("");
       setWishlist("");
       setVibes([]);
-    } catch {
-      setError("Something went wrong submitting your vote. Please try again.");
+    } catch (error) {
+      // TEMPORARY DIAGNOSTIC: shows the real error instead of a generic
+      // message - revert to a friendly string once the cause is found.
+      console.error("Vote submission failed:", error);
+      setError(`Debug: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setIsSubmitting(false);
     }
