@@ -290,14 +290,11 @@ export default function TripPollPage({
 
     setIsSubmitting(true);
 
-    // TEMPORARY DIAGNOSTIC (see the general catch below too): re-fetches
-    // the ID token fresh at submit time instead of trusting the value
-    // cached in state since page load - a real mobile LINE session
-    // reportedly fails here with no request ever reaching the server, so
-    // this isolates whether liff.getIDToken() itself throws when called
-    // at this point (vs. only ever having been exercised at mount).
-    // REVERT once the real cause is found: restore using the `idToken`
-    // state value directly and remove this block and the try/catch below.
+    // Fetched fresh here rather than trusting the `idToken` state value
+    // cached since page load - diagnosis confirmed this call itself
+    // never throws, but re-checking at the actual moment of use is
+    // cheap insurance against a token that's gone stale while the form
+    // was open, and keeps the request's real identity in one place.
     let liffIdToken = "";
     try {
       if (liff.isLoggedIn()) {
@@ -305,11 +302,7 @@ export default function TripPollPage({
       }
     } catch (tokenError) {
       console.error("liff.getIDToken() failed at submit time:", tokenError);
-      setError(
-        `Debug (getIDToken): ${
-          tokenError instanceof Error ? tokenError.message : String(tokenError)
-        }`
-      );
+      setError("Something went wrong submitting your vote. Please try again.");
       setIsSubmitting(false);
       return;
     }
@@ -345,11 +338,11 @@ export default function TripPollPage({
 
       if (!response.ok) {
         const data = await response.json().catch(() => null);
-        throw new Error(
-          typeof data?.error === "string"
-            ? data.error
-            : `Vote submission failed (HTTP ${response.status}).`
+        console.error(
+          `Vote submission failed with HTTP ${response.status}:`,
+          data?.error ?? "(no error body)"
         );
+        throw new Error("Vote submission failed.");
       }
 
       const data = await response.json();
@@ -369,10 +362,8 @@ export default function TripPollPage({
       setWishlist("");
       setVibes([]);
     } catch (error) {
-      // TEMPORARY DIAGNOSTIC: shows the real error instead of a generic
-      // message - revert to a friendly string once the cause is found.
       console.error("Vote submission failed:", error);
-      setError(`Debug: ${error instanceof Error ? error.message : String(error)}`);
+      setError("Something went wrong submitting your vote. Please try again.");
     } finally {
       setIsSubmitting(false);
     }

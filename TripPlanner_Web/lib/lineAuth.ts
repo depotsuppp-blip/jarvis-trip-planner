@@ -25,25 +25,44 @@ export async function verifyLineIdToken(idToken: string): Promise<string | null>
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ id_token: idToken, client_id: clientId }),
     });
-  } catch {
+  } catch (err) {
+    // TEMPORARY DIAGNOSTIC - see the other early returns below. Remove
+    // once real mobile LINE sessions verify successfully.
+    console.error("verifyLineIdToken: network error calling LINE's verify endpoint:", err);
     return null;
   }
 
   if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    console.error(`verifyLineIdToken: LINE verify endpoint returned ${response.status}: ${body}`);
     return null;
   }
 
   const claims = await response.json().catch(() => null);
   if (!claims || typeof claims.sub !== "string" || !claims.sub) {
+    console.error("verifyLineIdToken: response body has no valid sub claim:", claims);
     return null;
   }
   if (claims.aud !== clientId) {
+    // Far and away the most likely cause of a persistent, every-attempt
+    // failure on a real device while every other check passes: LIFF ID
+    // format is "{channelId}-{suffix}" (see NEXT_PUBLIC_LIFF_ID), so
+    // LINE_CHANNEL_ID must equal that prefix exactly - if it's set to a
+    // different channel's id, or has stray whitespace, every real token
+    // fails right here, every time, while the code itself is correct.
+    console.error(
+      `verifyLineIdToken: aud mismatch - token aud="${claims.aud}", configured LINE_CHANNEL_ID="${clientId}"`
+    );
     return null;
   }
   if (claims.iss !== "https://access.line.me") {
+    console.error(`verifyLineIdToken: unexpected iss claim: "${claims.iss}"`);
     return null;
   }
   if (typeof claims.exp !== "number" || claims.exp * 1000 <= Date.now()) {
+    console.error(
+      `verifyLineIdToken: token expired or missing exp claim (exp=${claims.exp}, now=${Date.now()})`
+    );
     return null;
   }
 
