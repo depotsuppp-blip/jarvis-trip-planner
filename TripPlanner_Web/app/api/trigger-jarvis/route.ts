@@ -3,6 +3,7 @@ import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { verifyBearerLineToken } from "@/lib/lineAuth";
+import { PlacesApiError, searchPlacesForSlot, type PlaceResult } from "@/lib/places";
 import { checkRateLimit } from "@/lib/rateLimit";
 import {
   claimPollForGeneration,
@@ -14,8 +15,16 @@ import {
 } from "@/lib/store";
 import { summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
 
-// A generous ceiling even though claude-haiku-4-5 typically finishes well
-// under this - see https://vercel.com/docs/functions/configuring-functions/duration.
+// Two Haiku calls plus N parallel Places calls. Measured against real
+// data: stage 1 (skeleton) ~4-7s, stage 2 (final write, given grounded
+// results) ~4.5s. The Places Text Search batch itself is not yet
+// measured end to end - "Places API (New)" isn't enabled on this
+// project's Google Cloud console yet (confirmed via a live 403
+// SERVICE_DISABLED response), so there is no successful real run to
+// time that stage against - but N calls run in parallel via Promise.all
+// should add low single-digit seconds even at ~20 slots, comfortably
+// inside this ceiling. Re-time once that's enabled.
+// https://vercel.com/docs/functions/configuring-functions/duration.
 export const maxDuration = 60;
 
 // Locking a poll spends real LLM quota and (once LINE push-back exists -
@@ -25,23 +34,21 @@ export const maxDuration = 60;
 const TRIGGER_RATE_LIMIT = 3;
 const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
 
-// Cost-optimization default: claude-haiku-4-5 for this structured-JSON-
-// to-itinerary transformation, escalating to claude-sonnet-5 or
-// claude-opus-5 only if testing shows Haiku's output is genuinely
-// insufficient for this specific task - not before. A live side-by-side
-// test against this exact prompt shape found Haiku's itinerary
-// thematically on-target (correctly prioritized the top-voted vibe,
-// included the requested places) but noticeably more generic/repetitive
-// than Opus's (Opus named actual streets/cafes/dishes; Haiku's first
-// three days were largely "visit local cafes" restated) - worth
-// revisiting if real usage shows that gap matters for this feature.
-//
-// No thinking/effort config below: unlike Opus 5/Sonnet 5/Fable 5, Haiku
-// 4.5 is pre-4.6-tier - output_config.effort errors outright on this
-// model, and omitting `thinking` entirely (rather than an explicit
-// {type:"disabled"}) is its correct "no extended thinking" state.
+// Cost-optimization default: claude-haiku-4-5, not opus-5/sonnet-5 -
+// already decided against escalating once this two-stage grounded
+// architecture replaced the single-call approach (see the prior
+// hallucination-vs-cost comparison). No thinking/effort config below:
+// unlike Opus 5/Sonnet 5/Fable 5, Haiku 4.5 is pre-4.6-tier -
+// output_config.effort errors outright on this model, and omitting
+// `thinking` entirely (rather than an explicit {type:"disabled"}) is
+// its correct "no extended thinking" state.
 const FINALIZE_MODEL = "claude-haiku-4-5-20251001";
 const FINALIZE_MAX_TOKENS = 4096;
+
+// ---------------------------------------------------------------------
+// Final itinerary shape - unchanged from the single-call version, and
+// the same shape as plugins/trip_planner.py's Itinerary Pydantic model.
+// ---------------------------------------------------------------------
 
 const ItineraryDaySchema = z.object({
   day: z.number(),
@@ -50,13 +57,6 @@ const ItineraryDaySchema = z.object({
   meals: z.array(z.string()),
 });
 
-// The same shape as plugins/trip_planner.py's Itinerary Pydantic model -
-// one definition of "what an itinerary looks like" per language, mirrored
-// rather than shared since this is a separate runtime. Passed as
-// output_config.format below, so Claude's response is constrained to this
-// shape at the API level (this project's TypeScript side has no
-// tool_choice-forced-tool_use path the way the Python side does - the SDK's
-// messages.parse + Zod is the equivalent structured-output guarantee).
 const ItinerarySchema = z.object({
   destination: z.string(),
   days: z.array(ItineraryDaySchema),
@@ -65,19 +65,44 @@ const ItinerarySchema = z.object({
 
 type Itinerary = z.infer<typeof ItinerarySchema>;
 
+// ---------------------------------------------------------------------
+// Stage 1: activity skeleton - what KIND of place each part of each day
+// should be, and roughly where. No venue names at this stage - those
+// come from real Places data in stage 2, never from the model's own
+// recall.
+// ---------------------------------------------------------------------
+
+const ActivitySlotSchema = z.object({
+  slotType: z.enum(["activity", "meal"]),
+  // A search category, e.g. "cafe", "temple", "night market", "Thai
+  // restaurant", "viewpoint" - never a specific venue name.
+  category: z.string(),
+  // Neighborhood/area to search near, e.g. "Nimman", "Old City".
+  area: z.string(),
+});
+
+const DaySkeletonSchema = z.object({
+  day: z.number(),
+  theme: z.string(),
+  slots: z.array(ActivitySlotSchema),
+});
+
+const ItinerarySkeletonSchema = z.object({
+  destination: z.string(),
+  days: z.array(DaySkeletonSchema),
+});
+
+type ItinerarySkeleton = z.infer<typeof ItinerarySkeletonSchema>;
+
 /**
- * Mirrors plugins/trip_planner.py's _build_finalization_prompt byte-for-
- * byte in intent - reads the same pre-aggregated PollSummary shape
- * (lib/tripSummary.ts's summarizePollVotes, the same function GET
- * /api/poll/[id] already calls) rather than re-tallying raw votes, so the
- * tallying logic exists in exactly one place in this language too.
- *
- * Unlike the Python version, this prompt does NOT ask for "ONLY a JSON
- * object" - output_config.format below constrains the response shape at
- * the API level, so there is nothing for the model to get wrong or wrap
- * in markdown fences.
+ * Mirrors plugins/trip_planner.py's _build_finalization_prompt in intent
+ * - reads the same pre-aggregated PollSummary shape
+ * (lib/tripSummary.ts's summarizePollVotes) rather than re-tallying raw
+ * votes. Unlike a "respond with ONLY a JSON object" prompt, this doesn't
+ * need to ask for JSON at all - output_config.format below constrains
+ * the response shape at the API level.
  */
-function buildFinalizationPrompt(summary: PollSummary): string {
+function buildSkeletonPrompt(summary: PollSummary): string {
   const vibesText =
     summary.topVibes.length > 0
       ? summary.topVibes.map((v) => `${v.vibe} (${v.count} votes)`).join(", ")
@@ -89,19 +114,114 @@ function buildFinalizationPrompt(summary: PollSummary): string {
   const votersText = summary.voters.length > 0 ? summary.voters.join(", ") : "the group";
 
   return (
-    "Generate a complete trip itinerary based on this consensus data from a " +
-    "group trip poll. Resolve any conflicting wishes by prioritizing the " +
-    "most popular vibes. Do not reference how the group gets to the " +
-    "destination or where they are coming from - start the itinerary from " +
-    "arrival.\n\n" +
+    "Plan the STRUCTURE of a trip itinerary based on this consensus data from a group trip poll. " +
+    "You will fill in real venue names in a later step - for now, decide only what KIND of place " +
+    "each part of the day should be, and roughly where. Infer a specific real destination city from " +
+    "the group's requested places and vibes. Resolve conflicting wishes by prioritizing the most " +
+    "popular vibes. Do not reference how the group gets to the destination or where they are coming " +
+    "from - start the itinerary from arrival.\n\n" +
     `Group size: ${summary.totalVotes} people (${votersText}).\n` +
     `Preferred dates: ${summary.dateRangeLabel}.\n` +
     `Top vibes, most to least popular: ${vibesText}.\n` +
-    `Specific places requested by the group: ${wishlistText}.`
+    `Specific places requested by the group: ${wishlistText}.\n\n` +
+    "For each day, break it into a small number of slots - roughly 3-4 activities and 2 meals per " +
+    "day is a reasonable density, not more. For each slot, give: slotType (\"activity\" or \"meal\"), " +
+    "a short search category such as \"cafe\", \"temple\", \"night market\", \"Thai restaurant\", " +
+    "\"viewpoint\", or \"museum\" - NOT a specific venue name - and the neighborhood or area to look " +
+    "near. Do not invent or guess any specific venue name at this stage."
   );
 }
 
-async function generateItinerary(summary: PollSummary): Promise<Itinerary> {
+async function generateSkeleton(summary: PollSummary): Promise<ItinerarySkeleton> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error("ANTHROPIC_API_KEY is not configured.");
+  }
+
+  const client = new Anthropic({ apiKey });
+  const response = await client.messages.parse({
+    model: FINALIZE_MODEL,
+    max_tokens: FINALIZE_MAX_TOKENS,
+    output_config: { format: zodOutputFormat(ItinerarySkeletonSchema) },
+    messages: [{ role: "user", content: buildSkeletonPrompt(summary) }],
+  });
+
+  if (!response.parsed_output) {
+    throw new Error("Claude did not return a valid itinerary skeleton.");
+  }
+  return response.parsed_output;
+}
+
+// ---------------------------------------------------------------------
+// Stage 1.5: ground every slot in real Places data, in parallel.
+// ---------------------------------------------------------------------
+
+interface GroundedSlot {
+  day: number;
+  slotType: "activity" | "meal";
+  category: string;
+  area: string;
+  places: PlaceResult[];
+}
+
+async function groundSkeleton(skeleton: ItinerarySkeleton): Promise<GroundedSlot[]> {
+  const flatSlots = skeleton.days.flatMap((day) =>
+    day.slots.map((slot) => ({ day: day.day, ...slot }))
+  );
+
+  // Promise.all, not sequential - N independent HTTP calls, and a slot's
+  // result doesn't depend on any other slot's. A PlacesApiError (the API
+  // itself is broken - not configured, not enabled, billing off, ...)
+  // rejects the whole batch immediately, which is correct: that failure
+  // mode affects every slot identically, so there is no partial result
+  // worth salvaging, and the caller needs one clear, specific message
+  // instead of N generic ones.
+  return Promise.all(
+    flatSlots.map(async (slot) => ({
+      ...slot,
+      places: await searchPlacesForSlot(slot.category, slot.area, skeleton.destination),
+    }))
+  );
+}
+
+// ---------------------------------------------------------------------
+// Stage 2: write the final itinerary, choosing only from real results.
+// ---------------------------------------------------------------------
+
+function formatSlotForPrompt(slot: GroundedSlot): string {
+  if (slot.places.length === 0) {
+    return `  - [${slot.slotType}] ${slot.category} near ${slot.area}: NO REAL VENUES FOUND. Say so plainly in this slot's text rather than inventing one.`;
+  }
+  const candidates = slot.places
+    .slice(0, 3)
+    .map((p) => `${p.name} (${p.address}${p.rating !== null ? `, rating ${p.rating}` : ""})`)
+    .join("; ");
+  return `  - [${slot.slotType}] ${slot.category} near ${slot.area}: ${candidates}`;
+}
+
+function buildFinalPrompt(skeleton: ItinerarySkeleton, groundedSlots: GroundedSlot[]): string {
+  const daysText = skeleton.days
+    .map((day) => {
+      const daySlots = groundedSlots.filter((s) => s.day === day.day);
+      return `Day ${day.day} (${day.theme}):\n${daySlots.map(formatSlotForPrompt).join("\n")}`;
+    })
+    .join("\n\n");
+
+  return (
+    `Write the final trip itinerary for ${skeleton.destination}, following this planned structure, ` +
+    "using the REAL Google Places search results listed for each slot below. Only use venues from " +
+    "the provided search results - never invent a name not present in this data. If a slot says NO " +
+    "REAL VENUES FOUND, say so plainly in that slot's activity or meal text rather than inventing a " +
+    "fallback. For each slot, pick one of its real results and write a short one-sentence " +
+    "description incorporating it.\n\n" +
+    `${daysText}`
+  );
+}
+
+async function generateFinalItinerary(
+  skeleton: ItinerarySkeleton,
+  groundedSlots: GroundedSlot[]
+): Promise<Itinerary> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     throw new Error("ANTHROPIC_API_KEY is not configured.");
@@ -112,7 +232,7 @@ async function generateItinerary(summary: PollSummary): Promise<Itinerary> {
     model: FINALIZE_MODEL,
     max_tokens: FINALIZE_MAX_TOKENS,
     output_config: { format: zodOutputFormat(ItinerarySchema) },
-    messages: [{ role: "user", content: buildFinalizationPrompt(summary) }],
+    messages: [{ role: "user", content: buildFinalPrompt(skeleton, groundedSlots) }],
   });
 
   if (!response.parsed_output) {
@@ -143,10 +263,14 @@ function parseStoredItinerary(text: string): Itinerary | null {
 /**
  * POST /api/trigger-jarvis - "Lock & Generate Plan" on the poll page.
  *
- * Self-contained: reads this trip's votes from Neon via Prisma, calls
- * Anthropic directly, and returns the finished itinerary in the response
- * body - no dependency on Jarvis's local Python backend, which never
- * accepts inbound connections.
+ * Self-contained: reads this trip's votes from Neon via Prisma, then
+ * runs a grounded two-stage generation - a Haiku call to plan the day
+ * structure (categories + areas, no venue names), real Google Places
+ * Text Search calls to find actual venues for every slot, then a second
+ * Haiku call to write the final itinerary choosing only from that real
+ * data - and returns the finished itinerary in the response body. No
+ * dependency on Jarvis's local Python backend, which never accepts
+ * inbound connections.
  *
  * NOT YET DONE: pushing the result back into the LINE group chat the way
  * plugins/trip_planner.py's _finalize_trip_task does via line_notifier -
@@ -191,7 +315,7 @@ export async function POST(request: NextRequest) {
     // claimPollForGeneration's docstring. Two near-simultaneous "Lock &
     // Generate Plan" clicks resolve to exactly one "claimed" and one
     // "in_progress" (or, if the first already finished, "locked") - never
-    // two concurrent Anthropic calls for the same trip.
+    // two concurrent generations for the same trip.
     const claim = await claimPollForGeneration(tripId);
 
     if (claim === "locked") {
@@ -228,7 +352,9 @@ export async function POST(request: NextRequest) {
       }
 
       const summary = summarizePollVotes(votes);
-      const itinerary = await generateItinerary(summary);
+      const skeleton = await generateSkeleton(summary);
+      const groundedSlots = await groundSkeleton(skeleton);
+      const itinerary = await generateFinalItinerary(skeleton, groundedSlots);
 
       await saveDraft(tripId, formatItineraryForStorage(itinerary));
       await lockPoll(tripId);
@@ -239,6 +365,13 @@ export async function POST(request: NextRequest) {
       throw innerError;
     }
   } catch (error) {
+    if (error instanceof PlacesApiError) {
+      console.error(`POST /api/trigger-jarvis: Places API error (${error.reason}):`, error.message);
+      return NextResponse.json(
+        { error: `Venue search is unavailable: ${error.message}`, reason: error.reason },
+        { status: 502 }
+      );
+    }
     if (error instanceof Anthropic.RateLimitError) {
       return NextResponse.json(
         { error: "The plan generator is temporarily rate-limited - please try again shortly." },
