@@ -16,11 +16,27 @@ interface PollVote {
   submittedAt: string;
 }
 
+interface TravelLeg {
+  durationMinutes: number;
+  distanceMeters: number;
+}
+
+interface ItineraryStop {
+  slotType: "activity" | "meal";
+  text: string;
+  // From the PRECEDING stop in this same day's array - null for a day's
+  // first stop, or wherever Stage 2.5 (app/api/trigger-jarvis/route.ts)
+  // had no route data (no coordinates for one of the two stops, or the
+  // Routes API call for that day failed). A future-dated, historical-
+  // pattern estimate, not live traffic - see the "~" in how this
+  // renders below.
+  travelFromPrevious: TravelLeg | null;
+}
+
 interface ItineraryDay {
   day: number;
   summary: string;
-  activities: string[];
-  meals: string[];
+  stops: ItineraryStop[];
 }
 
 interface Itinerary {
@@ -49,6 +65,13 @@ const VIBE_OPTIONS = [
 // wrongly block or allow dates right around midnight.
 function todayISO() {
   return new Date().toLocaleDateString("en-CA");
+}
+
+// Rounded, never 0 - "~0 min" would read as broken rather than "very
+// close by". The "(estimate)" wording sits next to this at the call
+// site, not baked in here, since this also feeds the title tooltip.
+function formatTravelMinutes(minutes: number): string {
+  return `~${Math.max(1, Math.round(minutes))} min`;
 }
 
 function BoardingPass({ id, votes }: { id: string; votes: PollVote[] }) {
@@ -132,6 +155,23 @@ export default function TripPollPage({
   // use() rather than await since this component cannot be async.
   const { id } = use(params);
 
+  // Presence of ?admin=<token> is what shows the "Lock & Generate Plan"
+  // button at all - see handleLockAndGenerate, which sends this same raw
+  // value to POST /api/trigger-jarvis. This is UX only, not a security
+  // check: the route itself independently verifies the token server-side
+  // (lib/adminToken.ts's verifyAdminToken) before doing anything, so a
+  // guessed or missing token is rejected there regardless of what this
+  // page renders. Only the trip creator ever receives a link with this
+  // param - see plugins/trip_planner.py's _run_consensus_poll, which
+  // sends it in a separate, private LINE message from the public voting
+  // link. Read directly from window.location rather than
+  // next/navigation's useSearchParams(), which would require wrapping
+  // this whole page in a Suspense boundary purely to avoid a
+  // static-prerender build error - not worth it for a value that's only
+  // ever read once, client-side, on mount.
+  const [adminToken, setAdminToken] = useState("");
+  const isAdmin = Boolean(adminToken);
+
   const [votes, setVotes] = useState<PollVote[]>([]);
   const [isLoadingVotes, setIsLoadingVotes] = useState(true);
 
@@ -163,10 +203,6 @@ export default function TripPollPage({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
 
-  // TODO: Check if user is Admin - replace with a real organizer check
-  // (e.g. the trip creator's LINE user id) once auth exists. The toggle
-  // below only exists so the gated state is demonstrable without one.
-  const [isAdmin, setIsAdmin] = useState(true);
   const [isLocking, setIsLocking] = useState(false);
   const [lockError, setLockError] = useState("");
   const [generatedPlan, setGeneratedPlan] = useState<Itinerary | null>(null);
@@ -223,6 +259,14 @@ export default function TripPollPage({
     // loadVotes below, which defers its setState calls the same way by
     // virtue of being async.
     queueMicrotask(() => {
+      try {
+        setAdminToken(new URLSearchParams(window.location.search).get("admin") || "");
+      } catch {
+        // No admin param, or an unparseable query string - either way
+        // this trip's poll page just shows no "Lock & Generate Plan"
+        // button, same as an ordinary voter link.
+      }
+
       try {
         setHasVotedOnThisDevice(localStorage.getItem(`voted:${id}`) === "1");
 
@@ -373,30 +417,13 @@ export default function TripPollPage({
     setLockError("");
     setIsLocking(true);
     try {
-      // A LINE session is attached when available but never required -
-      // matching handleSubmit's voting path (see
-      // app/api/trigger-jarvis/route.ts's docstring for why: the atomic
-      // claim server-side, not a verified identity, is what actually
-      // prevents duplicate-spend abuse of this button now). A getIDToken()
-      // failure here just proceeds anonymously rather than blocking.
-      let liffIdToken = "";
-      try {
-        if (liff.isLoggedIn()) {
-          liffIdToken = liff.getIDToken() || "";
-        }
-      } catch (tokenError) {
-        console.error("liff.getIDToken() failed at lock time:", tokenError);
-      }
-
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (liffIdToken) {
-        headers.Authorization = `Bearer ${liffIdToken}`;
-      }
-
+      // admin_token is the actual authorization mechanism now - see
+      // app/api/trigger-jarvis/route.ts's docstring. No LINE identity is
+      // sent or checked on this path at all any more.
       const response = await fetch("/api/trigger-jarvis", {
         method: "POST",
-        headers,
-        body: JSON.stringify({ trip_id: id }),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trip_id: id, admin_token: adminToken }),
       });
 
       const data = await response.json().catch(() => null);
@@ -426,14 +453,6 @@ export default function TripPollPage({
       <PageHeader title="Trip Poll" tripId={id} />
 
       <main className="mx-auto max-w-md space-y-6 px-4 py-6">
-        <button
-          type="button"
-          onClick={() => setIsAdmin((v) => !v)}
-          className="text-xs text-zinc-500 underline decoration-dotted underline-offset-2"
-        >
-          Viewing as: {isAdmin ? "Admin" : "Guest"} (demo toggle)
-        </button>
-
         {lockError && <p className="text-sm text-red-400">{lockError}</p>}
 
         <BoardingPass id={id} votes={votes} />
@@ -455,18 +474,27 @@ export default function TripPollPage({
                   <p className="text-sm font-semibold text-white">
                     Day {day.day} - {day.summary}
                   </p>
-                  {day.activities.length > 0 && (
-                    <p className="mt-2 text-xs text-zinc-400">
-                      <span className="text-zinc-500">Activities: </span>
-                      {day.activities.join(", ")}
-                    </p>
-                  )}
-                  {day.meals.length > 0 && (
-                    <p className="mt-1 text-xs text-zinc-400">
-                      <span className="text-zinc-500">Meals: </span>
-                      {day.meals.join(", ")}
-                    </p>
-                  )}
+                  <ul className="mt-2 space-y-1.5">
+                    {day.stops.map((stop, i) => (
+                      <li key={i}>
+                        {stop.travelFromPrevious && (
+                          <p
+                            className="flex items-center gap-1 pl-1 text-[11px] text-zinc-500"
+                            title="Estimated drive time for this future date, based on typical traffic patterns - not live traffic conditions."
+                          >
+                            <span aria-hidden="true">🚗</span>
+                            {formatTravelMinutes(stop.travelFromPrevious.durationMinutes)} (estimate)
+                          </p>
+                        )}
+                        <p className="text-xs text-zinc-400">
+                          <span className="text-zinc-500" aria-hidden="true">
+                            {stop.slotType === "meal" ? "🍴 " : "📍 "}
+                          </span>
+                          {stop.text}
+                        </p>
+                      </li>
+                    ))}
+                  </ul>
                 </li>
               ))}
             </ul>

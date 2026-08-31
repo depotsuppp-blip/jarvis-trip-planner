@@ -26,6 +26,20 @@ export function computeDateRangeLabel(
   )}`;
 }
 
+/**
+ * The earliest voted "From" date, as a raw YYYY-MM-DD string (not the
+ * formatted label computeDateRangeLabel produces) - null if no vote
+ * supplied one. Used by app/api/trigger-jarvis/route.ts's Stage 2.5 to
+ * anchor each itinerary day's Routes API departureTime to the trip's
+ * actual likely date (day 1 = this date, day N = this date + N-1 days)
+ * rather than "now", which would ask for current traffic instead of a
+ * plausible future estimate.
+ */
+export function earliestStartDate(votes: { startDate: string }[]): string | null {
+  const starts = votes.map((v) => v.startDate).filter(Boolean).sort();
+  return starts[0] ?? null;
+}
+
 export interface VibeTally {
   vibe: string;
   count: number;

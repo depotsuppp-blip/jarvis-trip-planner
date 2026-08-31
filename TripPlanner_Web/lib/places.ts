@@ -10,10 +10,23 @@
  * project even though GOOGLE_MAPS_API_KEY is the same key for both.
  */
 
+export interface LatLng {
+  lat: number;
+  lng: number;
+}
+
 export interface PlaceResult {
   name: string;
   address: string;
   rating: number | null;
+  /**
+   * null only if Google's response omits it for this specific place (rare
+   * for Text Search) - never omitted from the field mask itself, so this
+   * is a per-place data gap, not a config issue. Stage 2.5 (see
+   * app/api/trigger-jarvis/route.ts) treats a null location as "no travel
+   * time possible to/from this stop" rather than failing.
+   */
+  location: LatLng | null;
 }
 
 /**
@@ -42,13 +55,27 @@ const PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText";
 // Minimal on purpose - a broader field mask (photos, reviews, opening
 // hours, ...) bills at a higher Places API SKU tier, and none of that is
 // used by the itinerary prompt this feeds.
-const FIELD_MASK = "places.displayName,places.formattedAddress,places.rating";
+//
+// places.location is included for Stage 2.5's travel-time enrichment
+// (app/api/trigger-jarvis/route.ts) - verified against Google's Place
+// Data Fields (New) table before adding it: for Text Search specifically,
+// displayName/formattedAddress/location are all "Pro" tier, while rating
+// alone already puts this call at "Enterprise" tier (Google bills at the
+// HIGHEST SKU touched by any field in the mask, per Places API (New)'s
+// usage-and-billing docs). Since rating was already here, adding location
+// does not raise the SKU or the price - Enterprise already dominates Pro.
+// This is worth re-confirming against Google's current pricing docs if
+// rating is ever removed from this mask, since Pro would then become the
+// billed tier again (still includes location, just at a different price).
+const FIELD_MASK =
+  "places.displayName,places.formattedAddress,places.rating,places.location";
 
 interface PlacesSearchTextResponse {
   places?: {
     displayName?: { text?: string };
     formattedAddress?: string;
     rating?: number;
+    location?: { latitude?: number; longitude?: number };
   }[];
 }
 
@@ -100,6 +127,10 @@ export async function searchPlacesText(query: string): Promise<PlaceResult[]> {
     name: place.displayName?.text ?? "Unknown",
     address: place.formattedAddress ?? "",
     rating: typeof place.rating === "number" ? place.rating : null,
+    location:
+      typeof place.location?.latitude === "number" && typeof place.location?.longitude === "number"
+        ? { lat: place.location.latitude, lng: place.location.longitude }
+        : null,
   }));
 }
 

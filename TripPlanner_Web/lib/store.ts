@@ -154,18 +154,40 @@ export async function isPollLocked(tripId: string): Promise<boolean> {
   return row?.locked ?? false;
 }
 
-/**
- * lockedByLineUserId is metadata only, recorded when the caller happened
- * to have a verified LINE session at trigger time - "" otherwise. It is
- * never an access check: claimPollForGeneration is what actually
- * prevents duplicate spend for a trip, regardless of who is calling.
- */
-export async function lockPoll(tripId: string, lockedByLineUserId: string): Promise<void> {
+export async function lockPoll(tripId: string): Promise<void> {
   await prisma.poll.upsert({
     where: { tripId },
-    create: { tripId, locked: true, lockedAt: new Date(), generating: false, lockedByLineUserId },
-    update: { locked: true, lockedAt: new Date(), generating: false, lockedByLineUserId },
+    create: { tripId, locked: true, lockedAt: new Date(), generating: false },
+    update: { locked: true, lockedAt: new Date(), generating: false },
   });
+}
+
+// ---------------------------------------------------------------------
+// Admin token - the access-control boundary for "Lock & Generate Plan"
+// (POST /api/trigger-jarvis). See lib/adminToken.ts for hashing and
+// verification; this file only ever touches the stored hash, never a
+// raw token.
+// ---------------------------------------------------------------------
+
+/**
+ * Stores this trip's admin token hash, minted once by POST
+ * /api/poll/[id]/admin-token right after a poll is created by voice
+ * (plugins/trip_planner.py's _run_consensus_poll). An upsert since no
+ * Poll row exists yet at that point in the normal flow - same pattern
+ * as lockPoll/saveDraft elsewhere in this file.
+ */
+export async function createPollAdminToken(tripId: string, tokenHash: string): Promise<void> {
+  await prisma.poll.upsert({
+    where: { tripId },
+    create: { tripId, adminTokenHash: tokenHash },
+    update: { adminTokenHash: tokenHash },
+  });
+}
+
+/** "" if no Poll row exists yet, or none was ever issued for this trip. */
+export async function getPollAdminTokenHash(tripId: string): Promise<string> {
+  const row = await prisma.poll.findUnique({ where: { tripId } });
+  return row?.adminTokenHash ?? "";
 }
 
 // A claim older than this is treated as abandoned - see Poll.generating's

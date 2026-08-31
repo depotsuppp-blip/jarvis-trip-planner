@@ -113,6 +113,16 @@ google-genai>=1.0.0
 # There is exactly one Gemini SDK in this project's dependency tree now;
 # do not reintroduce google-generativeai without a specific reason.
 
+# Schema validation for the Trip Planner Agent's itinerary output
+# (plugins/trip_planner.py's Itinerary model) - Gemini's response_schema
+# and the forced Anthropic tool call are both built from it, and its
+# result is checked against it again on the way back, so a provider
+# returning a malformed shape is caught before it reaches a LINE
+# message. Already an undeclared transitive dependency of both SDKs
+# above; declared explicitly here so that stays true on purpose, not by
+# accident of what those two packages currently happen to vendor.
+pydantic>=2.0.0
+
 # NOTE ON THE OFFLINE GUARANTEE: the network boundary has moved. Wake
 # word detection and speech-to-text are still 100% on-device, but
 # speech *out* now has cloud tiers (see Module 3). Set
