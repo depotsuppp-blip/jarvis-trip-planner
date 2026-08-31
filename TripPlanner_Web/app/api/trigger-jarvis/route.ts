@@ -406,8 +406,19 @@ export async function POST(request: NextRequest) {
       );
     }
     console.error(`POST /api/trigger-jarvis failed for trip ${tripId}:`, error);
+    // TEMPORARY DIAGNOSTIC: production returns this generic 500 for a
+    // reproducible failure that never happens locally against the same
+    // database - surfacing the real error/stack to find out why instead
+    // of guessing. Revert to the generic message once found.
     return NextResponse.json(
-      { error: "Something went wrong while generating the plan. Please try again." },
+      {
+        error: "Something went wrong while generating the plan. Please try again.",
+        debug: {
+          name: error instanceof Error ? error.name : typeof error,
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+      },
       { status: 500 }
     );
   }
