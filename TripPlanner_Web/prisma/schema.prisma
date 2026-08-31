@@ -74,4 +74,11 @@ model Poll {
   /// reliably run a `finally` block) leaving generating=true stuck
   /// forever with no request left to release it.
   generatingStartedAt DateTime?
+  /// The verified LINE user id of whoever triggered the generation that
+  /// locked this poll, or "" if triggered without a LINE session - see
+  /// POST /api/trigger-jarvis, where a token is optional (matching
+  /// POST /api/poll/[id]'s voting path). Metadata only, not an access
+  /// control - the atomic claim in claimPollForGeneration is what
+  /// actually prevents duplicate spend, regardless of who is calling.
+  lockedByLineUserId String @default("")
 }

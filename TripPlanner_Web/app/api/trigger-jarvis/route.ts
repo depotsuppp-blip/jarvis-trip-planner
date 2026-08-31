@@ -15,15 +15,10 @@ import {
 } from "@/lib/store";
 import { summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
 
-// Two Haiku calls plus N parallel Places calls. Measured against real
-// data: stage 1 (skeleton) ~4-7s, stage 2 (final write, given grounded
-// results) ~4.5s. The Places Text Search batch itself is not yet
-// measured end to end - "Places API (New)" isn't enabled on this
-// project's Google Cloud console yet (confirmed via a live 403
-// SERVICE_DISABLED response), so there is no successful real run to
-// time that stage against - but N calls run in parallel via Promise.all
-// should add low single-digit seconds even at ~20 slots, comfortably
-// inside this ceiling. Re-time once that's enabled.
+// Two Haiku calls plus N parallel Places calls. Measured end to end
+// against a real successful run (19 slots, 0 empty): stage 1 (skeleton)
+// 3.9s, stage 1.5 (Places, all in parallel) 0.7s, stage 2 (final write)
+// 10.3s - total ~15s, comfortably inside this ceiling.
 // https://vercel.com/docs/functions/configuring-functions/duration.
 export const maxDuration = 60;
 
@@ -261,6 +256,17 @@ function parseStoredItinerary(text: string): Itinerary | null {
 }
 
 /**
+ * Best-effort caller IP for rate-limiting an anonymous trigger, which has
+ * no lineUserId to key by - same helper as app/api/poll/[id]/route.ts's
+ * clientIp, duplicated rather than shared since each route already keeps
+ * its own small local helpers (see e.g. that route's verifyHmacSignature).
+ */
+function clientIp(request: NextRequest): string {
+  const forwarded = request.headers.get("x-forwarded-for");
+  return forwarded ? forwarded.split(",")[0].trim() : "unknown";
+}
+
+/**
  * POST /api/trigger-jarvis - "Lock & Generate Plan" on the poll page.
  *
  * Self-contained: reads this trip's votes from Neon via Prisma, then
@@ -279,23 +285,37 @@ function parseStoredItinerary(text: string): Itinerary | null {
  * just a personal LINE_USER_ID push target - out of scope for now). The
  * frontend receiving the plan directly in this response is today's
  * substitute.
+ *
+ * A LINE session is optional here, not required - matching POST
+ * /api/poll/[id]'s voting path. A header that IS present must still
+ * check out (a present-but-bad token fails loudly, same reasoning as
+ * voting), but a request with no Authorization header at all proceeds
+ * anonymously. This used to be a hard requirement specifically to stop
+ * repeated-quota-burning abuse of a trip's poll link - but
+ * claimPollForGeneration below is what actually prevents that now: only
+ * one generation can ever succeed per trip regardless of who calls this,
+ * and a made-up trip_id with no real votes is rejected before any paid
+ * work runs. A verified identity on top of that added little real
+ * protection while reintroducing the exact LIFF fragility that was
+ * deliberately removed from voting earlier in this project - see
+ * lockPoll's lockedByLineUserId for the (metadata-only, not
+ * access-control) record of who triggered a given generation.
  */
 export async function POST(request: NextRequest) {
-  // Without this, anyone who obtains a trip's poll link (forwarded into
-  // a group chat, so not exactly secret) could call this route directly
-  // - no UI needed - and repeatedly burn LLM quota. This only proves the
-  // caller is SOME real LINE user, not that they're the trip's organizer
-  // - see the isAdmin TODO in app/trip/poll/[id]/page.tsx for the still-
-  // open next step.
-  const lineUserId = await verifyBearerLineToken(request.headers.get("authorization"));
-  if (!lineUserId) {
-    return NextResponse.json(
-      { error: "Missing, invalid, or expired LINE ID token." },
-      { status: 401 }
-    );
+  const authHeader = request.headers.get("authorization");
+  let lineUserId = "";
+  if (authHeader) {
+    lineUserId = (await verifyBearerLineToken(authHeader)) || "";
+    if (!lineUserId) {
+      return NextResponse.json(
+        { error: "Invalid or expired LINE ID token." },
+        { status: 401 }
+      );
+    }
   }
 
-  const rateLimit = checkRateLimit(`trigger:${lineUserId}`, TRIGGER_RATE_LIMIT, TRIGGER_RATE_WINDOW_MS);
+  const rateLimitKey = lineUserId ? `trigger:${lineUserId}` : `trigger:anon:${clientIp(request)}`;
+  const rateLimit = checkRateLimit(rateLimitKey, TRIGGER_RATE_LIMIT, TRIGGER_RATE_WINDOW_MS);
   if (!rateLimit.allowed) {
     return NextResponse.json(
       { error: "Too many plan-generation requests - please wait a few minutes and try again." },
@@ -357,7 +377,7 @@ export async function POST(request: NextRequest) {
       const itinerary = await generateFinalItinerary(skeleton, groundedSlots);
 
       await saveDraft(tripId, formatItineraryForStorage(itinerary));
-      await lockPoll(tripId);
+      await lockPoll(tripId, lineUserId);
 
       return NextResponse.json({ tripId, locked: true, itinerary }, { status: 201 });
     } catch (innerError) {

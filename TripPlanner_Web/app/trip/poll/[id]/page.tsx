@@ -373,20 +373,29 @@ export default function TripPollPage({
     setLockError("");
     setIsLocking(true);
     try {
-      // /api/trigger-jarvis now requires proof the caller is a signed-in
-      // LINE user (see that route) - otherwise anyone holding the poll
-      // link, not just the organizer, could spam paid LLM generations.
-      const idToken = liff.getIDToken();
-      if (!idToken) {
-        throw new Error("LINE ID token unavailable.");
+      // A LINE session is attached when available but never required -
+      // matching handleSubmit's voting path (see
+      // app/api/trigger-jarvis/route.ts's docstring for why: the atomic
+      // claim server-side, not a verified identity, is what actually
+      // prevents duplicate-spend abuse of this button now). A getIDToken()
+      // failure here just proceeds anonymously rather than blocking.
+      let liffIdToken = "";
+      try {
+        if (liff.isLoggedIn()) {
+          liffIdToken = liff.getIDToken() || "";
+        }
+      } catch (tokenError) {
+        console.error("liff.getIDToken() failed at lock time:", tokenError);
+      }
+
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (liffIdToken) {
+        headers.Authorization = `Bearer ${liffIdToken}`;
       }
 
       const response = await fetch("/api/trigger-jarvis", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${idToken}`,
-        },
+        headers,
         body: JSON.stringify({ trip_id: id }),
       });
 

@@ -154,11 +154,17 @@ export async function isPollLocked(tripId: string): Promise<boolean> {
   return row?.locked ?? false;
 }
 
-export async function lockPoll(tripId: string): Promise<void> {
+/**
+ * lockedByLineUserId is metadata only, recorded when the caller happened
+ * to have a verified LINE session at trigger time - "" otherwise. It is
+ * never an access check: claimPollForGeneration is what actually
+ * prevents duplicate spend for a trip, regardless of who is calling.
+ */
+export async function lockPoll(tripId: string, lockedByLineUserId: string): Promise<void> {
   await prisma.poll.upsert({
     where: { tripId },
-    create: { tripId, locked: true, lockedAt: new Date(), generating: false },
-    update: { locked: true, lockedAt: new Date(), generating: false },
+    create: { tripId, locked: true, lockedAt: new Date(), generating: false, lockedByLineUserId },
+    update: { locked: true, lockedAt: new Date(), generating: false, lockedByLineUserId },
   });
 }
 
