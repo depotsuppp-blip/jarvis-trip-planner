@@ -4,46 +4,11 @@ import { use, useEffect, useState, type FormEvent } from "react";
 import { ensureLiffInit, liff } from "@/lib/liff";
 import { PageHeader } from "@/components/PageHeader";
 import { StickyActionButton } from "@/components/StickyActionButton";
+import { TripSummary } from "@/components/trip/TripSummary";
+import { MapPlaceholderCard } from "@/components/trip/MapPlaceholderCard";
+import { TimelineList } from "@/components/trip/TimelineList";
 import { computeDateRangeLabel } from "@/lib/tripSummary";
-
-interface PollVote {
-  name: string;
-  lineUserId: string;
-  startDate: string;
-  endDate: string;
-  wishlist: string;
-  vibes: string[];
-  submittedAt: string;
-}
-
-interface TravelLeg {
-  durationMinutes: number;
-  distanceMeters: number;
-}
-
-interface ItineraryStop {
-  slotType: "activity" | "meal";
-  text: string;
-  // From the PRECEDING stop in this same day's array - null for a day's
-  // first stop, or wherever Stage 2.5 (app/api/trigger-jarvis/route.ts)
-  // had no route data (no coordinates for one of the two stops, or the
-  // Routes API call for that day failed). A future-dated, historical-
-  // pattern estimate, not live traffic - see the "~" in how this
-  // renders below.
-  travelFromPrevious: TravelLeg | null;
-}
-
-interface ItineraryDay {
-  day: number;
-  summary: string;
-  stops: ItineraryStop[];
-}
-
-interface Itinerary {
-  destination: string;
-  days: ItineraryDay[];
-  notes: string;
-}
+import type { Itinerary, PollVote } from "@/lib/tripTypes";
 
 const fieldClass =
   "mt-1.5 w-full rounded-2xl border border-white/10 bg-[#222222] px-4 py-3.5 text-base text-white placeholder:text-zinc-500 shadow-inner shadow-black/20 outline-none transition focus:border-white/25 focus:bg-[#262626] focus:ring-4 focus:ring-white/5";
@@ -65,13 +30,6 @@ const VIBE_OPTIONS = [
 // wrongly block or allow dates right around midnight.
 function todayISO() {
   return new Date().toLocaleDateString("en-CA");
-}
-
-// Rounded, never 0 - "~0 min" would read as broken rather than "very
-// close by". The "(estimate)" wording sits next to this at the call
-// site, not baked in here, since this also feeds the title tooltip.
-function formatTravelMinutes(minutes: number): string {
-  return `~${Math.max(1, Math.round(minutes))} min`;
 }
 
 function BoardingPass({ id, votes }: { id: string; votes: PollVote[] }) {
@@ -452,227 +410,212 @@ export default function TripPollPage({
     <div className="min-h-screen pb-32">
       <PageHeader title="Trip Poll" tripId={id} />
 
-      <main className="mx-auto max-w-md space-y-6 px-4 py-6">
+      <main
+        className={`mx-auto space-y-8 px-4 py-6 ${
+          generatedPlan ? "max-w-7xl" : "max-w-md"
+        }`}
+      >
         {lockError && <p className="text-sm text-red-400">{lockError}</p>}
 
-        <BoardingPass id={id} votes={votes} />
-
-        {generatedPlan && (
-          <section className="rounded-3xl border border-emerald-500/20 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
-            <div className="flex items-center justify-between gap-3">
-              <h2 className="text-base font-semibold text-white">
-                Plan ready: {generatedPlan.destination}
-              </h2>
-              <span className="shrink-0 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-400/90">
-                Locked
-              </span>
+        {generatedPlan ? (
+          <section aria-label="Trip itinerary" className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+            <div className="lg:col-span-4">
+              <TripSummary
+                destination={generatedPlan.destination}
+                dateLabel={computeDateRangeLabel(votes)}
+                headcount={votes.length}
+              />
             </div>
 
-            <ul className="mt-4 space-y-4">
-              {generatedPlan.days.map((day) => (
-                <li key={day.day} className="rounded-2xl border border-white/10 bg-[#141414] p-4">
-                  <p className="text-sm font-semibold text-white">
-                    Day {day.day} - {day.summary}
+            <div className="space-y-6 lg:col-span-8">
+              <MapPlaceholderCard />
+              <TimelineList days={generatedPlan.days} />
+              {generatedPlan.notes && (
+                <div className="rounded-3xl border border-zinc-800 bg-zinc-900/50 p-5 backdrop-blur-xl">
+                  <p className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">
+                    Notes
                   </p>
-                  <ul className="mt-2 space-y-1.5">
-                    {day.stops.map((stop, i) => (
-                      <li key={i}>
-                        {stop.travelFromPrevious && (
-                          <p
-                            className="flex items-center gap-1 pl-1 text-[11px] text-zinc-500"
-                            title="Estimated drive time for this future date, based on typical traffic patterns - not live traffic conditions."
-                          >
-                            <span aria-hidden="true">🚗</span>
-                            {formatTravelMinutes(stop.travelFromPrevious.durationMinutes)} (estimate)
-                          </p>
-                        )}
-                        <p className="text-xs text-zinc-400">
-                          <span className="text-zinc-500" aria-hidden="true">
-                            {stop.slotType === "meal" ? "🍴 " : "📍 "}
-                          </span>
-                          {stop.text}
-                        </p>
-                      </li>
-                    ))}
-                  </ul>
-                </li>
-              ))}
-            </ul>
-
-            {generatedPlan.notes && (
-              <p className="mt-4 text-sm text-zinc-300">{generatedPlan.notes}</p>
-            )}
-          </section>
-        )}
-
-        <section className="rounded-3xl border border-white/10 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
-          <h2 className="text-base font-semibold text-white">
-            Add your availability
-          </h2>
-          <p className="mt-1 text-sm text-zinc-400">
-            Let the group know when you&apos;re free and what you&apos;re hoping for.
-          </p>
-
-          <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
-            <div>
-              <label htmlFor="voterName" className={labelClass}>
-                Your name
-              </label>
-              <input
-                id="voterName"
-                type="text"
-                value={displayName}
-                onChange={(event) => setDisplayName(event.target.value)}
-                placeholder={ready ? "Your name" : "Checking LINE sign-in..."}
-                maxLength={100}
-                className={fieldClass}
-              />
-              {idToken && (
-                <p className="mt-1.5 text-xs text-emerald-400/80">
-                  Signed in with LINE - your vote is linked to your account.
-                </p>
+                  <p className="mt-1.5 text-sm text-zinc-300">{generatedPlan.notes}</p>
+                </div>
               )}
             </div>
+          </section>
+        ) : (
+          <BoardingPass id={id} votes={votes} />
+        )}
 
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label htmlFor="startDate" className={labelClass}>
-                  From
-                </label>
-                <input
-                  id="startDate"
-                  type="date"
-                  value={startDate}
-                  min={todayISO()}
-                  onChange={(event) => setStartDate(event.target.value)}
-                  className={`${fieldClass} [color-scheme:dark]`}
-                />
-              </div>
-              <div>
-                <label htmlFor="endDate" className={labelClass}>
-                  To
-                </label>
-                <input
-                  id="endDate"
-                  type="date"
-                  value={endDate}
-                  min={startDate || todayISO()}
-                  onChange={(event) => setEndDate(event.target.value)}
-                  className={`${fieldClass} [color-scheme:dark]`}
-                />
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <label htmlFor="wishlist" className={labelClass}>
-                Specific Places (Optional)
-              </label>
-              <textarea
-                id="wishlist"
-                value={wishlist}
-                onChange={(event) => setWishlist(event.target.value)}
-                placeholder="Cafe, art gallery, chill vibes..."
-                rows={3}
-                maxLength={WISHLIST_MAX_LENGTH}
-                className={`${fieldClass} resize-none`}
-              />
-              <p className="text-right text-xs text-zinc-500">
-                {wishlist.length}/{WISHLIST_MAX_LENGTH}
-              </p>
-            </div>
-
-            <div className="space-y-2 pt-1">
-              <p className={labelClass}>Or choose the vibes you want</p>
-              <div className="flex flex-wrap gap-2">
-                {VIBE_OPTIONS.map((vibe) => {
-                  const isSelected = vibes.includes(vibe);
-                  return (
-                    <button
-                      key={vibe}
-                      type="button"
-                      onClick={() => toggleVibe(vibe)}
-                      aria-pressed={isSelected}
-                      className={`inline-flex items-center gap-1.5 rounded-full border px-4 py-2.5 text-sm font-medium transition active:scale-[0.97] ${
-                        isSelected
-                          ? "border-indigo-500 bg-indigo-500 text-white shadow-md shadow-indigo-500/25"
-                          : "border-white/10 bg-[#1A1A1A] text-zinc-300"
-                      }`}
-                    >
-                      {isSelected && <span aria-hidden="true">✓</span>}
-                      {vibe}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {error && <p className="text-sm text-red-400">{error}</p>}
-
-            {!idToken && hasVotedOnThisDevice && (
-              <p className="text-sm text-zinc-400">
-                You&apos;ve already voted on this device - submitting again
-                will update your entry.
-              </p>
-            )}
-
-            <button
-              type="submit"
-              disabled={isSubmitting}
-              className="w-full rounded-full bg-zinc-200 px-4 py-3.5 text-base font-semibold text-zinc-900 shadow-md shadow-black/30 transition active:scale-[0.98] disabled:opacity-50"
-            >
-              {isSubmitting
-                ? "Submitting..."
-                : !idToken && hasVotedOnThisDevice
-                  ? "Update your vote"
-                  : "Submit my vote"}
-            </button>
-          </form>
-        </section>
-
-        <section className="rounded-3xl border border-white/10 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
-          <h2 className="text-base font-semibold text-white">
-            Current votes ({votes.length})
-          </h2>
-
-          {isLoadingVotes ? (
-            <p className="mt-3 text-sm text-zinc-400">Loading...</p>
-          ) : votes.length === 0 ? (
-            <p className="mt-3 text-sm text-zinc-400">
-              No one has voted yet - be the first!
+        {!generatedPlan && (
+        <div className="space-y-6">
+          <section className="rounded-3xl border border-white/10 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
+            <h2 className="text-base font-semibold text-white">
+              Add your availability
+            </h2>
+            <p className="mt-1 text-sm text-zinc-400">
+              Let the group know when you&apos;re free and what you&apos;re hoping for.
             </p>
-          ) : (
-            <ul className="mt-3 space-y-3">
-              {votes.map((vote, index) => (
-                <li
-                  key={`${vote.name}-${vote.submittedAt}-${index}`}
-                  className="rounded-2xl border border-white/10 bg-[#141414] p-4"
-                >
-                  <p className="font-medium text-white">{vote.name}</p>
-                  {(vote.startDate || vote.endDate) && (
-                    <p className="text-sm text-zinc-400">
-                      {vote.startDate || "?"} &rarr; {vote.endDate || "?"}
-                    </p>
-                  )}
-                  {vote.wishlist && (
-                    <p className="mt-1 text-sm text-zinc-300">{vote.wishlist}</p>
-                  )}
-                  {Array.isArray(vote.vibes) && vote.vibes.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {vote.vibes.map((vibe) => (
-                        <span
-                          key={vibe}
-                          className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-xs text-indigo-300"
-                        >
-                          {vibe}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+
+            <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
+              <div>
+                <label htmlFor="voterName" className={labelClass}>
+                  Your name
+                </label>
+                <input
+                  id="voterName"
+                  type="text"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  placeholder={ready ? "Your name" : "Checking LINE sign-in..."}
+                  maxLength={100}
+                  className={fieldClass}
+                />
+                {idToken && (
+                  <p className="mt-1.5 text-xs text-emerald-400/80">
+                    Signed in with LINE - your vote is linked to your account.
+                  </p>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="startDate" className={labelClass}>
+                    From
+                  </label>
+                  <input
+                    id="startDate"
+                    type="date"
+                    value={startDate}
+                    min={todayISO()}
+                    onChange={(event) => setStartDate(event.target.value)}
+                    className={`${fieldClass} [color-scheme:dark]`}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="endDate" className={labelClass}>
+                    To
+                  </label>
+                  <input
+                    id="endDate"
+                    type="date"
+                    value={endDate}
+                    min={startDate || todayISO()}
+                    onChange={(event) => setEndDate(event.target.value)}
+                    className={`${fieldClass} [color-scheme:dark]`}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label htmlFor="wishlist" className={labelClass}>
+                  Specific Places (Optional)
+                </label>
+                <textarea
+                  id="wishlist"
+                  value={wishlist}
+                  onChange={(event) => setWishlist(event.target.value)}
+                  placeholder="Cafe, art gallery, chill vibes..."
+                  rows={3}
+                  maxLength={WISHLIST_MAX_LENGTH}
+                  className={`${fieldClass} resize-none`}
+                />
+                <p className="text-right text-xs text-zinc-500">
+                  {wishlist.length}/{WISHLIST_MAX_LENGTH}
+                </p>
+              </div>
+
+              <div className="space-y-2 pt-1">
+                <p className={labelClass}>Or choose the vibes you want</p>
+                <div className="flex flex-wrap gap-2">
+                  {VIBE_OPTIONS.map((vibe) => {
+                    const isSelected = vibes.includes(vibe);
+                    return (
+                      <button
+                        key={vibe}
+                        type="button"
+                        onClick={() => toggleVibe(vibe)}
+                        aria-pressed={isSelected}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-4 py-2.5 text-sm font-medium transition active:scale-[0.97] ${
+                          isSelected
+                            ? "border-indigo-500 bg-indigo-500 text-white shadow-md shadow-indigo-500/25"
+                            : "border-white/10 bg-[#1A1A1A] text-zinc-300"
+                        }`}
+                      >
+                        {isSelected && <span aria-hidden="true">✓</span>}
+                        {vibe}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {error && <p className="text-sm text-red-400">{error}</p>}
+
+              {!idToken && hasVotedOnThisDevice && (
+                <p className="text-sm text-zinc-400">
+                  You&apos;ve already voted on this device - submitting again
+                  will update your entry.
+                </p>
+              )}
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full rounded-full bg-zinc-200 px-4 py-3.5 text-base font-semibold text-zinc-900 shadow-md shadow-black/30 transition active:scale-[0.98] disabled:opacity-50"
+              >
+                {isSubmitting
+                  ? "Submitting..."
+                  : !idToken && hasVotedOnThisDevice
+                    ? "Update your vote"
+                    : "Submit my vote"}
+              </button>
+            </form>
+          </section>
+
+          <section className="rounded-3xl border border-white/10 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
+            <h2 className="text-base font-semibold text-white">
+              Current votes ({votes.length})
+            </h2>
+
+            {isLoadingVotes ? (
+              <p className="mt-3 text-sm text-zinc-400">Loading...</p>
+            ) : votes.length === 0 ? (
+              <p className="mt-3 text-sm text-zinc-400">
+                No one has voted yet - be the first!
+              </p>
+            ) : (
+              <ul className="mt-3 space-y-3">
+                {votes.map((vote, index) => (
+                  <li
+                    key={`${vote.name}-${vote.submittedAt}-${index}`}
+                    className="rounded-2xl border border-white/10 bg-[#141414] p-4"
+                  >
+                    <p className="font-medium text-white">{vote.name}</p>
+                    {(vote.startDate || vote.endDate) && (
+                      <p className="text-sm text-zinc-400">
+                        {vote.startDate || "?"} &rarr; {vote.endDate || "?"}
+                      </p>
+                    )}
+                    {vote.wishlist && (
+                      <p className="mt-1 text-sm text-zinc-300">{vote.wishlist}</p>
+                    )}
+                    {Array.isArray(vote.vibes) && vote.vibes.length > 0 && (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {vote.vibes.map((vibe) => (
+                          <span
+                            key={vibe}
+                            className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-xs text-indigo-300"
+                          >
+                            {vibe}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
+        )}
       </main>
 
       <StickyActionButton
