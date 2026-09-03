@@ -42,6 +42,12 @@ export interface Itinerary {
   destination: string;
   days: ItineraryDay[];
   notes: string;
+  // The specific 5-day trip window this itinerary was generated for (see
+  // app/api/trigger-jarvis/route.ts's tripWindow) - optional since a plan
+  // generated before this field existed still parses without it; the
+  // poll page falls back to the raw vote date range when absent.
+  startDate?: string;
+  endDate?: string;
 }
 
 // Rounded, never 0 - "~0 min" would read as broken rather than "very

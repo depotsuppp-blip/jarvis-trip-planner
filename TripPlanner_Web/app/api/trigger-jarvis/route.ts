@@ -14,7 +14,8 @@ import {
   releasePollClaim,
   saveDraft,
 } from "@/lib/store";
-import { earliestStartDate, summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
+import { summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
+import { computeBestTripWindow, TRIP_WINDOW_DAYS, type TripDateWindow } from "@/lib/tripDates";
 
 // Two Haiku calls, N parallel Places calls, plus up to one Routes API
 // call per day (Stage 2.5), all days in parallel. Measured end to end
@@ -79,6 +80,12 @@ const ItinerarySchema = z.object({
   destination: z.string(),
   days: z.array(ItineraryDaySchema),
   notes: z.string(),
+  // The specific TRIP_WINDOW_DAYS-day window (see lib/tripDates.ts) this
+  // itinerary was generated for - optional so a plan stored before this
+  // field existed still parses via parseStoredItinerary below rather
+  // than being rejected outright.
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
 });
 
 type Itinerary = z.infer<typeof ItinerarySchema>;
@@ -154,8 +161,16 @@ type ItinerarySkeleton = z.infer<typeof ItinerarySkeletonSchema>;
  * votes. Unlike a "respond with ONLY a JSON object" prompt, this doesn't
  * need to ask for JSON at all - output_config.format below constrains
  * the response shape at the API level.
+ *
+ * Dates diverge from that Python prompt, though: this passes the actual
+ * TRIP_WINDOW_DAYS-day window computeBestTripWindow picked (the specific
+ * days most voters overlap on), not the group's full combined date
+ * range, and instructs the model to return exactly that many days - see
+ * this route's docstring point about the trip being a fixed "5 Days 4
+ * Nights" length, not however wide the poll's raw votes happened to
+ * span.
  */
-function buildSkeletonPrompt(summary: PollSummary): string {
+function buildSkeletonPrompt(summary: PollSummary, tripWindow: TripDateWindow): string {
   const vibesText =
     summary.topVibes.length > 0
       ? summary.topVibes.map((v) => `${v.vibe} (${v.count} votes)`).join(", ")
@@ -174,9 +189,14 @@ function buildSkeletonPrompt(summary: PollSummary): string {
     "popular vibes. Do not reference how the group gets to the destination or where they are coming " +
     "from - start the itinerary from arrival.\n\n" +
     `Group size: ${summary.totalVotes} people (${votersText}).\n` +
-    `Preferred dates: ${summary.dateRangeLabel}.\n` +
     `Top vibes, most to least popular: ${vibesText}.\n` +
     `Specific places requested by the group: ${wishlistText}.\n\n` +
+    `This trip is FIXED at exactly ${TRIP_WINDOW_DAYS} days / ${TRIP_WINDOW_DAYS - 1} nights, ` +
+    `from ${tripWindow.startDate} to ${tripWindow.endDate} inclusive - the specific window that the ` +
+    `most voters (${tripWindow.voterCount} of ${summary.totalVotes}) can make, not the group's full ` +
+    "combined date range. You MUST return EXACTLY " +
+    `${TRIP_WINDOW_DAYS} day objects in the "days" array, numbered 1 through ${TRIP_WINDOW_DAYS} in ` +
+    "calendar order matching that window - never more, never fewer.\n\n" +
     "For each day, break it into a small number of slots - roughly 3-4 activities and 2 meals per " +
     "day is a reasonable density, not more. For each slot, give: slotType (\"activity\" or \"meal\"), " +
     "a short search category such as \"cafe\", \"temple\", \"night market\", \"Thai restaurant\", " +
@@ -185,7 +205,10 @@ function buildSkeletonPrompt(summary: PollSummary): string {
   );
 }
 
-async function generateSkeleton(summary: PollSummary): Promise<ItinerarySkeleton> {
+async function generateSkeleton(
+  summary: PollSummary,
+  tripWindow: TripDateWindow
+): Promise<ItinerarySkeleton> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     throw new Error("ANTHROPIC_API_KEY is not configured.");
@@ -196,13 +219,30 @@ async function generateSkeleton(summary: PollSummary): Promise<ItinerarySkeleton
     model: FINALIZE_MODEL,
     max_tokens: FINALIZE_MAX_TOKENS,
     output_config: { format: zodOutputFormat(ItinerarySkeletonSchema) },
-    messages: [{ role: "user", content: buildSkeletonPrompt(summary) }],
+    messages: [{ role: "user", content: buildSkeletonPrompt(summary, tripWindow) }],
   });
 
   if (!response.parsed_output) {
     throw new Error("Claude did not return a valid itinerary skeleton.");
   }
-  return response.parsed_output;
+
+  // Prompt-level enforcement (above) is the primary mechanism, but Haiku
+  // can still miscount - a code-level safety net is cheap insurance. An
+  // over-long skeleton is truncated to the requested window rather than
+  // failing the whole generation; an under-long one is left as-is and
+  // just logged, since fabricating extra days' content isn't safe to do
+  // without another grounded LLM pass.
+  const skeleton = response.parsed_output;
+  if (skeleton.days.length !== TRIP_WINDOW_DAYS) {
+    console.error(
+      `[trigger-jarvis] skeleton returned ${skeleton.days.length} days, expected ${TRIP_WINDOW_DAYS} ` +
+        `(window ${tripWindow.startDate} to ${tripWindow.endDate}).`
+    );
+    if (skeleton.days.length > TRIP_WINDOW_DAYS) {
+      return { ...skeleton, days: skeleton.days.slice(0, TRIP_WINDOW_DAYS) };
+    }
+  }
+  return skeleton;
 }
 
 // ---------------------------------------------------------------------
@@ -400,7 +440,7 @@ function resolveStopLocation(stop: ItineraryStopLLM, slot: GroundedSlot | undefi
 async function enrichItineraryWithTravelTimes(
   itinerary: ItineraryLLM,
   groundedSlots: GroundedSlot[],
-  tripStartDate: string | null
+  tripWindow: TripDateWindow
 ): Promise<Itinerary> {
   const days = await Promise.all(
     itinerary.days.map(async (day) => {
@@ -414,7 +454,10 @@ async function enrichItineraryWithTravelTimes(
 
       const legs =
         geocodedCoords.length >= 2
-          ? await computeDayRoute(geocodedCoords, computeDepartureTimeForDay(tripStartDate, day.day))
+          ? await computeDayRoute(
+              geocodedCoords,
+              computeDepartureTimeForDay(tripWindow.startDate, day.day)
+            )
           : null;
 
       // legs[k] is the transition INTO geocodedIndices[k + 1] - map it
@@ -437,7 +480,13 @@ async function enrichItineraryWithTravelTimes(
     })
   );
 
-  return { destination: itinerary.destination, days, notes: itinerary.notes };
+  return {
+    destination: itinerary.destination,
+    days,
+    notes: itinerary.notes,
+    startDate: tripWindow.startDate,
+    endDate: tripWindow.endDate,
+  };
 }
 
 /**
@@ -572,8 +621,20 @@ export async function POST(request: NextRequest) {
       // collide across concurrent requests for different trips, since
       // this route has no per-request namespacing for them.
       const summary = summarizePollVotes(votes);
+      // The specific TRIP_WINDOW_DAYS-day window most voters overlap on -
+      // see lib/tripDates.ts's docstring for why this replaced the old
+      // earliest-start/latest-end span across every vote. Computed once
+      // here and threaded through Stage 1 (the prompt) and Stage 2.5 (the
+      // Routes API departure-date anchor) so both agree on the same
+      // dates.
+      const tripWindow = computeBestTripWindow(votes);
+      console.log(
+        `[trigger-jarvis] ${tripId}: trip window ${tripWindow.startDate} to ${tripWindow.endDate} ` +
+          `(${tripWindow.voterCount}/${votes.length} voters overlap)`
+      );
+
       let stageStart = Date.now();
-      const skeleton = await generateSkeleton(summary);
+      const skeleton = await generateSkeleton(summary, tripWindow);
       console.log(`[trigger-jarvis] ${tripId}: Stage 1 (skeleton) ${Date.now() - stageStart}ms`);
 
       stageStart = Date.now();
@@ -585,11 +646,7 @@ export async function POST(request: NextRequest) {
       console.log(`[trigger-jarvis] ${tripId}: Stage 2 (final write) ${Date.now() - stageStart}ms`);
 
       stageStart = Date.now();
-      const itinerary = await enrichItineraryWithTravelTimes(
-        draftItinerary,
-        groundedSlots,
-        earliestStartDate(votes)
-      );
+      const itinerary = await enrichItineraryWithTravelTimes(draftItinerary, groundedSlots, tripWindow);
       console.log(`[trigger-jarvis] ${tripId}: Stage 2.5 (Routes) ${Date.now() - stageStart}ms`);
 
       await saveDraft(tripId, formatItineraryForStorage(itinerary));

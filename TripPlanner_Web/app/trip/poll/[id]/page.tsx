@@ -7,12 +7,12 @@ import { StickyActionButton } from "@/components/StickyActionButton";
 import { TripSummary } from "@/components/trip/TripSummary";
 import { MapPlaceholderCard } from "@/components/trip/MapPlaceholderCard";
 import { TimelineList } from "@/components/trip/TimelineList";
-import { computeDateRangeLabel } from "@/lib/tripSummary";
+import { computeDateRangeLabel, formatShortDate } from "@/lib/tripSummary";
 import type { Itinerary, PollVote } from "@/lib/tripTypes";
 
 const fieldClass =
-  "mt-1.5 w-full rounded-2xl border border-white/10 bg-[#222222] px-4 py-3.5 text-base text-white placeholder:text-zinc-500 shadow-inner shadow-black/20 outline-none transition focus:border-white/25 focus:bg-[#262626] focus:ring-4 focus:ring-white/5";
-const labelClass = "text-xs font-semibold uppercase tracking-wider text-zinc-400";
+  "mt-1.5 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3.5 text-base text-slate-900 placeholder:text-slate-400 shadow-inner shadow-slate-900/5 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100";
+const labelClass = "text-xs font-semibold uppercase tracking-wider text-slate-500";
 const WISHLIST_MAX_LENGTH = 150;
 
 const VIBE_OPTIONS = [
@@ -42,63 +42,61 @@ function BoardingPass({ id, votes }: { id: string; votes: PollVote[] }) {
   });
 
   return (
-    <div className="relative rounded-3xl bg-gradient-to-br from-indigo-500 via-violet-600 to-sky-600 p-[1px] shadow-2xl shadow-indigo-950/50">
-      <div className="relative overflow-hidden rounded-3xl bg-[#1A1A1A]">
-        <div className="flex items-start justify-between px-5 pt-5">
-          <div>
-            <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-indigo-200/70">
-              Digital Boarding Pass
-            </p>
-            <p className="mt-1 text-xl font-bold text-white">Trip Poll</p>
-          </div>
-          <span className="shrink-0 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-400/90">
-            Poll Open
-          </span>
+    <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+      <div className="flex items-start justify-between px-5 pt-5">
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-blue-600">
+            Digital Boarding Pass
+          </p>
+          <p className="mt-1 text-xl font-bold text-slate-900">Trip Poll</p>
         </div>
+        <span className="shrink-0 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-700">
+          Poll Open
+        </span>
+      </div>
 
-        <div className="mt-5 flex items-center gap-3 px-5">
-          <div className="min-w-0 flex-1">
-            <p className="text-[11px] uppercase tracking-widest text-zinc-400">Crew</p>
-            <p className="truncate text-2xl font-bold text-white">{crewLabel}</p>
-          </div>
-          <div className="flex w-10 shrink-0 flex-col items-center text-indigo-300">
-            <span className="text-lg leading-none">&#9992;</span>
-            <div className="mt-1 h-px w-full border-t border-dashed border-white/25" />
-          </div>
-          <div className="min-w-0 flex-1 text-right">
-            <p className="text-[11px] uppercase tracking-widest text-zinc-400">Trip code</p>
-            <p className="truncate font-mono text-2xl font-bold text-white">
-              {id.toUpperCase()}
-            </p>
-          </div>
+      <div className="mt-5 flex items-center gap-3 px-5">
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] uppercase tracking-widest text-slate-400">Crew</p>
+          <p className="truncate text-2xl font-bold text-slate-900">{crewLabel}</p>
         </div>
+        <div className="flex w-10 shrink-0 flex-col items-center text-rose-500">
+          <span className="text-lg leading-none">&#9992;</span>
+          <div className="mt-1 h-px w-full border-t border-dashed border-slate-300" />
+        </div>
+        <div className="min-w-0 flex-1 text-right">
+          <p className="text-[11px] uppercase tracking-widest text-slate-400">Trip code</p>
+          <p className="truncate font-mono text-2xl font-bold text-slate-900">
+            {id.toUpperCase()}
+          </p>
+        </div>
+      </div>
 
-        <div className="relative my-5">
-          <div className="absolute -left-[10px] top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-[#0d0d0d]" />
-          <div className="absolute -right-[10px] top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-[#0d0d0d]" />
-          <div className="border-t border-dashed border-white/15" />
-        </div>
+      <div className="relative my-5">
+        <div className="absolute -left-[10px] top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-slate-50" />
+        <div className="absolute -right-[10px] top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-slate-50" />
+        <div className="border-t border-dashed border-slate-200" />
+      </div>
 
-        <div className="grid grid-cols-2 gap-2 px-5 pb-5 text-center">
-          <div>
-            <p className="text-[10px] uppercase tracking-widest text-zinc-500">Dates</p>
-            <p className="mt-1 text-sm font-semibold text-white">{dateLabel}</p>
-          </div>
-          <div>
-            <p className="text-[10px] uppercase tracking-widest text-zinc-500">Status</p>
-            <p className="mt-1 text-sm font-semibold text-white">Awaiting lock-in</p>
-          </div>
+      <div className="grid grid-cols-2 gap-2 px-5 pb-5 text-center">
+        <div>
+          <p className="text-[10px] uppercase tracking-widest text-slate-400">Dates</p>
+          <p className="mt-1 text-sm font-semibold text-slate-900">{dateLabel}</p>
         </div>
+        <div>
+          <p className="text-[10px] uppercase tracking-widest text-slate-400">Status</p>
+          <p className="mt-1 text-sm font-semibold text-slate-900">Awaiting lock-in</p>
+        </div>
+      </div>
 
-        <div className="flex h-8 items-end gap-[3px] overflow-hidden px-5 pb-5">
-          {barcodeWidths.map((w, i) => (
-            <span
-              key={i}
-              className="h-full bg-white/25"
-              style={{ width: `${w}px` }}
-            />
-          ))}
-        </div>
+      <div className="flex h-8 items-end gap-[3px] overflow-hidden px-5 pb-5">
+        {barcodeWidths.map((w, i) => (
+          <span
+            key={i}
+            className="h-full bg-slate-200"
+            style={{ width: `${w}px` }}
+          />
+        ))}
       </div>
     </div>
   );
@@ -406,39 +404,48 @@ export default function TripPollPage({
     }
   }
 
+  const lockedDateLabel =
+    generatedPlan?.startDate && generatedPlan?.endDate
+      ? `${formatShortDate(generatedPlan.startDate)} – ${formatShortDate(generatedPlan.endDate)}`
+      : computeDateRangeLabel(votes);
+
   return (
-    <div className="min-h-screen pb-32">
-      <PageHeader title="Trip Poll" tripId={id} />
+    <div className="min-h-screen bg-slate-50 pb-32">
+      <PageHeader title="Trip Poll" tripId={id} variant="light" />
 
       <main
         className={`mx-auto space-y-8 px-4 py-6 ${
           generatedPlan ? "max-w-7xl" : "max-w-md"
         }`}
       >
-        {lockError && <p className="text-sm text-red-400">{lockError}</p>}
+        {lockError && <p className="text-sm text-red-600">{lockError}</p>}
 
         {generatedPlan ? (
-          <section aria-label="Trip itinerary" className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-            <div className="lg:col-span-4">
-              <TripSummary
-                destination={generatedPlan.destination}
-                dateLabel={computeDateRangeLabel(votes)}
-                headcount={votes.length}
-              />
+          <section aria-label="Trip itinerary" className="space-y-6">
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+              <div className="lg:col-span-4">
+                <TripSummary
+                  destination={generatedPlan.destination}
+                  dateLabel={lockedDateLabel}
+                  headcount={votes.length}
+                />
+              </div>
+
+              <div className="lg:col-span-8">
+                <MapPlaceholderCard />
+              </div>
             </div>
 
-            <div className="space-y-6 lg:col-span-8">
-              <MapPlaceholderCard />
-              <TimelineList days={generatedPlan.days} />
-              {generatedPlan.notes && (
-                <div className="rounded-3xl border border-zinc-800 bg-zinc-900/50 p-5 backdrop-blur-xl">
-                  <p className="text-[11px] font-semibold uppercase tracking-widest text-zinc-500">
-                    Notes
-                  </p>
-                  <p className="mt-1.5 text-sm text-zinc-300">{generatedPlan.notes}</p>
-                </div>
-              )}
-            </div>
+            <TimelineList days={generatedPlan.days} />
+
+            {generatedPlan.notes && (
+              <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+                <p className="text-[11px] font-semibold uppercase tracking-widest text-slate-400">
+                  Notes
+                </p>
+                <p className="mt-1.5 text-sm text-slate-600">{generatedPlan.notes}</p>
+              </div>
+            )}
           </section>
         ) : (
           <BoardingPass id={id} votes={votes} />
@@ -446,11 +453,11 @@ export default function TripPollPage({
 
         {!generatedPlan && (
         <div className="space-y-6">
-          <section className="rounded-3xl border border-white/10 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
-            <h2 className="text-base font-semibold text-white">
+          <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-base font-semibold text-slate-900">
               Add your availability
             </h2>
-            <p className="mt-1 text-sm text-zinc-400">
+            <p className="mt-1 text-sm text-slate-500">
               Let the group know when you&apos;re free and what you&apos;re hoping for.
             </p>
 
@@ -469,7 +476,7 @@ export default function TripPollPage({
                   className={fieldClass}
                 />
                 {idToken && (
-                  <p className="mt-1.5 text-xs text-emerald-400/80">
+                  <p className="mt-1.5 text-xs text-emerald-600">
                     Signed in with LINE - your vote is linked to your account.
                   </p>
                 )}
@@ -486,7 +493,7 @@ export default function TripPollPage({
                     value={startDate}
                     min={todayISO()}
                     onChange={(event) => setStartDate(event.target.value)}
-                    className={`${fieldClass} [color-scheme:dark]`}
+                    className={`${fieldClass} [color-scheme:light]`}
                   />
                 </div>
                 <div>
@@ -499,7 +506,7 @@ export default function TripPollPage({
                     value={endDate}
                     min={startDate || todayISO()}
                     onChange={(event) => setEndDate(event.target.value)}
-                    className={`${fieldClass} [color-scheme:dark]`}
+                    className={`${fieldClass} [color-scheme:light]`}
                   />
                 </div>
               </div>
@@ -517,7 +524,7 @@ export default function TripPollPage({
                   maxLength={WISHLIST_MAX_LENGTH}
                   className={`${fieldClass} resize-none`}
                 />
-                <p className="text-right text-xs text-zinc-500">
+                <p className="text-right text-xs text-slate-400">
                   {wishlist.length}/{WISHLIST_MAX_LENGTH}
                 </p>
               </div>
@@ -535,8 +542,8 @@ export default function TripPollPage({
                         aria-pressed={isSelected}
                         className={`inline-flex items-center gap-1.5 rounded-full border px-4 py-2.5 text-sm font-medium transition active:scale-[0.97] ${
                           isSelected
-                            ? "border-indigo-500 bg-indigo-500 text-white shadow-md shadow-indigo-500/25"
-                            : "border-white/10 bg-[#1A1A1A] text-zinc-300"
+                            ? "border-rose-500 bg-rose-500 text-white shadow-md shadow-rose-500/25"
+                            : "border-slate-200 bg-white text-slate-600"
                         }`}
                       >
                         {isSelected && <span aria-hidden="true">✓</span>}
@@ -547,10 +554,10 @@ export default function TripPollPage({
                 </div>
               </div>
 
-              {error && <p className="text-sm text-red-400">{error}</p>}
+              {error && <p className="text-sm text-red-600">{error}</p>}
 
               {!idToken && hasVotedOnThisDevice && (
-                <p className="text-sm text-zinc-400">
+                <p className="text-sm text-slate-500">
                   You&apos;ve already voted on this device - submitting again
                   will update your entry.
                 </p>
@@ -559,7 +566,7 @@ export default function TripPollPage({
               <button
                 type="submit"
                 disabled={isSubmitting}
-                className="w-full rounded-full bg-zinc-200 px-4 py-3.5 text-base font-semibold text-zinc-900 shadow-md shadow-black/30 transition active:scale-[0.98] disabled:opacity-50"
+                className="w-full rounded-full bg-rose-500 px-4 py-3.5 text-base font-semibold text-white shadow-md shadow-rose-500/20 transition hover:bg-rose-600 active:scale-[0.98] disabled:opacity-50"
               >
                 {isSubmitting
                   ? "Submitting..."
@@ -570,15 +577,15 @@ export default function TripPollPage({
             </form>
           </section>
 
-          <section className="rounded-3xl border border-white/10 bg-[#1A1A1A] p-5 shadow-2xl shadow-black/40">
-            <h2 className="text-base font-semibold text-white">
+          <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-base font-semibold text-slate-900">
               Current votes ({votes.length})
             </h2>
 
             {isLoadingVotes ? (
-              <p className="mt-3 text-sm text-zinc-400">Loading...</p>
+              <p className="mt-3 text-sm text-slate-500">Loading...</p>
             ) : votes.length === 0 ? (
-              <p className="mt-3 text-sm text-zinc-400">
+              <p className="mt-3 text-sm text-slate-500">
                 No one has voted yet - be the first!
               </p>
             ) : (
@@ -586,23 +593,23 @@ export default function TripPollPage({
                 {votes.map((vote, index) => (
                   <li
                     key={`${vote.name}-${vote.submittedAt}-${index}`}
-                    className="rounded-2xl border border-white/10 bg-[#141414] p-4"
+                    className="rounded-2xl border border-slate-200 bg-slate-50 p-4"
                   >
-                    <p className="font-medium text-white">{vote.name}</p>
+                    <p className="font-medium text-slate-900">{vote.name}</p>
                     {(vote.startDate || vote.endDate) && (
-                      <p className="text-sm text-zinc-400">
+                      <p className="text-sm text-slate-500">
                         {vote.startDate || "?"} &rarr; {vote.endDate || "?"}
                       </p>
                     )}
                     {vote.wishlist && (
-                      <p className="mt-1 text-sm text-zinc-300">{vote.wishlist}</p>
+                      <p className="mt-1 text-sm text-slate-700">{vote.wishlist}</p>
                     )}
                     {Array.isArray(vote.vibes) && vote.vibes.length > 0 && (
                       <div className="mt-2 flex flex-wrap gap-1.5">
                         {vote.vibes.map((vibe) => (
                           <span
                             key={vibe}
-                            className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-xs text-indigo-300"
+                            className="rounded-full border border-blue-200 bg-blue-50 px-2.5 py-1 text-xs text-blue-700"
                           >
                             {vibe}
                           </span>
@@ -623,6 +630,7 @@ export default function TripPollPage({
         onClick={handleLockAndGenerate}
         disabled={!isAdmin || isLocking}
         disabledHint={!isAdmin ? "Only the trip organizer can lock the plan." : undefined}
+        variant="light"
       />
     </div>
   );
