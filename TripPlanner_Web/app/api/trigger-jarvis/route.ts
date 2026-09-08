@@ -3,9 +3,17 @@ import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { verifyAdminToken } from "@/lib/adminToken";
+import { FINALIZE_MODEL, FINALIZE_MAX_TOKENS } from "@/lib/llm";
+import {
+  computeTotalEstimatedCost,
+  formatItineraryForStorage,
+  parseStoredItinerary,
+  type Itinerary,
+  type ItineraryStop,
+} from "@/lib/itinerary";
 import { PlacesApiError, searchPlacesForSlot, type LatLng, type PlaceResult } from "@/lib/places";
 import { checkRateLimit } from "@/lib/rateLimit";
-import { computeDayRoute, type TravelLeg } from "@/lib/routes";
+import { computeDayRoute, computeDepartureTimeForDay, type TravelLeg } from "@/lib/routes";
 import {
   claimPollForGeneration,
   getDraft,
@@ -16,18 +24,17 @@ import {
 } from "@/lib/store";
 import { summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
 import { computeBestTripWindow, TRIP_WINDOW_DAYS, type TripDateWindow } from "@/lib/tripDates";
+import { fetchWeatherSummary } from "@/lib/weather";
 
-// Two Haiku calls, N parallel Places calls, plus up to one Routes API
-// call per day (Stage 2.5), all days in parallel. Measured end to end
-// against two real successful 6-day Chiang Mai runs (see this route's
+// Two Haiku calls, N parallel Places calls, plus one Routes API call per
+// LEG (Stage 2.5 - see lib/routes.ts's per-leg dynamic travel mode),
+// plus one Weather API call, all in parallel within their stage. Measured
+// end to end against real successful Chiang Mai runs (see this route's
 // own [trigger-jarvis] stage logs): stage 1 (skeleton) 3.5-4.1s, stage
 // 1.5 (Places, all in parallel) 0.5-0.7s, stage 2 (final write)
-// 10.1-14.2s, stage 2.5 (Routes, all 6 days in parallel) 0.17-0.31s -
-// total 14.8-19.9s, comfortably inside this ceiling. Stage 2.5 stays
-// well under a second regardless of trip length, since every day's
-// Compute Routes call runs concurrently rather than one after another;
-// stage 2's Haiku call, not Stage 2.5, is what actually dominates.
-// https://vercel.com/docs/functions/configuring-functions/duration.
+// 10.1-14.2s, stage 2.5 (Routes + weather, all in parallel) well under a
+// second regardless of trip length - stage 2's Haiku call, not Stage 2.5,
+// is what actually dominates. https://vercel.com/docs/functions/configuring-functions/duration.
 export const maxDuration = 60;
 
 // Locking a poll spends real LLM quota and (once LINE push-back exists -
@@ -37,66 +44,13 @@ export const maxDuration = 60;
 const TRIGGER_RATE_LIMIT = 3;
 const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
 
-// Cost-optimization default: claude-haiku-4-5, not opus-5/sonnet-5 -
-// already decided against escalating once this two-stage grounded
-// architecture replaced the single-call approach (see the prior
-// hallucination-vs-cost comparison). No thinking/effort config below:
-// unlike Opus 5/Sonnet 5/Fable 5, Haiku 4.5 is pre-4.6-tier -
-// output_config.effort errors outright on this model, and omitting
-// `thinking` entirely (rather than an explicit {type:"disabled"}) is
-// its correct "no extended thinking" state.
-const FINALIZE_MODEL = "claude-haiku-4-5-20251001";
-const FINALIZE_MAX_TOKENS = 4096;
-
 // ---------------------------------------------------------------------
-// Final itinerary shape - each day is now one ORDERED sequence of stops
-// (rather than separate activities[]/meals[] bags), each optionally
-// carrying travelFromPrevious - the Stage 2.5 Routes API leg from the
-// PRECEDING stop in this same array, null for a day's first stop or
-// wherever travel data wasn't available (see enrichItineraryWithTravelTimes).
-// This has diverged from plugins/trip_planner.py's Itinerary Pydantic
-// model (which still uses activities[]/meals[]) - that Python pipeline
-// doesn't run Stage 2.5 and isn't touched by it.
-// ---------------------------------------------------------------------
-
-const TravelLegSchema = z.object({
-  durationMinutes: z.number(),
-  distanceMeters: z.number(),
-});
-
-const ItineraryStopSchema = z.object({
-  slotType: z.enum(["activity", "meal"]),
-  text: z.string(),
-  travelFromPrevious: TravelLegSchema.nullable(),
-});
-
-const ItineraryDaySchema = z.object({
-  day: z.number(),
-  summary: z.string(),
-  stops: z.array(ItineraryStopSchema),
-});
-
-const ItinerarySchema = z.object({
-  destination: z.string(),
-  days: z.array(ItineraryDaySchema),
-  notes: z.string(),
-  // The specific TRIP_WINDOW_DAYS-day window (see lib/tripDates.ts) this
-  // itinerary was generated for - optional so a plan stored before this
-  // field existed still parses via parseStoredItinerary below rather
-  // than being rejected outright.
-  startDate: z.string().optional(),
-  endDate: z.string().optional(),
-});
-
-type Itinerary = z.infer<typeof ItinerarySchema>;
-type ItineraryStop = z.infer<typeof ItineraryStopSchema>;
-
-// ---------------------------------------------------------------------
-// Stage 2's LLM-facing output shape - structurally similar, but stops
-// carry placeIndex (which of that slot's grounded candidates Claude
-// used) instead of travelFromPrevious. Travel data is never asked of
-// the model - see this route's docstring point 4: Stage 2.5 attaches it
-// afterward, in code, from real Routes API results, never narrated.
+// Stage 2's LLM-facing output shape - structurally similar to the
+// persisted Itinerary (lib/itinerary.ts), but stops carry placeIndex
+// (which of that slot's grounded candidates Claude used) instead of
+// travelFromPrevious/location - those are attached afterward, in code,
+// by enrichItineraryWithTravelTimes (Stage 2.5), never narrated by the
+// model.
 // ---------------------------------------------------------------------
 
 const ItineraryStopLLMSchema = z.object({
@@ -109,6 +63,10 @@ const ItineraryStopLLMSchema = z.object({
   // candidate range is treated the same way by enrichItineraryWithTravelTimes,
   // never trusted blindly.
   placeIndex: z.number().int(),
+  // A realistic per-person cost in `currency` below, grounded in the
+  // candidate's real Places priceLevel (see formatSlotForPrompt) - null
+  // for a stop with no real venue to estimate from.
+  estimatedCostPerPerson: z.number().nullable(),
 });
 
 const ItineraryDayLLMSchema = z.object({
@@ -121,6 +79,10 @@ const ItineraryLLMSchema = z.object({
   destination: z.string(),
   days: z.array(ItineraryDayLLMSchema),
   notes: z.string(),
+  // The ISO 4217-ish currency code the model determined for the
+  // destination (e.g. "THB") - every stop's estimatedCostPerPerson is
+  // denominated in this same currency.
+  currency: z.string(),
 });
 
 type ItineraryLLM = z.infer<typeof ItineraryLLMSchema>;
@@ -166,9 +128,8 @@ type ItinerarySkeleton = z.infer<typeof ItinerarySkeletonSchema>;
  * TRIP_WINDOW_DAYS-day window computeBestTripWindow picked (the specific
  * days most voters overlap on), not the group's full combined date
  * range, and instructs the model to return exactly that many days - see
- * this route's docstring point about the trip being a fixed "5 Days 4
- * Nights" length, not however wide the poll's raw votes happened to
- * span.
+ * this route's docstring about the trip being a fixed "5 Days 4 Nights"
+ * length, not however wide the poll's raw votes happened to span.
  */
 function buildSkeletonPrompt(summary: PollSummary, tripWindow: TripDateWindow): string {
   const vibesText =
@@ -196,7 +157,9 @@ function buildSkeletonPrompt(summary: PollSummary, tripWindow: TripDateWindow): 
     `most voters (${tripWindow.voterCount} of ${summary.totalVotes}) can make, not the group's full ` +
     "combined date range. You MUST return EXACTLY " +
     `${TRIP_WINDOW_DAYS} day objects in the "days" array, numbered 1 through ${TRIP_WINDOW_DAYS} in ` +
-    "calendar order matching that window - never more, never fewer.\n\n" +
+    "calendar order matching that window - never more, never fewer. The itinerary you produce, end to " +
+    `end, MUST cover exactly ${TRIP_WINDOW_DAYS} days - not fewer, not more - regardless of how the ` +
+    "group's individual votes were worded.\n\n" +
     "For each day, break it into a small number of slots - roughly 3-4 activities and 2 meals per " +
     "day is a reasonable density, not more. For each slot, give: slotType (\"activity\" or \"meal\"), " +
     "a short search category such as \"cafe\", \"temple\", \"night market\", \"Thai restaurant\", " +
@@ -277,6 +240,21 @@ async function groundSkeleton(skeleton: ItinerarySkeleton): Promise<GroundedSlot
   );
 }
 
+/**
+ * The first real, geocoded venue found anywhere in the grounded slots -
+ * used as a stand-in "destination location" for the weather lookup
+ * (Stage 2.5), since this app never geocodes the destination string
+ * itself. Good enough for a same-city trip's average forecast; not meant
+ * to be the mathematically precise city center.
+ */
+function findRepresentativeLocation(groundedSlots: GroundedSlot[]): LatLng | null {
+  for (const slot of groundedSlots) {
+    const location = slot.places[0]?.location;
+    if (location) return location;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------
 // Stage 2: write the final itinerary, choosing only from real results.
 // ---------------------------------------------------------------------
@@ -285,12 +263,19 @@ function formatSlotForPrompt(slot: GroundedSlot, slotPosition: number): string {
   if (slot.places.length === 0) {
     return (
       `  - Stop ${slotPosition} [${slot.slotType}] ${slot.category} near ${slot.area}: ` +
-      "NO REAL VENUES FOUND. Say so plainly in this stop's text rather than inventing one, and set placeIndex to -1."
+      "NO REAL VENUES FOUND. Say so plainly in this stop's text rather than inventing one, set " +
+      "placeIndex to -1, and set estimatedCostPerPerson to null."
     );
   }
   const candidates = slot.places
     .slice(0, 3)
-    .map((p, i) => `${i}=${p.name} (${p.address}${p.rating !== null ? `, rating ${p.rating}` : ""})`)
+    .map((p, i) => {
+      const ratingText = p.rating !== null ? `, rating ${p.rating}` : "";
+      const priceText = p.priceLevel
+        ? `, price level ${p.priceLevel.replace("PRICE_LEVEL_", "").toLowerCase()}`
+        : "";
+      return `${i}=${p.name} (${p.address}${ratingText}${priceText})`;
+    })
     .join("; ");
   return `  - Stop ${slotPosition} [${slot.slotType}] ${slot.category} near ${slot.area}, candidates: ${candidates}`;
 }
@@ -315,10 +300,15 @@ function buildFinalPrompt(skeleton: ItinerarySkeleton, groundedSlots: GroundedSl
     "using the REAL Google Places search results listed for each stop below. Only use venues from " +
     "the provided candidates - never invent a name not present in this data. For each day, return " +
     "exactly one stop object per Stop listed, IN THE SAME ORDER, with: slotType (copy from the Stop), " +
-    "text (a short one-sentence description, incorporating the chosen venue's real name), and " +
-    "placeIndex (the candidate number - 0, 1, or 2 - that your text is about). If a Stop says NO REAL " +
-    "VENUES FOUND, say so plainly in that stop's text rather than inventing a fallback, and set " +
-    "placeIndex to -1.\n\n" +
+    "text (a short one-sentence description, incorporating the chosen venue's real name), placeIndex " +
+    "(the candidate number - 0, 1, or 2 - that your text is about), and estimatedCostPerPerson (a " +
+    "realistic estimated cost per person for that activity or meal, as a plain number, using the " +
+    "venue's price level above as a guide where one is shown). If a Stop says NO REAL VENUES FOUND, " +
+    "say so plainly in that stop's text rather than inventing a fallback, set placeIndex to -1, and " +
+    "set estimatedCostPerPerson to null.\n\n" +
+    `Also return currency: the ISO 4217 currency code actually used day-to-day in ${skeleton.destination} ` +
+    "(e.g. \"THB\", \"USD\", \"JPY\") - every estimatedCostPerPerson value above must be a realistic " +
+    "amount in this same currency, not USD by default.\n\n" +
     `${daysText}`
   );
 }
@@ -348,57 +338,11 @@ async function generateFinalItinerary(
 
 // ---------------------------------------------------------------------
 // Stage 2.5: ground every stop-to-stop transition in a real Google
-// Routes API drive-time/distance estimate. Runs entirely in code, after
-// Stage 2 - never routed through another LLM call (see this route's
-// docstring point 4).
+// Routes API travel-time/distance estimate (dynamic per-leg mode - see
+// lib/routes.ts), and attach a Stage 2.6 weather summary for the trip's
+// window. Both run entirely in code, after Stage 2 - never routed
+// through another LLM call.
 // ---------------------------------------------------------------------
-
-// Mid-morning is a reasonable default departure for a day of sightseeing
-// - not load-bearing precision, since TRAFFIC_AWARE's estimate for a
-// date weeks out is a historical-pattern prediction regardless of the
-// exact hour. Left in UTC rather than resolved to the destination's
-// actual timezone (which this app doesn't otherwise track anywhere) -
-// still lands the estimate on the right DAY, which is what matters for
-// a weekday-vs-weekend traffic pattern.
-const DEFAULT_DEPARTURE_HOUR_UTC = 10;
-
-// Used only when no vote supplied a start date at all - still anchors
-// the estimate to a plausible FUTURE date (required by Routes API's
-// departureTime) rather than "now", which would request current traffic
-// instead of a general future-pattern estimate.
-const FALLBACK_DAYS_FROM_NOW = 14;
-
-/**
- * RFC3339 UTC timestamp for itinerary day N's departure - tripStartDate
- * (day 1's date) plus (dayNumber - 1) days, at a fixed mid-morning hour.
- * Clamped to at least tomorrow if that lands in the past (a poll whose
- * voted dates have already elapsed) or if tripStartDate is missing/
- * unparseable entirely - Routes API rejects a past departureTime.
- */
-function computeDepartureTimeForDay(tripStartDate: string | null, dayNumber: number): string {
-  const fallback = new Date();
-  fallback.setUTCDate(fallback.getUTCDate() + FALLBACK_DAYS_FROM_NOW);
-  fallback.setUTCHours(DEFAULT_DEPARTURE_HOUR_UTC, 0, 0, 0);
-
-  let departure = fallback;
-  if (tripStartDate) {
-    const parsed = new Date(`${tripStartDate}T00:00:00Z`);
-    if (!Number.isNaN(parsed.getTime())) {
-      parsed.setUTCDate(parsed.getUTCDate() + (dayNumber - 1));
-      parsed.setUTCHours(DEFAULT_DEPARTURE_HOUR_UTC, 0, 0, 0);
-      departure = parsed;
-    }
-  }
-
-  const tomorrow = new Date();
-  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-  if (departure.getTime() < tomorrow.getTime()) {
-    departure = tomorrow;
-    departure.setUTCHours(DEFAULT_DEPARTURE_HOUR_UTC, 0, 0, 0);
-  }
-
-  return departure.toISOString();
-}
 
 type ItineraryStopLLM = z.infer<typeof ItineraryStopLLMSchema>;
 
@@ -418,10 +362,10 @@ function resolveStopLocation(stop: ItineraryStopLLM, slot: GroundedSlot | undefi
 }
 
 /**
- * Attaches Stage 2.5 travel data to every day, calling Routes API for
- * every day in parallel (Promise.all, not sequential) - each day is an
- * independent request, and there's no reason one day's routing should
- * wait on another's round trip.
+ * Attaches Stage 2.5 travel data and per-stop cost to every day, calling
+ * Routes API for every day in parallel (Promise.all, not sequential) -
+ * each day is an independent request, and there's no reason one day's
+ * routing should wait on another's round trip.
  *
  * Within a day, only stops with a resolvable location (see
  * resolveStopLocation) are sent to Routes API, preserving their
@@ -431,11 +375,10 @@ function resolveStopLocation(stop: ItineraryStopLLM, slot: GroundedSlot | undefi
  * travelFromPrevious: null, and the NEXT geocoded stop's travel time (if
  * any) is computed from the last geocoded stop before it, skipping the
  * gap - the closest honest estimate available rather than omitting that
- * leg too. If the whole day's Routes API call fails outright (see
- * computeDayRoute), every stop in that day gets travelFromPrevious: null -
- * a day-level failure can't be attributed to one specific leg, but it
- * must never fail the itinerary this route already spent real Anthropic
- * and Places quota generating.
+ * leg too. A single leg's own routing failure (see lib/routes.ts's
+ * computeDayRoute) degrades that one leg to travelFromPrevious: null,
+ * never the whole day - it must never fail the itinerary this route
+ * already spent real Anthropic and Places quota generating.
  */
 async function enrichItineraryWithTravelTimes(
   itinerary: ItineraryLLM,
@@ -466,7 +409,10 @@ async function enrichItineraryWithTravelTimes(
       const travelByStopIndex = new Map<number, TravelLeg>();
       if (legs) {
         for (let k = 0; k < legs.length; k++) {
-          travelByStopIndex.set(geocodedIndices[k + 1], legs[k]);
+          const leg = legs[k];
+          if (leg) {
+            travelByStopIndex.set(geocodedIndices[k + 1], leg);
+          }
         }
       }
 
@@ -474,38 +420,24 @@ async function enrichItineraryWithTravelTimes(
         slotType: stop.slotType,
         text: stop.text,
         travelFromPrevious: travelByStopIndex.get(i) ?? null,
+        location: locations[i],
+        estimatedCostPerPerson: stop.estimatedCostPerPerson,
       }));
 
       return { day: day.day, summary: day.summary, stops };
     })
   );
 
-  return {
+  const built: Itinerary = {
     destination: itinerary.destination,
     days,
     notes: itinerary.notes,
     startDate: tripWindow.startDate,
     endDate: tripWindow.endDate,
+    currency: itinerary.currency,
   };
-}
-
-/**
- * The generated plan is stored as JSON in the trip's TripDraft row
- * (shared with the solo draft board feature - see that model's comment
- * in prisma/schema.prisma) so a repeat "Lock & Generate Plan" click on an
- * already-locked poll can return the exact same plan without spending
- * LLM quota again, rather than re-deriving it from a lossy text format.
- */
-function formatItineraryForStorage(itinerary: Itinerary): string {
-  return JSON.stringify(itinerary, null, 2);
-}
-
-function parseStoredItinerary(text: string): Itinerary | null {
-  try {
-    return ItinerarySchema.parse(JSON.parse(text));
-  } catch {
-    return null;
-  }
+  built.totalTripEstimatedCost = computeTotalEstimatedCost(built);
+  return built;
 }
 
 /**
@@ -516,13 +448,15 @@ function parseStoredItinerary(text: string): Itinerary | null {
  * (categories + areas, no venue names; Stage 1), real Google Places
  * Text Search calls to find actual venues for every slot (Stage 1.5), a
  * second Haiku call to write the final itinerary choosing only from
- * that real data (Stage 2), and finally a real Google Routes API
- * Compute Routes call per day to attach drive-time/distance between
- * each day's consecutive stops (Stage 2.5, see
- * enrichItineraryWithTravelTimes - never another LLM call, this is
- * real data attached as-is) - and returns the finished itinerary in the
- * response body. No dependency on Jarvis's local Python backend, which
- * never accepts inbound connections.
+ * that real data and estimating a per-stop cost (Stage 2), and finally,
+ * in parallel: a real Google Routes API call per stop-to-stop leg with a
+ * dynamically chosen travel mode (Stage 2.5, see
+ * enrichItineraryWithTravelTimes and lib/routes.ts - never another LLM
+ * call, this is real data attached as-is) and a real-world forecast
+ * lookup for the trip's window (Stage 2.6, see lib/weather.ts) - and
+ * returns the finished itinerary in the response body. No dependency on
+ * Jarvis's local Python backend, which never accepts inbound
+ * connections.
  *
  * NOT YET DONE: pushing the result back into the LINE group chat the way
  * plugins/trip_planner.py's _finalize_trip_task does via line_notifier -
@@ -646,8 +580,17 @@ export async function POST(request: NextRequest) {
       console.log(`[trigger-jarvis] ${tripId}: Stage 2 (final write) ${Date.now() - stageStart}ms`);
 
       stageStart = Date.now();
-      const itinerary = await enrichItineraryWithTravelTimes(draftItinerary, groundedSlots, tripWindow);
-      console.log(`[trigger-jarvis] ${tripId}: Stage 2.5 (Routes) ${Date.now() - stageStart}ms`);
+      const representativeLocation = findRepresentativeLocation(groundedSlots);
+      const [itinerary, weather] = await Promise.all([
+        enrichItineraryWithTravelTimes(draftItinerary, groundedSlots, tripWindow),
+        representativeLocation
+          ? fetchWeatherSummary(representativeLocation, tripWindow.startDate, tripWindow.endDate)
+          : Promise.resolve(null),
+      ]);
+      if (weather) {
+        itinerary.weather = weather;
+      }
+      console.log(`[trigger-jarvis] ${tripId}: Stage 2.5 (Routes + weather) ${Date.now() - stageStart}ms`);
 
       await saveDraft(tripId, formatItineraryForStorage(itinerary));
       await lockPoll(tripId);

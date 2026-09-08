@@ -428,6 +428,9 @@ export default function TripPollPage({
                   destination={generatedPlan.destination}
                   dateLabel={lockedDateLabel}
                   headcount={votes.length}
+                  totalEstimatedCost={generatedPlan.totalTripEstimatedCost}
+                  currency={generatedPlan.currency}
+                  weather={generatedPlan.weather}
                 />
               </div>
 
@@ -436,7 +439,14 @@ export default function TripPollPage({
               </div>
             </div>
 
-            <TimelineList days={generatedPlan.days} />
+            <TimelineList
+              days={generatedPlan.days}
+              currency={generatedPlan.currency}
+              tripId={id}
+              isAdmin={isAdmin}
+              adminToken={adminToken}
+              onSwap={(itinerary) => setGeneratedPlan(itinerary)}
+            />
 
             {generatedPlan.notes && (
               <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">

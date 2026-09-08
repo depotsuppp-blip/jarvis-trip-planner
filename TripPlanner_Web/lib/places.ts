@@ -1,7 +1,9 @@
 /**
- * Google Places API (New) - Text Search, used to ground itinerary venue
- * names in real data instead of letting the LLM invent them - see
- * app/api/trigger-jarvis/route.ts's two-stage generation.
+ * Google Places API (New) - Text Search and Nearby Search, used to ground
+ * itinerary venue names in real data instead of letting the LLM invent
+ * them - see app/api/trigger-jarvis/route.ts's two-stage generation
+ * (Text Search) and app/api/trip/alternative/route.ts's live fallback
+ * suggestion (Nearby Search).
  *
  * This is a DIFFERENT product from the legacy Places API
  * (maps.googleapis.com/maps/api/place/textsearch/json) that
@@ -27,6 +29,14 @@ export interface PlaceResult {
    * time possible to/from this stop" rather than failing.
    */
   location: LatLng | null;
+  /**
+   * Google's own PRICE_LEVEL_* enum string (e.g. "PRICE_LEVEL_MODERATE"),
+   * or null if Google didn't return one for this place - common for
+   * venues that don't take payment, or sparse data. Passed to the Stage 2
+   * cost-estimating LLM call (formatSlotForPrompt in
+   * app/api/trigger-jarvis/route.ts) as a real signal instead of a guess.
+   */
+  priceLevel: string | null;
 }
 
 /**
@@ -50,11 +60,13 @@ export class PlacesApiError extends Error {
   }
 }
 
-const PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText";
+const PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText";
+const PLACES_NEARBY_SEARCH_URL = "https://places.googleapis.com/v1/places:searchNearby";
 
 // Minimal on purpose - a broader field mask (photos, reviews, opening
 // hours, ...) bills at a higher Places API SKU tier, and none of that is
-// used by the itinerary prompt this feeds.
+// used by the itinerary prompt this feeds. Shared by both Text Search and
+// Nearby Search below - both return the same Place resource shape.
 //
 // places.location is included for Stage 2.5's travel-time enrichment
 // (app/api/trigger-jarvis/route.ts) - verified against Google's Place
@@ -64,18 +76,21 @@ const PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText";
 // HIGHEST SKU touched by any field in the mask, per Places API (New)'s
 // usage-and-billing docs). Since rating was already here, adding location
 // does not raise the SKU or the price - Enterprise already dominates Pro.
-// This is worth re-confirming against Google's current pricing docs if
-// rating is ever removed from this mask, since Pro would then become the
-// billed tier again (still includes location, just at a different price).
+// priceLevel is also documented as "Pro" tier, so the same reasoning
+// applies to it. Worth re-confirming against Google's current pricing
+// docs if rating is ever removed from this mask, since Pro would then
+// become the billed tier again (still includes location/priceLevel, just
+// at a different price).
 const FIELD_MASK =
-  "places.displayName,places.formattedAddress,places.rating,places.location";
+  "places.displayName,places.formattedAddress,places.rating,places.location,places.priceLevel";
 
-interface PlacesSearchTextResponse {
+interface PlacesResponse {
   places?: {
     displayName?: { text?: string };
     formattedAddress?: string;
     rating?: number;
     location?: { latitude?: number; longitude?: number };
+    priceLevel?: string;
   }[];
 }
 
@@ -86,7 +101,23 @@ interface GoogleErrorBody {
   };
 }
 
-export async function searchPlacesText(query: string): Promise<PlaceResult[]> {
+function mapPlace(place: NonNullable<PlacesResponse["places"]>[number]): PlaceResult {
+  return {
+    name: place.displayName?.text ?? "Unknown",
+    address: place.formattedAddress ?? "",
+    rating: typeof place.rating === "number" ? place.rating : null,
+    location:
+      typeof place.location?.latitude === "number" && typeof place.location?.longitude === "number"
+        ? { lat: place.location.latitude, lng: place.location.longitude }
+        : null,
+    priceLevel:
+      typeof place.priceLevel === "string" && place.priceLevel !== "PRICE_LEVEL_UNSPECIFIED"
+        ? place.priceLevel
+        : null,
+  };
+}
+
+async function postPlacesRequest(url: string, body: Record<string, unknown>): Promise<PlaceResult[]> {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) {
     throw new PlacesApiError("GOOGLE_MAPS_API_KEY is not configured.", "MISSING_API_KEY");
@@ -94,14 +125,14 @@ export async function searchPlacesText(query: string): Promise<PlaceResult[]> {
 
   let response: Response;
   try {
-    response = await fetch(PLACES_SEARCH_URL, {
+    response = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": apiKey,
         "X-Goog-FieldMask": FIELD_MASK,
       },
-      body: JSON.stringify({ textQuery: query }),
+      body: JSON.stringify(body),
     });
   } catch (err) {
     throw new PlacesApiError(
@@ -111,27 +142,23 @@ export async function searchPlacesText(query: string): Promise<PlaceResult[]> {
   }
 
   if (!response.ok) {
-    const body: GoogleErrorBody | null = await response.json().catch(() => null);
+    const errBody: GoogleErrorBody | null = await response.json().catch(() => null);
     const reason =
-      body?.error?.details?.find((d) => typeof d.reason === "string")?.reason ??
+      errBody?.error?.details?.find((d) => typeof d.reason === "string")?.reason ??
       `HTTP_${response.status}`;
     const message =
-      typeof body?.error?.message === "string"
-        ? body.error.message
+      typeof errBody?.error?.message === "string"
+        ? errBody.error.message
         : `Places API request failed with HTTP ${response.status}.`;
     throw new PlacesApiError(message, reason);
   }
 
-  const data: PlacesSearchTextResponse = await response.json().catch(() => ({}));
-  return (data.places ?? []).map((place) => ({
-    name: place.displayName?.text ?? "Unknown",
-    address: place.formattedAddress ?? "",
-    rating: typeof place.rating === "number" ? place.rating : null,
-    location:
-      typeof place.location?.latitude === "number" && typeof place.location?.longitude === "number"
-        ? { lat: place.location.latitude, lng: place.location.longitude }
-        : null,
-  }));
+  const data: PlacesResponse = await response.json().catch(() => ({}));
+  return (data.places ?? []).map(mapPlace);
+}
+
+export async function searchPlacesText(query: string): Promise<PlaceResult[]> {
+  return postPlacesRequest(PLACES_TEXT_SEARCH_URL, { textQuery: query });
 }
 
 /**
@@ -153,4 +180,33 @@ export async function searchPlacesForSlot(
     return primary;
   }
   return searchPlacesText(`${category} in ${destination}`);
+}
+
+/**
+ * "What's actually near this exact point right now" - used by POST
+ * /api/trip/alternative for a real-time fallback suggestion (a stop that
+ * turned out closed, ran out of time, ...), as opposed to
+ * searchPlacesForSlot's category+neighborhood-name matching used when the
+ * original itinerary was generated. `includedType` must be one of
+ * Google's own Place Types (New) values (e.g. "cafe", "restaurant") - not
+ * validated here; an invalid one surfaces as a PlacesApiError from
+ * Google itself, same as any other Places API failure this module
+ * throws.
+ */
+export async function searchNearbyPlaces(
+  location: LatLng,
+  radiusMeters: number,
+  includedType: string,
+  maxResultCount = 3
+): Promise<PlaceResult[]> {
+  return postPlacesRequest(PLACES_NEARBY_SEARCH_URL, {
+    includedTypes: [includedType],
+    maxResultCount,
+    locationRestriction: {
+      circle: {
+        center: { latitude: location.lat, longitude: location.lng },
+        radius: radiusMeters,
+      },
+    },
+  });
 }
