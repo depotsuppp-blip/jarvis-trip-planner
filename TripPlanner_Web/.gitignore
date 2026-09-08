@@ -36,6 +36,10 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# ...except the template itself, which documents every var this app
+# reads (see that file's own header) and is meant to be committed and
+# kept current - it holds no real secrets, just var names and comments.
+!.env.example
 
 # vercel
 .vercel
