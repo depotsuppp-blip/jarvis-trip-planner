@@ -13,4 +13,13 @@
  * {type:"disabled"}) is its correct "no extended thinking" state.
  */
 export const FINALIZE_MODEL = "claude-haiku-4-5-20251001";
-export const FINALIZE_MAX_TOKENS = 4096;
+// Raised from the original 4096: trip length is now dynamic (up to
+// MAX_TRIP_DAYS=14, see lib/tripDates.ts) and Stage 1's prompt requires
+// 4-6 stops per day, not ~5-6 total - a long, dense trip's skeleton or
+// final-write JSON can genuinely need more than 4096 tokens, and a
+// truncated structured-output response fails messages.parse outright
+// rather than degrading gracefully. This only raises the CEILING;
+// Anthropic bills actual completion length, so a short response (a
+// single-stop alternative choice, a 1-day skeleton) costs the same as
+// before.
+export const FINALIZE_MAX_TOKENS = 8192;

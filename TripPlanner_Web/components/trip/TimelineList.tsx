@@ -72,7 +72,8 @@ export function TimelineList({
     setSwapError("");
 
     const placeType = window.prompt(
-      "What kind of place should replace this stop? (e.g. cafe, restaurant, museum)"
+      "What should replace this stop? A category (e.g. cafe, restaurant, museum) or a specific place " +
+        "name both work, in any language."
     );
     if (!placeType || !placeType.trim()) return;
 

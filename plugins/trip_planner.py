@@ -668,7 +668,7 @@ def _run_planner_agent(prompt: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def _run_consensus_poll(destination: str) -> None:
+def _run_consensus_poll(destination: str, days: int) -> None:
     """
     'consensus'`s entire background job: create a poll, mint its admin
     token, and send two LINE messages - the public voting link (safe to
@@ -677,6 +677,18 @@ def _run_consensus_poll(destination: str) -> None:
     app/api/trigger-jarvis/route.ts). Not LINE identity: that proved
     unreliable throughout this project, and a plain voter link was never
     actually distinguishable from an organizer's anyway.
+
+    days is the trip length the user actually asked Jarvis for - it rides
+    along on the admin link as a plain ?days=<n> query param (app/trip/poll/[id]/page.tsx
+    reads it the same way it already reads ?admin=<token>, and forwards it
+    to POST /api/trigger-jarvis) rather than being stored server-side:
+    that route already clamps/defaults it (lib/tripDates.ts's
+    resolveTripDays), so there's no new failure mode introduced by not
+    persisting it, and no Prisma migration needed for what's ultimately
+    just generation-time config the organizer already holds via this same
+    link. Previously this was dropped entirely for consensus trips,
+    silently falling back to the web app's old hardcoded 5-day length
+    regardless of what the user asked for by voice.
 
     No Geocoding, Places, or Gemini call happens here - see "PLANNING_
     TYPE FORKS BEFORE ANY DATA GATHERING" in the module docstring for
@@ -700,7 +712,7 @@ def _run_consensus_poll(destination: str) -> None:
         print(f"[TripPlanner] Consensus poll notification for {destination}: {result}")
 
         if admin_token_stored:
-            admin_url = build_liff_link(f"/trip/poll/{trip_id}?admin={admin_token}")
+            admin_url = build_liff_link(f"/trip/poll/{trip_id}?admin={admin_token}&days={days}")
             admin_message = (
                 "ลิงก์นี้สำหรับบอสคนเดียวนะครับ ห้าม Forward ต่อเด็ดขาด - "
                 f"ใช้กด Lock & Generate Plan ตอนโหวตครบแล้วครับ: {admin_url}"
@@ -790,7 +802,7 @@ def _plan_trip_task(
     )
 
     if planning_type == "consensus":
-        _run_consensus_poll(destination)
+        _run_consensus_poll(destination, days)
         return
 
     if planning_type == "solo_draft":

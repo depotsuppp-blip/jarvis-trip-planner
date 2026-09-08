@@ -210,3 +210,31 @@ export async function searchNearbyPlaces(
     },
   });
 }
+
+/**
+ * Text Search, biased toward (not restricted to) a point - used by POST
+ * /api/trip/alternative when the traveler typed a SPECIFIC venue name
+ * rather than a category (see that route's classifyPlaceQuery): Nearby
+ * Search's includedTypes only accepts Google's fixed Place Types (New)
+ * enum, which a proper noun like "Katsuya" was never going to match, so
+ * this reuses ordinary Text Search instead with locationBias standing in
+ * for Nearby Search's locationRestriction - a bias, not a hard filter,
+ * which is correct for a named search: the exact branch closest to the
+ * traveler should still win over a same-named venue across town, without
+ * hiding it outright if it's the only real match.
+ */
+export async function searchPlacesTextNear(
+  query: string,
+  location: LatLng,
+  radiusMeters: number
+): Promise<PlaceResult[]> {
+  return postPlacesRequest(PLACES_TEXT_SEARCH_URL, {
+    textQuery: query,
+    locationBias: {
+      circle: {
+        center: { latitude: location.lat, longitude: location.lng },
+        radius: radiusMeters,
+      },
+    },
+  });
+}

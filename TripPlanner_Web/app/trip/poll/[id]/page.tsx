@@ -128,6 +128,16 @@ export default function TripPollPage({
   const [adminToken, setAdminToken] = useState("");
   const isAdmin = Boolean(adminToken);
 
+  // The organizer's requested trip length, read from the SAME admin
+  // link's ?days=<n> param (see plugins/trip_planner.py's
+  // _run_consensus_poll, which appends it right next to ?admin=<token>) -
+  // forwarded as-is to POST /api/trigger-jarvis in handleLockAndGenerate.
+  // "" (never sent) for an ordinary voter link, or an admin link minted
+  // before this param existed - the API defaults that case to
+  // DEFAULT_TRIP_DAYS itself (lib/tripDates.ts's resolveTripDays), so
+  // there's nothing to default here.
+  const [tripDays, setTripDays] = useState("");
+
   const [votes, setVotes] = useState<PollVote[]>([]);
   const [isLoadingVotes, setIsLoadingVotes] = useState(true);
 
@@ -216,10 +226,12 @@ export default function TripPollPage({
     // virtue of being async.
     queueMicrotask(() => {
       try {
-        setAdminToken(new URLSearchParams(window.location.search).get("admin") || "");
+        const params = new URLSearchParams(window.location.search);
+        setAdminToken(params.get("admin") || "");
+        setTripDays(params.get("days") || "");
       } catch {
-        // No admin param, or an unparseable query string - either way
-        // this trip's poll page just shows no "Lock & Generate Plan"
+        // No admin/days param, or an unparseable query string - either
+        // way this trip's poll page just shows no "Lock & Generate Plan"
         // button, same as an ordinary voter link.
       }
 
@@ -375,11 +387,19 @@ export default function TripPollPage({
     try {
       // admin_token is the actual authorization mechanism now - see
       // app/api/trigger-jarvis/route.ts's docstring. No LINE identity is
-      // sent or checked on this path at all any more.
+      // sent or checked on this path at all any more. `days`, when
+      // present, is forwarded as a number - the API itself clamps and
+      // defaults it (lib/tripDates.ts's resolveTripDays), so an absent
+      // or malformed value here is never fatal.
+      const parsedDays = Number(tripDays);
       const response = await fetch("/api/trigger-jarvis", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trip_id: id, admin_token: adminToken }),
+        body: JSON.stringify({
+          trip_id: id,
+          admin_token: adminToken,
+          ...(tripDays && Number.isFinite(parsedDays) ? { days: parsedDays } : {}),
+        }),
       });
 
       const data = await response.json().catch(() => null);

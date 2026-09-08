@@ -11,7 +11,13 @@ import {
   type Itinerary,
   type ItineraryStop,
 } from "@/lib/itinerary";
-import { PlacesApiError, searchNearbyPlaces, type LatLng, type PlaceResult } from "@/lib/places";
+import {
+  PlacesApiError,
+  searchNearbyPlaces,
+  searchPlacesTextNear,
+  type LatLng,
+  type PlaceResult,
+} from "@/lib/places";
 import { checkRateLimit } from "@/lib/rateLimit";
 import { computeDayRoute, computeDepartureTimeForDay } from "@/lib/routes";
 import { getDraft, saveDraft } from "@/lib/store";
@@ -26,6 +32,108 @@ const ALTERNATIVE_RATE_WINDOW_MS = 5 * 60_000;
 
 const NEARBY_SEARCH_RADIUS_METERS = 5000;
 const MAX_CANDIDATES = 3;
+
+// A small, fixed output - no need for FINALIZE_MAX_TOKENS' full budget.
+const CLASSIFY_MAX_TOKENS = 300;
+
+// Fallback when the traveler's input is a category but Claude couldn't
+// map it to a real Google Place Types (New) value - "restaurant" is
+// broad enough to almost always return something rather than a hard
+// 404, and matches this route's own worked example ('cafe').
+const DEFAULT_PLACE_TYPE = "restaurant";
+
+const PlaceQueryClassificationSchema = z.object({
+  // True when the traveler named ONE specific venue (a proper noun
+  // someone would search by name, in ANY language/script) rather than a
+  // general category. Decides which real Google Places product this
+  // route calls next - see classifyPlaceQuery's docstring.
+  isSpecificName: z.boolean(),
+  // For a specific name: the venue's real name, transliterated/
+  // translated into however it would appear in Google's data (e.g.
+  // "คัตสึยะ" -> "Katsuya") - used as a Text Search query. For a
+  // category: a short English search phrase (e.g. "ramen restaurant").
+  searchQuery: z.string(),
+  // Only meaningful when isSpecificName is false: the single closest
+  // match from Google's Place Types (New) taxonomy (e.g. "restaurant",
+  // "cafe", "museum", "tourist_attraction") for Nearby Search's
+  // includedTypes. Null when isSpecificName is true (Text Search needs
+  // no type filter) or when nothing fits well - see DEFAULT_PLACE_TYPE
+  // for what the route falls back to in that case.
+  googlePlaceType: z.string().nullable(),
+});
+
+function buildClassifyPrompt(rawInput: string): string {
+  return (
+    "A traveler typed this into a \"find something nearby\" search, in whatever language or script " +
+    `they used: "${rawInput}".\n\n` +
+    "Decide: is this a SPECIFIC venue name (one particular restaurant, cafe, shop, or attraction " +
+    "someone would search for by its own proper name - e.g. \"Katsuya\", \"McDonald's\", \"คัตสึยะ\") " +
+    "or a GENERAL CATEGORY (e.g. \"restaurant\", \"cafe\", \"ร้านอาหาร\", \"somewhere to eat\")?\n\n" +
+    "Return isSpecificName (true/false); searchQuery (for a specific name: the venue's real name, " +
+    "transliterated or translated into however it would appear in a Google Maps search - in Latin " +
+    "characters if it has a known English/romanized form, otherwise exactly as given; for a category: " +
+    "a short English search phrase such as \"ramen restaurant\" or \"coffee shop\"); and " +
+    "googlePlaceType (ONLY for a category: the single closest match from Google's Place Types (New) " +
+    "taxonomy, e.g. \"restaurant\", \"cafe\", \"museum\", \"tourist_attraction\", \"shopping_mall\" - " +
+    "or null if nothing fits well, or if isSpecificName is true)."
+  );
+}
+
+/**
+ * Classifies the traveler's raw, free-text (often non-English) input
+ * BEFORE any Google Places call - this is what fixes the crash a
+ * category like "ร้านอาหาร" used to cause: Nearby Search's includedTypes
+ * only accepts Google's fixed English Place Types (New) enum, so passing
+ * arbitrary user text straight through failed outright for anything that
+ * wasn't already exactly one of those ~200 strings, in English. A
+ * hardcoded translation table would only ever cover the languages/words
+ * someone thought to add; asking Claude to both translate/normalize AND
+ * decide "specific venue vs. category" in one small, cheap call handles
+ * any language or phrasing the same way.
+ */
+async function classifyPlaceQuery(rawInput: string) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error("ANTHROPIC_API_KEY is not configured.");
+  }
+
+  const client = new Anthropic({ apiKey });
+  const response = await client.messages.parse({
+    model: FINALIZE_MODEL,
+    max_tokens: CLASSIFY_MAX_TOKENS,
+    output_config: { format: zodOutputFormat(PlaceQueryClassificationSchema) },
+    messages: [{ role: "user", content: buildClassifyPrompt(rawInput) }],
+  });
+
+  if (!response.parsed_output) {
+    throw new Error("Claude did not classify the place query.");
+  }
+  return response.parsed_output;
+}
+
+/**
+ * Fetches real candidates for whatever the traveler typed, using
+ * whichever real Google Places product actually fits it (see
+ * classifyPlaceQuery): Text Search, biased near their current location,
+ * for a specific venue name; Nearby Search, filtered to a real Google
+ * Place Type, for a general category. Always returns PlaceResult[],
+ * capped to MAX_CANDIDATES - never the raw, unbounded Text Search result
+ * count.
+ */
+async function findCandidates(rawInput: string, location: LatLng): Promise<PlaceResult[]> {
+  const classification = await classifyPlaceQuery(rawInput);
+
+  const results = classification.isSpecificName
+    ? await searchPlacesTextNear(classification.searchQuery, location, NEARBY_SEARCH_RADIUS_METERS)
+    : await searchNearbyPlaces(
+        location,
+        NEARBY_SEARCH_RADIUS_METERS,
+        classification.googlePlaceType ?? DEFAULT_PLACE_TYPE,
+        MAX_CANDIDATES
+      );
+
+  return results.slice(0, MAX_CANDIDATES);
+}
 
 const AlternativeChoiceSchema = z.object({
   // Index into the candidate list this route sent, 0-based - see
@@ -115,9 +223,11 @@ async function recomputeLegInto(
  * POST /api/trip/alternative - real-time fallback routing for one stop
  * on an already-locked trip: "this cafe is closed, what else is nearby
  * right now?" Given the traveler's current lat/lng, how much time they
- * have, and a Google place type, this finds 3 real nearby candidates
- * (Places API (New) Nearby Search - see lib/places.ts's
- * searchNearbyPlaces), asks Claude to pick the best fit and estimate its
+ * have, and free-text describing what they want (any language, a
+ * category or a specific venue name - see classifyPlaceQuery), this
+ * classifies that input, finds up to MAX_CANDIDATES real nearby
+ * candidates via whichever real Google Places product actually fits it
+ * (see findCandidates), asks Claude to pick the best fit and estimate its
  * cost, then patches that one stop into the trip's stored itinerary and
  * recomputes the travel legs on either side of it (see
  * recomputeLegInto) - never regenerating the rest of the plan.
@@ -213,12 +323,7 @@ export async function POST(request: NextRequest) {
     const day = itinerary.days[dayIndex];
     const originalStop = day.stops[stopIndex];
 
-    const candidates = await searchNearbyPlaces(
-      { lat, lng },
-      NEARBY_SEARCH_RADIUS_METERS,
-      placeType,
-      MAX_CANDIDATES
-    );
+    const candidates = await findCandidates(placeType, { lat, lng });
     if (candidates.length === 0) {
       return NextResponse.json(
         { error: `No ${placeType} alternatives found within ${NEARBY_SEARCH_RADIUS_METERS / 1000}km.` },

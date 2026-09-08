@@ -11,7 +11,7 @@ import {
   type Itinerary,
   type ItineraryStop,
 } from "@/lib/itinerary";
-import { PlacesApiError, searchPlacesForSlot, type LatLng, type PlaceResult } from "@/lib/places";
+import { PlacesApiError, searchPlacesForSlot, searchPlacesText, type LatLng, type PlaceResult } from "@/lib/places";
 import { checkRateLimit } from "@/lib/rateLimit";
 import { computeDayRoute, computeDepartureTimeForDay, type TravelLeg } from "@/lib/routes";
 import {
@@ -23,7 +23,7 @@ import {
   saveDraft,
 } from "@/lib/store";
 import { summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
-import { computeBestTripWindow, TRIP_WINDOW_DAYS, type TripDateWindow } from "@/lib/tripDates";
+import { computeBestTripWindow, resolveTripDays, type TripDateWindow } from "@/lib/tripDates";
 import { fetchWeatherSummary } from "@/lib/weather";
 
 // Two Haiku calls, N parallel Places calls, plus one Routes API call per
@@ -97,10 +97,23 @@ type ItineraryLLM = z.infer<typeof ItineraryLLMSchema>;
 const ActivitySlotSchema = z.object({
   slotType: z.enum(["activity", "meal"]),
   // A search category, e.g. "cafe", "temple", "night market", "Thai
-  // restaurant", "viewpoint" - never a specific venue name.
+  // restaurant", "viewpoint" - ignored by groundSkeleton when
+  // specificPlaceName is set (see below); otherwise never a specific
+  // venue name.
   category: z.string(),
-  // Neighborhood/area to search near, e.g. "Nimman", "Old City".
+  // Neighborhood/area to search near, e.g. "Nimman", "Old City". Ignored
+  // when specificPlaceName is set - a named search doesn't need an area.
   area: z.string(),
+  // The exact venue name, when - and ONLY when - this slot exists to
+  // satisfy a specific place the group named in their wishlist (e.g.
+  // "คัตสึยะ" -> "Katsuya", romanized/translated into however it would
+  // appear in a map search) - see buildSkeletonPrompt's STRICT RULE.
+  // "" for every ordinary slot, where category+area are what's used
+  // instead. groundSkeleton searches by this name directly rather than
+  // by category+area when it's non-empty, and Stage 2's prompt (see
+  // formatSlotForPrompt) flags the slot so the model doesn't quietly
+  // substitute a different venue of the same general type.
+  specificPlaceName: z.string(),
 });
 
 const DaySkeletonSchema = z.object({
@@ -125,13 +138,14 @@ type ItinerarySkeleton = z.infer<typeof ItinerarySkeletonSchema>;
  * the response shape at the API level.
  *
  * Dates diverge from that Python prompt, though: this passes the actual
- * TRIP_WINDOW_DAYS-day window computeBestTripWindow picked (the specific
- * days most voters overlap on), not the group's full combined date
- * range, and instructs the model to return exactly that many days - see
- * this route's docstring about the trip being a fixed "5 Days 4 Nights"
- * length, not however wide the poll's raw votes happened to span.
+ * tripDays-day window computeBestTripWindow picked (the specific days
+ * most voters overlap on), not the group's full combined date range, and
+ * instructs the model to return exactly that many days. tripDays is the
+ * organizer's actually-requested trip length (see lib/tripDates.ts's
+ * resolveTripDays) - a 1-day request must produce a 1-day itinerary, not
+ * a hardcoded 5.
  */
-function buildSkeletonPrompt(summary: PollSummary, tripWindow: TripDateWindow): string {
+function buildSkeletonPrompt(summary: PollSummary, tripWindow: TripDateWindow, tripDays: number): string {
   const vibesText =
     summary.topVibes.length > 0
       ? summary.topVibes.map((v) => `${v.vibe} (${v.count} votes)`).join(", ")
@@ -141,36 +155,50 @@ function buildSkeletonPrompt(summary: PollSummary, tripWindow: TripDateWindow): 
       ? summary.wishlist.join("; ")
       : "No specific places suggested.";
   const votersText = summary.voters.length > 0 ? summary.voters.join(", ") : "the group";
+  const nightsText = tripDays > 1 ? `${tripDays - 1} nights` : "no overnight stay";
 
   return (
-    "Plan the STRUCTURE of a trip itinerary based on this consensus data from a group trip poll. " +
-    "You will fill in real venue names in a later step - for now, decide only what KIND of place " +
-    "each part of the day should be, and roughly where. Infer a specific real destination city from " +
-    "the group's requested places and vibes. Resolve conflicting wishes by prioritizing the most " +
-    "popular vibes. Do not reference how the group gets to the destination or where they are coming " +
-    "from - start the itinerary from arrival.\n\n" +
+    "Act as an Expert Travel Planner. Plan the STRUCTURE of a trip itinerary based on this consensus " +
+    "data from a group trip poll - a full, realistic, well-paced day, not a bare-minimum outline. You " +
+    "will fill in real venue names in a later step - for now, decide only what KIND of place each part " +
+    "of the day should be (or, for an exact wishlist request, WHICH exact place - see the STRICT RULE " +
+    "below), and roughly where. Infer a specific real destination city from the group's requested " +
+    "places and vibes. Resolve conflicting wishes by prioritizing the most popular vibes. Do not " +
+    "reference how the group gets to the destination or where they are coming from - start the " +
+    "itinerary from arrival.\n\n" +
     `Group size: ${summary.totalVotes} people (${votersText}).\n` +
     `Top vibes, most to least popular: ${vibesText}.\n` +
     `Specific places requested by the group: ${wishlistText}.\n\n` +
-    `This trip is FIXED at exactly ${TRIP_WINDOW_DAYS} days / ${TRIP_WINDOW_DAYS - 1} nights, ` +
+    `This trip is FIXED at exactly ${tripDays} day${tripDays === 1 ? "" : "s"} / ${nightsText}, ` +
     `from ${tripWindow.startDate} to ${tripWindow.endDate} inclusive - the specific window that the ` +
     `most voters (${tripWindow.voterCount} of ${summary.totalVotes}) can make, not the group's full ` +
     "combined date range. You MUST return EXACTLY " +
-    `${TRIP_WINDOW_DAYS} day objects in the "days" array, numbered 1 through ${TRIP_WINDOW_DAYS} in ` +
-    "calendar order matching that window - never more, never fewer. The itinerary you produce, end to " +
-    `end, MUST cover exactly ${TRIP_WINDOW_DAYS} days - not fewer, not more - regardless of how the ` +
-    "group's individual votes were worded.\n\n" +
-    "For each day, break it into a small number of slots - roughly 3-4 activities and 2 meals per " +
-    "day is a reasonable density, not more. For each slot, give: slotType (\"activity\" or \"meal\"), " +
-    "a short search category such as \"cafe\", \"temple\", \"night market\", \"Thai restaurant\", " +
-    "\"viewpoint\", or \"museum\" - NOT a specific venue name - and the neighborhood or area to look " +
-    "near. Do not invent or guess any specific venue name at this stage."
+    `${tripDays} day object${tripDays === 1 ? "" : "s"} in the "days" array, numbered 1 through ` +
+    `${tripDays} in calendar order matching that window - never more, never fewer. The itinerary you ` +
+    `produce, end to end, MUST cover exactly ${tripDays} day${tripDays === 1 ? "" : "s"} - not fewer, ` +
+    "not more - regardless of how the group's individual votes were worded.\n\n" +
+    "For each day, structure it explicitly across Morning, Afternoon, and Evening, with AT LEAST 4 to " +
+    "6 stops total across the day (activities and meals combined) - a sparse day with only 1-3 stops " +
+    "is NOT acceptable. Fill logical gaps yourself: if there's a lull between two stops (for example " +
+    "after an active outing and before dinner), proactively insert a nearby cafe, gallery, park, or " +
+    "rest stop rather than leaving a long unplanned gap - a well-paced day has no dead time. For each " +
+    "slot, give: slotType (\"activity\" or \"meal\"), a short search category such as \"cafe\", " +
+    "\"temple\", \"night market\", \"Thai restaurant\", \"viewpoint\", or \"museum\" (NOT a specific " +
+    "venue name), and the neighborhood or area to look near.\n\n" +
+    "STRICT RULE - exact requests: if the group's wishlist above names a SPECIFIC place rather than a " +
+    "general category (a proper noun someone would search by name, e.g. \"คัตสึยะ\" or \"Central " +
+    "World\"), you MUST create a slot for that exact place and set specificPlaceName to the venue's " +
+    "real name, romanized/translated into however it would appear in a map search (e.g. \"คัตสึยะ\" -> " +
+    "\"Katsuya\") - do NOT generalize it into a category like \"Japanese restaurant\" instead. For " +
+    "every other, ordinary slot, leave specificPlaceName as an empty string and rely on category+area " +
+    "as usual - do not invent or guess a specific venue name for those."
   );
 }
 
 async function generateSkeleton(
   summary: PollSummary,
-  tripWindow: TripDateWindow
+  tripWindow: TripDateWindow,
+  tripDays: number
 ): Promise<ItinerarySkeleton> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -182,7 +210,7 @@ async function generateSkeleton(
     model: FINALIZE_MODEL,
     max_tokens: FINALIZE_MAX_TOKENS,
     output_config: { format: zodOutputFormat(ItinerarySkeletonSchema) },
-    messages: [{ role: "user", content: buildSkeletonPrompt(summary, tripWindow) }],
+    messages: [{ role: "user", content: buildSkeletonPrompt(summary, tripWindow, tripDays) }],
   });
 
   if (!response.parsed_output) {
@@ -196,13 +224,13 @@ async function generateSkeleton(
   // just logged, since fabricating extra days' content isn't safe to do
   // without another grounded LLM pass.
   const skeleton = response.parsed_output;
-  if (skeleton.days.length !== TRIP_WINDOW_DAYS) {
+  if (skeleton.days.length !== tripDays) {
     console.error(
-      `[trigger-jarvis] skeleton returned ${skeleton.days.length} days, expected ${TRIP_WINDOW_DAYS} ` +
+      `[trigger-jarvis] skeleton returned ${skeleton.days.length} days, expected ${tripDays} ` +
         `(window ${tripWindow.startDate} to ${tripWindow.endDate}).`
     );
-    if (skeleton.days.length > TRIP_WINDOW_DAYS) {
-      return { ...skeleton, days: skeleton.days.slice(0, TRIP_WINDOW_DAYS) };
+    if (skeleton.days.length > tripDays) {
+      return { ...skeleton, days: skeleton.days.slice(0, tripDays) };
     }
   }
   return skeleton;
@@ -217,9 +245,21 @@ interface GroundedSlot {
   slotType: "activity" | "meal";
   category: string;
   area: string;
+  // Carried through from ActivitySlotSchema so formatSlotForPrompt (Stage
+  // 2) can flag this slot as a specific wishlist request - see that
+  // schema field's docstring.
+  specificPlaceName: string;
   places: PlaceResult[];
 }
 
+/**
+ * A slot with specificPlaceName set is searched BY THAT NAME directly
+ * (Text Search for "<name>, <destination>"), never by category+area -
+ * this is what actually makes the STRICT RULE in buildSkeletonPrompt
+ * bite: a wishlist venue gets grounded in real Places data under its own
+ * name instead of being genericized into "Japanese restaurant" the way
+ * an ordinary category slot is.
+ */
 async function groundSkeleton(skeleton: ItinerarySkeleton): Promise<GroundedSlot[]> {
   const flatSlots = skeleton.days.flatMap((day) =>
     day.slots.map((slot) => ({ day: day.day, ...slot }))
@@ -235,7 +275,9 @@ async function groundSkeleton(skeleton: ItinerarySkeleton): Promise<GroundedSlot
   return Promise.all(
     flatSlots.map(async (slot) => ({
       ...slot,
-      places: await searchPlacesForSlot(slot.category, slot.area, skeleton.destination),
+      places: slot.specificPlaceName
+        ? await searchPlacesText(`${slot.specificPlaceName}, ${skeleton.destination}`)
+        : await searchPlacesForSlot(slot.category, slot.area, skeleton.destination),
     }))
   );
 }
@@ -260,9 +302,12 @@ function findRepresentativeLocation(groundedSlots: GroundedSlot[]): LatLng | nul
 // ---------------------------------------------------------------------
 
 function formatSlotForPrompt(slot: GroundedSlot, slotPosition: number): string {
+  const requestedNote = slot.specificPlaceName
+    ? ` [USER-REQUESTED: "${slot.specificPlaceName}" - the group asked for this exact place by name]`
+    : "";
   if (slot.places.length === 0) {
     return (
-      `  - Stop ${slotPosition} [${slot.slotType}] ${slot.category} near ${slot.area}: ` +
+      `  - Stop ${slotPosition} [${slot.slotType}]${requestedNote} ${slot.category} near ${slot.area}: ` +
       "NO REAL VENUES FOUND. Say so plainly in this stop's text rather than inventing one, set " +
       "placeIndex to -1, and set estimatedCostPerPerson to null."
     );
@@ -277,7 +322,7 @@ function formatSlotForPrompt(slot: GroundedSlot, slotPosition: number): string {
       return `${i}=${p.name} (${p.address}${ratingText}${priceText})`;
     })
     .join("; ");
-  return `  - Stop ${slotPosition} [${slot.slotType}] ${slot.category} near ${slot.area}, candidates: ${candidates}`;
+  return `  - Stop ${slotPosition} [${slot.slotType}]${requestedNote} ${slot.category} near ${slot.area}, candidates: ${candidates}`;
 }
 
 /**
@@ -305,7 +350,8 @@ function buildFinalPrompt(skeleton: ItinerarySkeleton, groundedSlots: GroundedSl
     "realistic estimated cost per person for that activity or meal, as a plain number, using the " +
     "venue's price level above as a guide where one is shown). If a Stop says NO REAL VENUES FOUND, " +
     "say so plainly in that stop's text rather than inventing a fallback, set placeIndex to -1, and " +
-    "set estimatedCostPerPerson to null.\n\n" +
+    "set estimatedCostPerPerson to null. For a Stop marked USER-REQUESTED, use that candidate even if " +
+    "its category label doesn't perfectly match, since the group explicitly asked for it by name.\n\n" +
     `Also return currency: the ISO 4217 currency code actually used day-to-day in ${skeleton.destination} ` +
     "(e.g. \"THB\", \"USD\", \"JPY\") - every estimatedCostPerPerson value above must be a realistic " +
     "amount in this same currency, not USD by default.\n\n" +
@@ -486,6 +532,13 @@ export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => null);
   const tripId = typeof body?.trip_id === "string" ? body.trip_id.trim() : "";
   const adminToken = typeof body?.admin_token === "string" ? body.admin_token.trim() : "";
+  // The organizer's actually-requested trip length, forwarded from the
+  // ?days=<n> param on their admin link (see build_liff_link's admin URL
+  // in plugins/trip_planner.py's _run_consensus_poll, and this same
+  // field read in app/trip/poll/[id]/page.tsx) - resolveTripDays clamps
+  // and defaults it, so a missing/malformed value never breaks
+  // generation, it just falls back to DEFAULT_TRIP_DAYS.
+  const tripDays = resolveTripDays(body?.days);
 
   if (!tripId) {
     return NextResponse.json({ error: "trip_id is required." }, { status: 400 });
@@ -555,20 +608,20 @@ export async function POST(request: NextRequest) {
       // collide across concurrent requests for different trips, since
       // this route has no per-request namespacing for them.
       const summary = summarizePollVotes(votes);
-      // The specific TRIP_WINDOW_DAYS-day window most voters overlap on -
-      // see lib/tripDates.ts's docstring for why this replaced the old
+      // The specific tripDays-day window most voters overlap on - see
+      // lib/tripDates.ts's docstring for why this replaced the old
       // earliest-start/latest-end span across every vote. Computed once
       // here and threaded through Stage 1 (the prompt) and Stage 2.5 (the
       // Routes API departure-date anchor) so both agree on the same
       // dates.
-      const tripWindow = computeBestTripWindow(votes);
+      const tripWindow = computeBestTripWindow(votes, tripDays);
       console.log(
         `[trigger-jarvis] ${tripId}: trip window ${tripWindow.startDate} to ${tripWindow.endDate} ` +
-          `(${tripWindow.voterCount}/${votes.length} voters overlap)`
+          `(${tripDays}d, ${tripWindow.voterCount}/${votes.length} voters overlap)`
       );
 
       let stageStart = Date.now();
-      const skeleton = await generateSkeleton(summary, tripWindow);
+      const skeleton = await generateSkeleton(summary, tripWindow, tripDays);
       console.log(`[trigger-jarvis] ${tripId}: Stage 1 (skeleton) ${Date.now() - stageStart}ms`);
 
       stageStart = Date.now();
