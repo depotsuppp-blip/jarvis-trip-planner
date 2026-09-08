@@ -678,17 +678,15 @@ def _run_consensus_poll(destination: str, days: int) -> None:
     unreliable throughout this project, and a plain voter link was never
     actually distinguishable from an organizer's anyway.
 
-    days is the trip length the user actually asked Jarvis for - it rides
-    along on the admin link as a plain ?days=<n> query param (app/trip/poll/[id]/page.tsx
-    reads it the same way it already reads ?admin=<token>, and forwards it
-    to POST /api/trigger-jarvis) rather than being stored server-side:
-    that route already clamps/defaults it (lib/tripDates.ts's
-    resolveTripDays), so there's no new failure mode introduced by not
-    persisting it, and no Prisma migration needed for what's ultimately
-    just generation-time config the organizer already holds via this same
-    link. Previously this was dropped entirely for consensus trips,
-    silently falling back to the web app's old hardcoded 5-day length
-    regardless of what the user asked for by voice.
+    days is the trip length the user actually asked Jarvis for -
+    forwarded to _create_poll_admin_token, which persists it to
+    Poll.durationDays server-side (see that function's docstring). It no
+    longer rides along as a URL param on the admin link: an earlier
+    version did that instead, but a value that lived only in the URL
+    reset to the web app's hardcoded 5-day default on every page reload
+    or friend link, since nothing about it was actually saved anywhere.
+    Before that URL-param version, this was dropped entirely for
+    consensus trips regardless of what the user asked for by voice.
 
     No Geocoding, Places, or Gemini call happens here - see "PLANNING_
     TYPE FORKS BEFORE ANY DATA GATHERING" in the module docstring for
@@ -699,7 +697,7 @@ def _run_consensus_poll(destination: str, days: int) -> None:
     poll_url = build_liff_link(f"/trip/poll/{trip_id}")
 
     admin_token = secrets.token_urlsafe(32)
-    admin_token_stored = _create_poll_admin_token(trip_id, admin_token, get_app_base_url())
+    admin_token_stored = _create_poll_admin_token(trip_id, admin_token, get_app_base_url(), days)
 
     try:
         from plugins import line_notifier
@@ -712,7 +710,7 @@ def _run_consensus_poll(destination: str, days: int) -> None:
         print(f"[TripPlanner] Consensus poll notification for {destination}: {result}")
 
         if admin_token_stored:
-            admin_url = build_liff_link(f"/trip/poll/{trip_id}?admin={admin_token}&days={days}")
+            admin_url = build_liff_link(f"/trip/poll/{trip_id}?admin={admin_token}")
             admin_message = (
                 "ลิงก์นี้สำหรับบอสคนเดียวนะครับ ห้าม Forward ต่อเด็ดขาด - "
                 f"ใช้กด Lock & Generate Plan ตอนโหวตครบแล้วครับ: {admin_url}"
@@ -961,7 +959,7 @@ def _sign_poll_request(trip_id: str, secret: str) -> tuple[str, str]:
     return _sign_request("GET", f"/api/poll/{trip_id}", secret)
 
 
-def _create_poll_admin_token(trip_id: str, admin_token: str, base_url: str) -> bool:
+def _create_poll_admin_token(trip_id: str, admin_token: str, base_url: str, days: int) -> bool:
     """
     POST {base_url}/api/poll/<trip_id>/admin-token - mints this trip's
     admin credential for "Lock & Generate Plan" (see
@@ -971,6 +969,13 @@ def _create_poll_admin_token(trip_id: str, admin_token: str, base_url: str) -> b
     Postgres, so the raw value only ever exists here and in the LINE
     message _run_consensus_poll sends right after this call succeeds -
     never in a database.
+
+    Also sends `days` - the trip length the user requested by voice -
+    which the route persists to Poll.durationDays. That's now the ONLY
+    place this value is captured for a consensus trip: it used to also
+    ride along as a ?days=<n> URL param on the admin link, but that reset
+    to the hardcoded default on every page reload or friend link since
+    nothing about it was actually saved server-side.
 
     Returns False on ANY failure: missing requests package, missing
     TRIP_API_SECRET_KEY, connection refused, timeout, or a non-2xx
@@ -994,7 +999,7 @@ def _create_poll_admin_token(trip_id: str, admin_token: str, base_url: str) -> b
     try:
         response = requests.post(
             f"{base_url}{path}",
-            json={"adminToken": admin_token},
+            json={"adminToken": admin_token, "days": days},
             headers={"X-Ts": ts, "X-Sig": sig},
             timeout=(3, 10),
         )

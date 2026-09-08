@@ -170,17 +170,25 @@ export async function lockPoll(tripId: string): Promise<void> {
 // ---------------------------------------------------------------------
 
 /**
- * Stores this trip's admin token hash, minted once by POST
- * /api/poll/[id]/admin-token right after a poll is created by voice
- * (plugins/trip_planner.py's _run_consensus_poll). An upsert since no
- * Poll row exists yet at that point in the normal flow - same pattern
- * as lockPoll/saveDraft elsewhere in this file.
+ * Stores this trip's admin token hash AND its requested trip length,
+ * minted/captured once by POST /api/poll/[id]/admin-token right after a
+ * poll is created by voice (plugins/trip_planner.py's
+ * _run_consensus_poll). An upsert since no Poll row exists yet at that
+ * point in the normal flow - same pattern as lockPoll/saveDraft
+ * elsewhere in this file. durationDays lives here (not on TripDraft,
+ * which doesn't exist yet at this point for a consensus trip) precisely
+ * so it's already in the database before generation ever needs to read
+ * it - see the field's own comment in prisma/schema.prisma.
  */
-export async function createPollAdminToken(tripId: string, tokenHash: string): Promise<void> {
+export async function createPollAdminToken(
+  tripId: string,
+  tokenHash: string,
+  durationDays: number
+): Promise<void> {
   await prisma.poll.upsert({
     where: { tripId },
-    create: { tripId, adminTokenHash: tokenHash },
-    update: { adminTokenHash: tokenHash },
+    create: { tripId, adminTokenHash: tokenHash, durationDays },
+    update: { adminTokenHash: tokenHash, durationDays },
   });
 }
 
@@ -188,6 +196,17 @@ export async function createPollAdminToken(tripId: string, tokenHash: string): P
 export async function getPollAdminTokenHash(tripId: string): Promise<string> {
   const row = await prisma.poll.findUnique({ where: { tripId } });
   return row?.adminTokenHash ?? "";
+}
+
+/**
+ * The organizer's requested trip length - Prisma's own column default
+ * (5) covers a trip created before this field existed; this function's
+ * `?? 5` only covers the (normally impossible) case of no Poll row at
+ * all, e.g. a stale/invalid tripId slipping past this function's caller.
+ */
+export async function getPollDurationDays(tripId: string): Promise<number> {
+  const row = await prisma.poll.findUnique({ where: { tripId } });
+  return row?.durationDays ?? 5;
 }
 
 // A claim older than this is treated as abandoned - see Poll.generating's

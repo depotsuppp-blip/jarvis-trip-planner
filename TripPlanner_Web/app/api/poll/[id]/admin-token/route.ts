@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { hashAdminToken } from "@/lib/adminToken";
 import { createPollAdminToken } from "@/lib/store";
+import { resolveTripDays } from "@/lib/tripDates";
 
 // params is a Promise in this Next.js version, not a plain object - see
 // node_modules/next/dist/docs/01-app/03-api-reference/03-file-conventions/route.md.
@@ -85,7 +86,18 @@ function verifyHmacSignature(request: NextRequest, id: string): string | null {
  *
  * Intentionally callable more than once for the same trip id (upsert,
  * not create-or-fail): a retried voice command should mint a fresh
- * token rather than get stuck on a leftover row from a prior attempt.
+ * token rather than get stuck on a leftover row from a prior attempt -
+ * that also re-saves `days` each time, which is correct: a retry should
+ * reflect whatever the user most recently asked for.
+ *
+ * Also captures `days` - the organizer's requested trip length - into
+ * Poll.durationDays (see that field's comment in prisma/schema.prisma
+ * for why it lives here rather than on TripDraft). This used to ride
+ * along as a ?days=<n> URL param on the admin link instead, which reset
+ * to the hardcoded default on every page reload or friend link since
+ * nothing about it was ever persisted server-side - this route is what
+ * actually fixes that, by making the value durable from the moment the
+ * trip is created.
  */
 export async function POST(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
@@ -104,9 +116,10 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         { status: 400 }
       );
     }
+    const durationDays = resolveTripDays(body?.days);
 
-    await createPollAdminToken(id, hashAdminToken(adminToken));
-    return NextResponse.json({ tripId: id }, { status: 201 });
+    await createPollAdminToken(id, hashAdminToken(adminToken), durationDays);
+    return NextResponse.json({ tripId: id, durationDays }, { status: 201 });
   } catch (error) {
     console.error(`POST /api/poll/${id}/admin-token failed:`, error);
     return NextResponse.json(

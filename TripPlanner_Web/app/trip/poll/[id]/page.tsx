@@ -128,16 +128,6 @@ export default function TripPollPage({
   const [adminToken, setAdminToken] = useState("");
   const isAdmin = Boolean(adminToken);
 
-  // The organizer's requested trip length, read from the SAME admin
-  // link's ?days=<n> param (see plugins/trip_planner.py's
-  // _run_consensus_poll, which appends it right next to ?admin=<token>) -
-  // forwarded as-is to POST /api/trigger-jarvis in handleLockAndGenerate.
-  // "" (never sent) for an ordinary voter link, or an admin link minted
-  // before this param existed - the API defaults that case to
-  // DEFAULT_TRIP_DAYS itself (lib/tripDates.ts's resolveTripDays), so
-  // there's nothing to default here.
-  const [tripDays, setTripDays] = useState("");
-
   const [votes, setVotes] = useState<PollVote[]>([]);
   const [isLoadingVotes, setIsLoadingVotes] = useState(true);
 
@@ -226,12 +216,10 @@ export default function TripPollPage({
     // virtue of being async.
     queueMicrotask(() => {
       try {
-        const params = new URLSearchParams(window.location.search);
-        setAdminToken(params.get("admin") || "");
-        setTripDays(params.get("days") || "");
+        setAdminToken(new URLSearchParams(window.location.search).get("admin") || "");
       } catch {
-        // No admin/days param, or an unparseable query string - either
-        // way this trip's poll page just shows no "Lock & Generate Plan"
+        // No admin param, or an unparseable query string - either way
+        // this trip's poll page just shows no "Lock & Generate Plan"
         // button, same as an ordinary voter link.
       }
 
@@ -264,6 +252,17 @@ export default function TripPollPage({
         const data = await response.json();
         if (!cancelled) {
           setVotes(Array.isArray(data.votes) ? data.votes : []);
+          // The actual fix for the state-sync bug: this trip's locked
+          // itinerary, straight from Postgres (see GET /api/poll/[id]'s
+          // docstring) - not just whatever POST /api/trigger-jarvis
+          // happened to return into React state during THIS tab's own
+          // "Lock & Generate Plan" click. A refresh, or a friend opening
+          // the same link fresh, now sees the SAME locked dashboard the
+          // admin does, with no "Lock & Generate Plan" button anywhere -
+          // see the sticky button's render guard below.
+          if (data.itinerary) {
+            setGeneratedPlan(data.itinerary as Itinerary);
+          }
         }
       } catch {
         // Leave the list empty - the form below still works either way.
@@ -387,19 +386,14 @@ export default function TripPollPage({
     try {
       // admin_token is the actual authorization mechanism now - see
       // app/api/trigger-jarvis/route.ts's docstring. No LINE identity is
-      // sent or checked on this path at all any more. `days`, when
-      // present, is forwarded as a number - the API itself clamps and
-      // defaults it (lib/tripDates.ts's resolveTripDays), so an absent
-      // or malformed value here is never fatal.
-      const parsedDays = Number(tripDays);
+      // sent or checked on this path at all any more. Trip length is no
+      // longer sent here either - the route reads it server-side from
+      // Poll.durationDays (captured at poll-creation time), not from
+      // this request.
       const response = await fetch("/api/trigger-jarvis", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          trip_id: id,
-          admin_token: adminToken,
-          ...(tripDays && Number.isFinite(parsedDays) ? { days: parsedDays } : {}),
-        }),
+        body: JSON.stringify({ trip_id: id, admin_token: adminToken }),
       });
 
       const data = await response.json().catch(() => null);
@@ -440,7 +434,17 @@ export default function TripPollPage({
       >
         {lockError && <p className="text-sm text-red-600">{lockError}</p>}
 
-        {generatedPlan ? (
+        {isLoadingVotes ? (
+          // Avoids a flash of the voting form (and, for an admin, the
+          // "Lock & Generate Plan" button) before this load has had a
+          // chance to say whether the trip is already locked - see
+          // loadVotes above, which is what populates generatedPlan from
+          // the database now, not just this tab's own POST
+          // /api/trigger-jarvis response.
+          <div className="rounded-3xl border border-slate-200 bg-white p-10 text-center text-sm text-slate-500 shadow-sm">
+            Loading trip...
+          </div>
+        ) : generatedPlan ? (
           <section aria-label="Trip itinerary" className="space-y-6">
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
               <div className="lg:col-span-4">
@@ -481,7 +485,7 @@ export default function TripPollPage({
           <BoardingPass id={id} votes={votes} />
         )}
 
-        {!generatedPlan && (
+        {!isLoadingVotes && !generatedPlan && (
         <div className="space-y-6">
           <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="text-base font-semibold text-slate-900">
@@ -655,13 +659,20 @@ export default function TripPollPage({
         )}
       </main>
 
-      <StickyActionButton
-        label={isLocking ? "Processing..." : "Lock & Generate Plan"}
-        onClick={handleLockAndGenerate}
-        disabled={!isAdmin || isLocking}
-        disabledHint={!isAdmin ? "Only the trip organizer can lock the plan." : undefined}
-        variant="light"
-      />
+      {/* Completely hidden, not just disabled, once a plan already
+          exists - for every viewer, admin included, since there is
+          nothing left to lock. Also hidden while the initial load is
+          still in flight, so it can't flash briefly before generatedPlan
+          arrives on an already-locked trip. */}
+      {!isLoadingVotes && !generatedPlan && (
+        <StickyActionButton
+          label={isLocking ? "Processing..." : "Lock & Generate Plan"}
+          onClick={handleLockAndGenerate}
+          disabled={!isAdmin || isLocking}
+          disabledHint={!isAdmin ? "Only the trip organizer can lock the plan." : undefined}
+          variant="light"
+        />
+      )}
     </div>
   );
 }

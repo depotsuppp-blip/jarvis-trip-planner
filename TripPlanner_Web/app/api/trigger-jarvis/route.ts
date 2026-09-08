@@ -17,6 +17,7 @@ import { computeDayRoute, computeDepartureTimeForDay, type TravelLeg } from "@/l
 import {
   claimPollForGeneration,
   getDraft,
+  getPollDurationDays,
   getPollVotes,
   lockPoll,
   releasePollClaim,
@@ -532,13 +533,6 @@ export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => null);
   const tripId = typeof body?.trip_id === "string" ? body.trip_id.trim() : "";
   const adminToken = typeof body?.admin_token === "string" ? body.admin_token.trim() : "";
-  // The organizer's actually-requested trip length, forwarded from the
-  // ?days=<n> param on their admin link (see build_liff_link's admin URL
-  // in plugins/trip_planner.py's _run_consensus_poll, and this same
-  // field read in app/trip/poll/[id]/page.tsx) - resolveTripDays clamps
-  // and defaults it, so a missing/malformed value never breaks
-  // generation, it just falls back to DEFAULT_TRIP_DAYS.
-  const tripDays = resolveTripDays(body?.days);
 
   if (!tripId) {
     return NextResponse.json({ error: "trip_id is required." }, { status: 400 });
@@ -600,6 +594,15 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
+
+      // The organizer's actually-requested trip length, read from
+      // Poll.durationDays (see that field's comment in
+      // prisma/schema.prisma) - captured once at poll-creation time by
+      // POST /api/poll/[id]/admin-token, NOT from this request's body.
+      // resolveTripDays re-clamps it as a defense-in-depth safety net
+      // (the write side already clamps too), so a malformed stored
+      // value never breaks generation.
+      const tripDays = resolveTripDays(await getPollDurationDays(tripId));
 
       // Per-stage timings, logged (not just commented) so real numbers
       // stay verifiable as this pipeline changes - see this route's

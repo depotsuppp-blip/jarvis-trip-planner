@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { addPollVote, getPollVotes, type PollVote } from "@/lib/store";
+import { addPollVote, getDraft, getPollVotes, isPollLocked, type PollVote } from "@/lib/store";
+import { parseStoredItinerary } from "@/lib/itinerary";
 import { summarizePollVotes } from "@/lib/tripSummary";
 import { verifyBearerLineToken } from "@/lib/lineAuth";
 import { checkRateLimit } from "@/lib/rateLimit";
@@ -103,7 +104,31 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     // finalize_trip_plan_async on the Python side - gets one clean object
     // instead of re-implementing this same tallying logic in a second
     // language.
-    return NextResponse.json({ tripId: id, votes, summary: summarizePollVotes(votes) });
+    //
+    // `locked`/`itinerary` are also additive, and are what actually fixes
+    // the poll page's state-sync bug: it used to only ever learn a trip
+    // was locked from the direct response of its OWN POST
+    // /api/trigger-jarvis call, held in nothing but React state - a
+    // refresh, or a friend opening the same link, saw the vote form and
+    // (for an admin) the "Lock & Generate Plan" button again even though
+    // the trip was already locked in Postgres. This GET, which the page
+    // already calls on every mount, is now the single source of truth
+    // for that: `itinerary` is the same parsed shape POST
+    // /api/trigger-jarvis returns, straight from TripDraft (see
+    // lib/itinerary.ts's parseStoredItinerary), or null if there isn't a
+    // valid one yet - which the page treats as "not locked" regardless
+    // of what `locked` says, since there'd be nothing to render.
+    const locked = await isPollLocked(id);
+    const draft = locked ? await getDraft(id) : null;
+    const itinerary = draft ? parseStoredItinerary(draft.text) : null;
+
+    return NextResponse.json({
+      tripId: id,
+      votes,
+      summary: summarizePollVotes(votes),
+      locked,
+      itinerary,
+    });
   } catch (error) {
     // An uncaught throw here (e.g. a corrupted .data/polls.json, a disk
     // error) previously escaped as a bare connection drop instead of a

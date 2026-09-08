@@ -93,6 +93,23 @@ model Poll {
   /// for this trip - verifyAdminToken treats that as "nobody can
   /// authorize this trip," never as "any token works."
   adminTokenHash      String    @default("")
+  /// Requested trip length in days, captured once at poll-creation time
+  /// (see POST /api/poll/[id]/admin-token, sent by
+  /// plugins/trip_planner.py's _create_poll_admin_token right after the
+  /// user's voice command specifies it). The source of truth for both
+  /// the date-window search (lib/tripDates.ts's computeBestTripWindow)
+  /// and the Stage 1 prompt's day count (app/api/trigger-jarvis/route.ts) -
+  /// replaces an earlier ?days=<n> URL-param approach, which reset to
+  /// the default on every page reload or friend link since nothing
+  /// about it was ever persisted server-side. Lives on Poll rather than
+  /// TripDraft: Poll already exists from the moment a trip is created
+  /// (see adminTokenHash above), but TripDraft for a consensus trip
+  /// doesn't exist until generation actually finishes writing one - too
+  /// late, since Stage 1 needs this value BEFORE it generates anything.
+  /// Defaults to 5 for a trip created before this field existed, or if
+  /// the voice pipeline never sent a value - the same default this app
+  /// always used.
+  durationDays        Int       @default(5)
 }
 
 model action_logs {
