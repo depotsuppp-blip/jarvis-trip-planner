@@ -1,7 +1,9 @@
 "use client";
 
 import { use, useEffect, useState } from "react";
+import { useSession } from "next-auth/react";
 import { PageHeader } from "@/components/PageHeader";
+import { LoginScreen } from "@/components/auth/LoginScreen";
 import { computeDateRangeLabel, tallyVibes } from "@/lib/tripSummary";
 
 interface PollVote {
@@ -25,10 +27,38 @@ export default function TripDashboardPage({
   // use() rather than await since this component cannot be async.
   const { id } = use(params);
 
+  // Same admin-link bypass and login gate as app/trip/poll/[id]/page.tsx -
+  // see that file's matching comments for why this reads the query string
+  // in an effect instead of a lazy useState initializer (window isn't
+  // available during this client component's server render).
+  const [adminToken, setAdminToken] = useState("");
+  const isAdmin = Boolean(adminToken);
+  const { status: sessionStatus } = useSession();
+  const canAccess = isAdmin || sessionStatus === "authenticated";
+
   const [votes, setVotes] = useState<PollVote[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
+    queueMicrotask(() => {
+      try {
+        setAdminToken(new URLSearchParams(window.location.search).get("admin") || "");
+      } catch {
+        // No admin param, or an unparseable query string - falls back to
+        // requiring a signed-in session, same as an ordinary invite link.
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    // Don't fetch this trip's votes until the login gate below actually
+    // lets the visitor see them - see the matching effect (and the note
+    // on why isLoading staying true while blocked is harmless) in
+    // app/trip/poll/[id]/page.tsx.
+    if (!canAccess) {
+      return;
+    }
+
     let cancelled = false;
 
     async function loadVotes() {
@@ -51,13 +81,28 @@ export default function TripDashboardPage({
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, canAccess]);
 
   const dateLabel = computeDateRangeLabel(votes);
   const topVibes = tallyVibes(votes);
   const maxVibeCount = topVibes[0]?.count ?? 0;
 
   const wishlistEntries = votes.filter((vote) => vote.wishlist.trim().length > 0);
+
+  if (!isAdmin && sessionStatus === "loading") {
+    return (
+      <div className="min-h-screen pb-10">
+        <PageHeader title="Trip Dashboard" tripId={id} />
+        <main className="mx-auto max-w-md px-4 py-6">
+          <p className="text-sm text-zinc-400">Loading...</p>
+        </main>
+      </div>
+    );
+  }
+
+  if (!canAccess) {
+    return <LoginScreen tripId={id} />;
+  }
 
   return (
     <div className="min-h-screen pb-10">

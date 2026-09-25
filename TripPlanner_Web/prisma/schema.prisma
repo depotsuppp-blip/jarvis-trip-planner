@@ -6,6 +6,148 @@ datasource db {
   provider = "postgresql"
 }
 
+// ---------------------------------------------------------------------
+// NextAuth.js (Auth.js) models - the exact shape @auth/prisma-adapter
+// expects for a Postgres adapter. Field names/casing (emailVerified,
+// providerAccountId, session_state, etc.) are load-bearing: the adapter
+// reads/writes them by these exact names, not just by model name, so
+// don't rename them to match this file's usual camelCase-everywhere
+// style. See app/api/auth/[...nextauth]/route.ts and lib/auth.ts.
+// ---------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+
+  accounts Account[]
+  sessions Session[]
+
+  // Phase 2 social/personalization features - see their own model
+  // docstrings below for why tripId isn't a hard foreign key.
+  tripParticipations     TripParticipant[]
+  swipeActions           UserSwipeAction[]
+  sentFriendRequests     Friendship[]      @relation("FriendshipRequester")
+  receivedFriendRequests Friendship[]      @relation("FriendshipAddressee")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------
+// Phase 2: social + personalization features
+// ---------------------------------------------------------------------
+
+// One row per (user, trip) a signed-in user has joined - lets the UI
+// answer "who's in this trip" and, by joining across rows sharing a
+// userId, "who have I traveled with before" (Past Trip Mates).
+//
+// tripId is a bare correlator string, the same convention Poll/PollVote/
+// TripDraft above already use for tripId - deliberately NOT a
+// `@relation` to TripDraft. A participant can join a trip before any
+// TripDraft row exists (TripDraft is only written once draft text is
+// saved or a consensus itinerary finishes generating - see TripDraft's
+// and Poll.durationDays's docstrings above), so a hard foreign key here
+// would reject that ordering instead of matching how trips actually get
+// created.
+model TripParticipant {
+  id       String   @id @default(cuid())
+  userId   String
+  tripId   String
+  joinedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tripId])
+  @@index([tripId])
+}
+
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+// Explicit "Add Friend" relationship. A self-relation on User via two
+// named relations (requester/addressee) rather than a single symmetric
+// join table, since a request has a direction and a status until it's
+// accepted - see FriendshipStatus above.
+model Friendship {
+  id          String           @id @default(cuid())
+  requesterId String
+  addresseeId String
+  status      FriendshipStatus @default(PENDING)
+  createdAt   DateTime         @default(now())
+
+  requester User @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee User @relation("FriendshipAddressee", fields: [addresseeId], references: [id], onDelete: Cascade)
+
+  @@unique([requesterId, addresseeId])
+  @@index([addresseeId])
+}
+
+enum SwipeAction {
+  LIKE
+  DISLIKE
+}
+
+// One row per (user, trip, place) swipe on the upcoming Tinder-style
+// place-picker UI. A later swipe on the same (userId, tripId,
+// googlePlaceId) is meant to replace this row (same "resubmission
+// replaces the prior row" convention as PollVote.voterKey above), not
+// append a duplicate - enforced here the same way, via @@unique.
+//
+// tripId is a bare correlator string, not a `@relation` to TripDraft -
+// see TripParticipant's docstring above for why.
+model UserSwipeAction {
+  id            String      @id @default(cuid())
+  userId        String
+  tripId        String
+  googlePlaceId String
+  action        SwipeAction
+  createdAt     DateTime    @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tripId, googlePlaceId])
+  @@index([tripId])
+}
+
 // One row per voter per trip. A resubmission (double-tap, or genuinely
 // changing your mind) replaces the prior row rather than appending a
 // duplicate - enforced by the database itself via @@unique([tripId,

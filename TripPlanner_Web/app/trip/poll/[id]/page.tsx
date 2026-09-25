@@ -1,9 +1,11 @@
 "use client";
 
 import { use, useEffect, useState, type FormEvent } from "react";
+import { useSession } from "next-auth/react";
 import { ensureLiffInit, liff } from "@/lib/liff";
 import { PageHeader } from "@/components/PageHeader";
 import { StickyActionButton } from "@/components/StickyActionButton";
+import { LoginScreen } from "@/components/auth/LoginScreen";
 import { TripSummary } from "@/components/trip/TripSummary";
 import { MapPlaceholderCard } from "@/components/trip/MapPlaceholderCard";
 import { TimelineList } from "@/components/trip/TimelineList";
@@ -128,6 +130,13 @@ export default function TripPollPage({
   const [adminToken, setAdminToken] = useState("");
   const isAdmin = Boolean(adminToken);
 
+  // Phase 2 login gate: an admin link always gets in (see isAdmin above),
+  // otherwise a visitor must hold a NextAuth session - see the early
+  // returns near the bottom of this component and components/auth/
+  // LoginScreen.tsx, which is the entire sign-in UI for that case.
+  const { status: sessionStatus } = useSession();
+  const canAccess = isAdmin || sessionStatus === "authenticated";
+
   const [votes, setVotes] = useState<PollVote[]>([]);
   const [isLoadingVotes, setIsLoadingVotes] = useState(true);
 
@@ -244,6 +253,16 @@ export default function TripPollPage({
   }, [id]);
 
   useEffect(() => {
+    // Don't fetch this trip's votes/itinerary until the login gate below
+    // actually lets the visitor see them - canAccess flips true either
+    // immediately (admin link) or once sessionStatus resolves to
+    // "authenticated", re-running this effect. isLoadingVotes staying
+    // true while blocked is harmless: the login-gate early return below
+    // renders LoginScreen instead of ever showing that loading state.
+    if (!canAccess) {
+      return;
+    }
+
     let cancelled = false;
 
     async function loadVotes() {
@@ -277,7 +296,7 @@ export default function TripPollPage({
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, canAccess]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -422,6 +441,28 @@ export default function TripPollPage({
     generatedPlan?.startDate && generatedPlan?.endDate
       ? `${formatShortDate(generatedPlan.startDate)} – ${formatShortDate(generatedPlan.endDate)}`
       : computeDateRangeLabel(votes);
+
+  // Login gate: an admin link (isAdmin) always passes through. Otherwise,
+  // wait for the NextAuth session to resolve before deciding - showing a
+  // neutral loading state avoids a flash of either the poll form or the
+  // login screen while sessionStatus is still "loading" - then show
+  // LoginScreen instead of any trip content for a signed-out visitor.
+  if (!isAdmin && sessionStatus === "loading") {
+    return (
+      <div className="min-h-screen bg-slate-50">
+        <PageHeader title="Trip Poll" tripId={id} variant="light" />
+        <main className="mx-auto max-w-md px-4 py-6">
+          <div className="rounded-3xl border border-slate-200 bg-white p-10 text-center text-sm text-slate-500 shadow-sm">
+            Loading...
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  if (!canAccess) {
+    return <LoginScreen tripId={id} />;
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 pb-32">
