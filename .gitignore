@@ -18,6 +18,9 @@ venv/
 # Local session memory
 memory.json
 
+# llm_budget.py's daily token usage record
+.data/
+
 # Custom wake word training output
 jarvis_training_output/
 my_jarvis.yaml

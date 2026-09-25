@@ -75,7 +75,7 @@ behind a different voice and a different bill.
 MODEL CHOICE - READ THIS
 -------------------------------------------------------------------
 The Anthropic path targets "claude-sonnet-5", not "claude-3-5-sonnet",
-and "claude-haiku-4-5", not "claude-3-haiku-20240307". Every model in
+and "claude-haiku-4-5-20251001", not "claude-3-haiku-20240307". Every model in
 ROUTING_TABLE is a current one, and that is not cosmetic: the claude-3
 generation is retired, so a router pointed at it would fail every
 question it routed instead of answering it more cheaply.
@@ -116,6 +116,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import llm_budget
 import plugin_loader
 import task_dispatcher
 import vision_engine
@@ -151,7 +152,7 @@ INTENT_SIMPLE = "simple"        # greetings, thanks, the time - talk, not work
 INTENT_STANDARD = "standard"    # the default: one tool call and a sentence
 INTENT_COMPLEX = "complex"      # design, analysis, debugging, writing code
 
-MODEL_SIMPLE = "claude-haiku-4-5"   # cheap tier, for talk that needs no thought
+MODEL_SIMPLE = "claude-haiku-4-5-20251001"   # cheap tier, for talk that needs no thought
 MODEL = "claude-sonnet-5"           # standard tier, and the default
 MODEL_DEEP = "claude-opus-5"        # reasoning tier, for heavy requests
 
@@ -1787,7 +1788,16 @@ class AnthropicProvider(_Provider):
         request: dict[str, Any] = {
             "model": target,
             "max_tokens": self._max_tokens,
-            "system": system,
+            # A cache_control breakpoint on the system prompt, not a
+            # plain string - SYSTEM_PROMPT is identical on every call
+            # this provider makes, so Anthropic can serve it from cache
+            # (a fraction of the input-token cost) instead of the model
+            # re-reading it from scratch each turn. Below Anthropic's
+            # ~1024-token minimum this is simply a no-op, not an error,
+            # so it costs nothing to always set.
+            "system": [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ],
             "thinking": THINKING_TOOLS if tools else THINKING_PLAIN,
             "output_config": {"effort": effort or self._effort},
             "messages": self._to_messages(transcript),
@@ -1804,12 +1814,26 @@ class AnthropicProvider(_Provider):
             request.pop("thinking", None)
 
         if tools:
-            request["tools"] = anthropic_tool_schemas(tools)
+            schemas = anthropic_tool_schemas(tools)
+            # Same reasoning as the system-prompt breakpoint above: the
+            # tool list is rebuilt from the same static TOOLS registry
+            # every call, so mark the LAST schema cacheable - Anthropic
+            # caches everything up to and including a marked block, so
+            # this one breakpoint covers the whole tools array.
+            schemas[-1] = {**schemas[-1], "cache_control": {"type": "ephemeral"}}
+            request["tools"] = schemas
 
         try:
             response = self._client.messages.create(**request)
         except Exception as exc:  # noqa: BLE001 - classified immediately below
             raise self._classify(exc) from exc
+
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            llm_budget.record_usage(
+                getattr(usage, "input_tokens", 0) or 0,
+                getattr(usage, "output_tokens", 0) or 0,
+            )
 
         # Safety classifiers can decline a request: HTTP 200, but with
         # stop_reason "refusal" and no usable content. Check before
@@ -2046,6 +2070,13 @@ class GeminiProvider(_Provider):
             )
         except Exception as exc:  # noqa: BLE001 - classified immediately below
             raise self._classify(exc) from exc
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            llm_budget.record_usage(
+                getattr(usage, "prompt_token_count", 0) or 0,
+                getattr(usage, "candidates_token_count", 0) or 0,
+            )
 
         text_parts: list[str] = []
         calls: list[ToolCall] = []
@@ -2500,6 +2531,17 @@ class LLMBrain:
         """
         if not user_text or not user_text.strip():
             return "I didn't catch a question."
+
+        # Checked before any routing or provider work happens at all -
+        # see llm_budget's module docstring: a no-op unless
+        # JARVIS_DAILY_TOKEN_BUDGET is explicitly configured.
+        if llm_budget.is_budget_exceeded():
+            print("[Brain] Daily LLM token budget reached - not calling a provider.")
+            return (
+                "I've hit today's language-model budget, so I can't answer that "
+                "right now. It resets tomorrow, or raise JARVIS_DAILY_TOKEN_BUDGET "
+                "in the .env file."
+            )
 
         if not self.available:
             return (
