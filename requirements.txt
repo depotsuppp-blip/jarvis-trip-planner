@@ -74,6 +74,15 @@ vosk>=0.3.45
 #     python whisper_manager.py
 #
 # Without it, ACTIVE mode falls back to Vosk and English-only commands.
+#
+# Also supplies end-of-speech detection (vad_capture.py): faster-whisper
+# bundles the Silero VAD model as an ONNX file, and vad_capture.py runs it
+# on the onnxruntime already required above for openWakeWord. There is no
+# torch, webrtcvad or pynput dependency - push-to-talk polls the key
+# through ctypes. It reads whatever Silero file the installed
+# faster-whisper bundles (checked against 1.2.1, silero_vad_v6.onnx); if
+# that file's inputs are not the ones it drives, it falls back to the
+# energy gate and prints why.
 faster-whisper>=1.0.0
 
 # --- On-demand vision (Module 11) ---------------------------------------

@@ -39,16 +39,22 @@ immediately and the microphone is never reopened.
 ENDPOINTING
 -------------------------------------------------------------------
 Whisper transcribes a finished recording; it does not stream. Something
-has to decide when the user stopped talking, and that is the energy
-gate in `_record`: 30 ms frames, an RMS threshold calibrated against
-the room's own noise floor at the start of each listen, speech declared
-after a few voiced frames and ended after END_SILENCE seconds of quiet.
+has to decide when the user stopped talking, and that is vad_capture.py:
+Silero VAD scores each 32 ms of microphone audio for human speech, and a
+phrase ends after 0.6 s without any. A held push-to-talk key can
+take the decision over entirely (JARVIS_PTT). `_capture` below only
+opens the microphone and hands the stream over.
 
-Deliberately simple, and deliberately not a neural VAD: this runs on
-the main thread between microphone reads, and the cost of a wrong
-decision is small (a slightly clipped sentence, or one extra second of
-patience). Whisper's own VAD filter then trims the recording before
-transcription, so leading and trailing silence never reaches the model.
+This used to be an RMS energy gate calibrated once per listen, and it
+had a bad failure mode: any noise that came and went (a fan, keystrokes)
+kept restarting its "has it gone quiet" clock until the 20 s cap, so
+Whisper was handed a huge recording to decode. vad_capture's docstring
+has the details; the energy gate survives there only as a fallback.
+
+Whisper's own VAD filter still runs over a VAD-endpointed recording
+(cheap, and harmless on audio that is already trimmed) and is skipped
+for a push-to-talk one, where the user has told us the model's idea of
+speech was wrong.
 
 -------------------------------------------------------------------
 CONFIGURATION (.env)
@@ -60,7 +66,10 @@ CONFIGURATION (.env)
     JARVIS_WHISPER_LANGUAGE  blank = auto-detect (default), or th / en to pin
     JARVIS_WHISPER_PROMPT    override the code-switching hint below
     JARVIS_WHISPER_BEAM      beam size, default 5 (1 is ~10% faster)
-    JARVIS_VAD_THRESHOLD     blank = auto-calibrate, or an RMS integer
+    JARVIS_VAD               silero (default) | energy, plus _END_SILENCE_MS,
+                             _MAX_PHRASE and _SPEECH_PROB - see vad_capture.py
+    JARVIS_VAD_THRESHOLD     an RMS integer; the energy fallback only
+    JARVIS_PTT, JARVIS_PTT_KEY   push-to-talk: off (default) | auto | hold
 
 -------------------------------------------------------------------
 PERFORMANCE, MEASURED ON THIS MACHINE (CPU, int8)
@@ -104,6 +113,8 @@ from typing import Callable, Optional
 
 import numpy as np
 
+import vad_capture
+
 try:  # Windows only; everywhere else the cue is simply skipped.
     import winsound
 except ImportError:  # pragma: no cover - non-Windows
@@ -137,19 +148,13 @@ DEFAULT_MODEL_SIZE = "small"
 # other audio path in this project.
 SAMPLE_RATE = 16000
 
-# Endpointer geometry.
-FRAME_MS = 30                      # granularity of the energy gate
+# Where an utterance starts and stops is vad_capture.py's business now.
+# What is left here is the rough energy estimate speech_seconds() makes
+# of audio that was NOT captured by it (the standby spillover).
+FRAME_MS = 30                      # granularity of speech_seconds()
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
-START_FRAMES = 3                   # ~90 ms of voice to call it speech
-END_SILENCE = 0.8                  # quiet after speech that ends a phrase
-MAX_PHRASE = 20.0                  # hard cap on one utterance
-MIN_SPEECH = 0.25                  # shorter than this is a cough, not a command
-
-# Fallback RMS gate, used when calibration is impossible. Auto
-# calibration (noise floor x NOISE_MULTIPLIER) normally wins.
+MIN_SPEECH = vad_capture.MIN_SPEECH  # shorter than this is a cough, not a command
 DEFAULT_RMS_THRESHOLD = 500.0
-NOISE_MULTIPLIER = 3.0
-CALIBRATION_FRAMES = 10            # ~300 ms of room tone
 
 # Whisper is prompted rather than pinned to a language. Pinning to "en"
 # would make Thai come back as English nonsense; pinning to "th" does
@@ -254,17 +259,6 @@ def _beam_size() -> int:
         return 5
 
 
-def _rms_threshold_override() -> Optional[float]:
-    raw = _env("JARVIS_VAD_THRESHOLD")
-    if not raw:
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"[Whisper] Ignoring invalid JARVIS_VAD_THRESHOLD={raw!r}.")
-        return None
-
-
 def is_available() -> bool:
     """True if the faster-whisper package imported."""
     return _WHISPER_AVAILABLE
@@ -355,6 +349,22 @@ class WhisperTranscriber:
         self._loaded = threading.Event()
         self._lock = threading.Lock()
 
+        # End-of-speech detection (vad_capture.py). Built on first use,
+        # not here: loading the VAD is cheap but not free, and a
+        # transcriber made for a one-off self-test never captures.
+        self._vad = None
+        self._ptt = None
+        self._endpointing_lock = threading.Lock()
+
+    def _ensure_endpointing(self) -> None:
+        """Loads the VAD and reads the push-to-talk settings, once."""
+        with self._endpointing_lock:
+            if self._vad is not None:
+                return
+            self._vad = vad_capture.load_vad()
+            self._ptt = vad_capture.PushToTalk.from_env()
+            print(f"[VAD] {vad_capture.describe(self._vad, self._ptt)}.")
+
     # -- model lifecycle -----------------------------------------------
 
     @property
@@ -388,6 +398,13 @@ class WhisperTranscriber:
 
     def _load(self) -> None:
         started = time.monotonic()
+        # Warmed here, off the main thread, so the first listen of the
+        # session does not pay for the VAD and its status line is
+        # printed with the rest of the startup output.
+        try:
+            self._ensure_endpointing()
+        except Exception as exc:  # noqa: BLE001 - listen() will retry and report
+            print(f"[VAD] Could not start yet ({type(exc).__name__}: {exc}).")
         os.makedirs(MODELS_DIR, exist_ok=True)
         print(f"[Whisper] Loading {self._size} ({self._device}/{self._compute})...")
         try:
@@ -454,9 +471,15 @@ class WhisperTranscriber:
 
     # -- transcription -------------------------------------------------
 
-    def transcribe(self, pcm: bytes) -> str:
+    def transcribe(self, pcm: bytes, vad_filter: bool = True) -> str:
         """
         Transcribes finished audio. Returns "" if there is nothing in it.
+
+        `vad_filter` is Whisper's own silence trimming. It is on for
+        everything the endpointer cut, and off for a push-to-talk
+        recording: someone who held a key to be heard over a noisy room
+        has told us the model's idea of speech is wrong, and letting it
+        drop the quiet parts of that recording would undo the point.
 
         Never raises: a transcription failure degrades to "I heard
         nothing", which the session loop already knows how to handle.
@@ -476,7 +499,7 @@ class WhisperTranscriber:
                 task="transcribe",             # never "translate"
                 initial_prompt=_initial_prompt(),
                 beam_size=_beam_size(),
-                vad_filter=True,               # trim silence before decoding
+                vad_filter=vad_filter,         # trim silence before decoding
                 # Each command is independent; carrying context across
                 # them makes Whisper repeat the previous sentence when
                 # this one is short or noisy.
@@ -498,92 +521,53 @@ class WhisperTranscriber:
 
     # -- capture -------------------------------------------------------
 
-    def _record(
+    def _capture(
         self,
         timeout: float,
         cancel: Optional[threading.Event] = None,
-    ) -> bytes:
+        on_audio: Optional[Callable[[bytes], None]] = None,
+    ) -> vad_capture.CaptureResult:
         """
-        Captures one utterance and returns its PCM (b"" if none).
+        Opens the microphone and captures one utterance (see vad_capture).
 
         `timeout` is patience for speech to START; once it has, the
-        phrase runs until END_SILENCE of quiet or MAX_PHRASE.
+        phrase runs until the VAD hears it end (or the key comes up).
 
-        `cancel` is the session's inactivity Event, checked once per
-        30 ms frame - the timer thread only ever sets a flag, and this
-        is where it is read. Like the Vosk path, cancellation is honoured
-        only before speech starts, never mid-sentence.
+        `cancel` is the session's inactivity Event - the timer thread
+        only ever sets a flag, and the capture loop is where it is read,
+        once per 32 ms frame. Like the Vosk path, cancellation is
+        honoured only before speech starts, never mid-sentence.
+
+        `on_audio` receives each chunk as it is captured; it is the
+        hook a streaming recogniser plugs into (see vad_capture).
         """
-        stream = self._voice.open_input_stream(frames_per_buffer=FRAME_SAMPLES)
+        self._ensure_endpointing()
+        stream = self._voice.open_input_stream(frames_per_buffer=vad_capture.FRAME_SAMPLES)
         if stream is None:
-            return b""
-
-        threshold = _rms_threshold_override()
-        calibrating = threshold is None
-        noise: list[float] = []
-
-        frames: list[bytes] = []
-        voiced_run = 0
-        speech_started: Optional[float] = None
-        last_voice = 0.0
-        started = time.monotonic()
-
-        print("[Whisper] Listening... (speak now)")
+            return vad_capture.CaptureResult(reason="no-mic")
         try:
-            while True:
-                now = time.monotonic()
-
-                if speech_started is None:
-                    if cancel is not None and cancel.is_set():
-                        return b""
-                    if now - started > timeout:
-                        return b""
-                elif now - speech_started > MAX_PHRASE:
-                    print("[Whisper] Reached the phrase limit.")
-                    break
-
-                try:
-                    frame = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
-                except Exception as exc:  # noqa: BLE001 - read error mid-capture
-                    print(f"[Whisper] Microphone read failed: {exc}")
-                    return b"".join(frames)
-
-                level = _rms(frame)
-
-                if calibrating:
-                    noise.append(level)
-                    if len(noise) >= CALIBRATION_FRAMES:
-                        floor = float(np.median(noise))
-                        threshold = max(DEFAULT_RMS_THRESHOLD * 0.4, floor * NOISE_MULTIPLIER)
-                        calibrating = False
-                        print(f"[Whisper] Noise floor {floor:.0f}, gate {threshold:.0f}.")
-                    continue
-
-                if level > threshold:
-                    voiced_run += 1
-                    last_voice = now
-                    if speech_started is None and voiced_run >= START_FRAMES:
-                        speech_started = now
-                        print("\r[Whisper] Speech detected...", end="", flush=True)
-                else:
-                    voiced_run = 0
-
-                # Keep a little pre-roll so the first consonant of the
-                # sentence is not clipped off the front.
-                frames.append(frame)
-                if speech_started is None and len(frames) > START_FRAMES * 4:
-                    frames.pop(0)
-
-                if speech_started is not None and now - last_voice > END_SILENCE:
-                    break
-
-            return b"".join(frames)
+            return vad_capture.capture_utterance(
+                stream,
+                timeout=timeout,
+                cancel=cancel,
+                vad=self._vad,
+                ptt=self._ptt,
+                on_audio=on_audio,
+            )
         finally:
             try:
                 stream.stop_stream()
                 stream.close()
             except Exception:  # noqa: BLE001 - teardown must stay quiet
                 pass
+
+    def _record(
+        self,
+        timeout: float,
+        cancel: Optional[threading.Event] = None,
+    ) -> bytes:
+        """The captured PCM alone (b"" if none). Kept for existing callers."""
+        return self._capture(timeout, cancel).pcm
 
     def listen(
         self,
@@ -646,17 +630,20 @@ class WhisperTranscriber:
                     return text
                 print("[Whisper] Nothing intelligible in the spillover; listening live.")
 
-        pcm = self._record(timeout=timeout, cancel=cancel)
+        capture = self._capture(timeout=timeout, cancel=cancel)
+        pcm = capture.pcm
         if not pcm:
             return ""
 
         # Gated on actual speech, not merely on bytes: acknowledging a
-        # cough or a door closing is worse than staying quiet.
-        voiced = speech_seconds(pcm)
+        # cough or a door closing is worse than staying quiet. The
+        # figure comes from the endpointer, which already counted it
+        # frame by frame, rather than from a second pass over the audio.
+        voiced = capture.voiced_seconds
         if voiced >= MIN_SPEECH:
             acknowledge(voiced)
 
-        text = self.transcribe(pcm)
+        text = self.transcribe(pcm, vad_filter=not capture.ptt)
         if text:
             safe_print(f"[You] {text}")
         else:
@@ -677,6 +664,7 @@ def status() -> int:
     print(f"  compute      {_compute_type(device)}")
     print(f"  language     {_language() or 'auto-detect (Thai/English code-switching)'}")
     print(f"  beam size    {_beam_size()}")
+    print(f"  endpointing  {vad_capture.describe()}")
     print(f"  cache        {MODELS_DIR}")
     if os.path.isdir(MODELS_DIR):
         total = sum(
