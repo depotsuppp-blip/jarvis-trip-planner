@@ -26,7 +26,7 @@ Tools live in TOOLS below. Each carries one JSON schema that is
 translated into whichever provider's dialect is in use, so adding a
 tool means writing one entry, not two.
 
-Four things were added to this module beyond plain tool calling:
+Five things were added to this module beyond plain tool calling:
 
   DYNAMIC MODEL ROUTING  _classify_intent labels each question and
       ROUTING_TABLE turns that label into a model, before the turn is
@@ -55,6 +55,17 @@ Four things were added to this module beyond plain tool calling:
       plugin_loader picks up on the next turn. It is confirmation-gated
       and the code is printed before it is written. Read the honest
       security note in plugin_loader.py before extending this.
+
+  FRONT DOOR  before the supervisor loop, one tool-less call to the cheap
+      tier reads the question against FRONT_DOOR_PROMPT and answers with
+      JSON: {intent_type, route_to, response}. route_to "SELF" means
+      response is spoken as it stands, so greetings and general
+      conversation never pay for a tool-carrying supervisor turn.
+      "ORCHESTRATOR" (trip planning, anything that needs a tool) hands
+      the question on to the supervisor loop below, which is where the
+      orchestration actually lives. Tool commands, reasoning-tier
+      questions and answers to something Jarvis just asked never reach
+      it - see LLMBrain._front_door. JARVIS_FRONT_DOOR=0 turns it off.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -225,6 +236,33 @@ VISION_SYSTEM_PROMPT = """You are the eyes of a voice assistant. You are shown o
 - When reading code or text back, read the relevant part, not the whole screen, and say which file or window it is in if that is visible.
 - Never read out long paths, URLs, or anything that looks like a password, an API key, or a token, even if it is on screen. Say that it is there instead.
 - No markdown, bullet points, or code fences - your words are spoken."""
+
+# System prompt for the front door (see LLMBrain._front_door). The first
+# two paragraphs are the router brief as written; everything after them
+# is what this deployment needs on top. The router has no tools, so the
+# worst thing it can do is answer something that needed one, and the
+# reply is spoken verbatim, so it needs the same voice rules as the main
+# persona. SYSTEM_PROMPT stays the source of truth for those rules; this
+# is the short form of them.
+FRONT_DOOR_PROMPT = """You are JARVIS's Front-Door Router. Analyze the user's input and classify the intent. If the input is a greeting or general conversation, provide a helpful response. If the input requires complex trip planning or agent coordination, leave the response null and set the route_to flag to "ORCHESTRATOR".
+
+Output JSON format:
+{ "intent_type": "CHAT" | "TRIP_PLANNING", "route_to": "SELF" | "ORCHESTRATOR", "response": "string or null" }
+
+How this deployment reads your output:
+
+- Reply with the JSON object and nothing else: no code fence, no commentary before or after it.
+- Use route_to "SELF" only with intent_type "CHAT" and a real answer in response. Every other case is route_to "ORCHESTRATOR" with response null.
+- intent_type says what the input is about and route_to says who answers it, so they are separate decisions. "TRIP_PLANNING" is only for input about a trip: planning one, its group poll, voting, or finalizing the plan. Every other input is "CHAT", including a request that needs a tool, which is "CHAT" with route_to "ORCHESTRATOR".
+- The assistant behind you has tools that you do not. It logs and reads Subtrack expenses and records, runs n8n workflows, looks at the user's screen, sends LINE messages, starts and stops apps and servers, plans trips and trip polls, and reports what it can do and what is still running. A request that needs one of those, or live information about the user's own systems, is never yours to answer: route it to "ORCHESTRATOR" with response null. Never say or imply that you have done, started, or checked anything.
+- If the input answers a question the assistant just asked, or accepts or declines something it offered, route it to "ORCHESTRATOR".
+
+When you answer, the response is converted to speech and played through a speaker, so:
+
+- Speak English only, even if the user spoke Thai or a mix of Thai and English. Never emit Thai script.
+- Lead with the answer, in one to three short sentences of plain spoken prose, and add context only if it changes what the user would do next. No markdown, lists, emoji, asterisks, code, file paths, or URLs.
+- A greeting or a thank-you gets a brief natural reply and nothing else, such as "Hello." or "You're welcome." Do not end on a question or an offer of help ("How can I help?", "What do you need?"). If the input is only the name "Jarvis", reply "Yes?" or "I'm listening."
+- If you are unsure of a figure, a clause number, or a fact, say so plainly instead of inventing one."""
 
 # Spoken answers are short by nature, so a small cap keeps replies tight
 # and avoids the assistant monologuing at the user through the speakers.
@@ -603,6 +641,103 @@ def _classify_intent(text: str) -> tuple[str, str]:
                 return INTENT_SIMPLE, f"small talk (matched {marker!r})"
 
     return INTENT_STANDARD, "ordinary transactional work"
+
+
+# =====================================================================
+# Front door (Feature 6)
+# =====================================================================
+#
+# One tool-less call to the cheap tier, ahead of the supervisor loop,
+# that either answers the question itself or says "not mine". It covers
+# what _classify_intent cannot: telling a stray bit of general
+# conversation ("tell me a joke") from a request that only sounds like
+# one, without a keyword list that has to know every phrasing.
+#
+# It costs a round trip, which is why it is not consulted for everything.
+# LLMBrain._front_door_skip_reason keeps it off the questions where it
+# could only lose. What is left either gets its whole reply from this one
+# small call (cheaper than the supervisor turn it replaces) or pays one
+# small extra call before the supervisor takes over.
+
+_FRONT_DOOR_INTENTS = ("CHAT", "TRIP_PLANNING")
+_FRONT_DOOR_ROUTES = ("SELF", "ORCHESTRATOR")
+
+
+@dataclass
+class FrontDoorDecision:
+    """The router's verdict, as parsed from its JSON."""
+
+    intent_type: str
+    route_to: str
+    response: Optional[str] = None
+
+    @property
+    def spoken(self) -> Optional[str]:
+        """
+        The sentence to speak if the front door is answering, else None.
+
+        Both fields have to agree. A "SELF" verdict on a trip request
+        would speak an answer from a model with no trip tools, which is
+        the silent failure the thinking-mode comment above warns about -
+        so anything other than CHAT/SELF with a real reply is a hand-off.
+        """
+        if self.route_to == "SELF" and self.intent_type == "CHAT":
+            return self.response
+        return None
+
+
+def _parse_front_door(raw: str) -> Optional[FrontDoorDecision]:
+    """
+    Reads the router's JSON, or None if it did not produce a decision.
+
+    Lenient about the packaging - a model told "JSON only" still
+    sometimes wraps the object in a code fence or a sentence - and strict
+    about the content: a label outside the two lists is not a verdict.
+    The caller treats None as "hand it to the supervisor".
+    """
+    text = (raw or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    intent_type = str(data.get("intent_type") or "").strip().upper()
+    route_to = str(data.get("route_to") or "").strip().upper()
+    if intent_type not in _FRONT_DOOR_INTENTS or route_to not in _FRONT_DOOR_ROUTES:
+        return None
+
+    response = data.get("response")
+    if isinstance(response, str):
+        response = response.strip()
+        # The literal word "null" is what a model writes when it copies
+        # the format string instead of using JSON null.
+        if response.lower() in ("", "null"):
+            response = None
+    else:
+        response = None
+
+    return FrontDoorDecision(intent_type, route_to, response)
+
+
+def _looks_like_tool_command(text: str) -> bool:
+    """
+    True when an utterance reads as "do something" rather than "say
+    something".
+
+    The same two signals _classify_intent uses to keep these off the
+    cheap tier - a transactional opener, or a word that means the user
+    wants something run - because the front door has no tools and must
+    not be the one to answer them.
+    """
+    lowered = " " + re.sub(r"[^\w\s]", " ", text.lower()).strip() + " "
+    if any(lowered.lstrip().startswith(opener) for opener in _ALWAYS_FAST):
+        return True
+    return any(word in _TOOL_WORDS for word in lowered.split())
 
 
 # -- tool implementations ---------------------------------------------
@@ -2199,6 +2334,12 @@ class LLMBrain:
         self._tools = TOOLS if tools is None else tools
         self._confirm = confirm
 
+        # Feature 6: see _front_door. On unless JARVIS_FRONT_DOOR is set
+        # to 0, which sends every question straight to the supervisor.
+        self._front_door_enabled = _env("JARVIS_FRONT_DOOR", "1").lower() not in (
+            "0", "false", "no", "off",
+        )
+
         self._history: list[Turn] = []
         self._unavailable_reason = ""
 
@@ -2267,6 +2408,8 @@ class LLMBrain:
             for intent, route in ROUTING_TABLE.items()
         )
         print(f"[Brain] Routing table ({self._route_key}): {table} - picked per question.")
+        state = "on" if self._front_door_enabled else "off (JARVIS_FRONT_DOOR=0)"
+        print(f"[Brain] Front door: {state}.")
         standby = self._secondary if self._provider is self._primary else self._primary
         if standby.available:
             print(f"[Brain] Standby provider: {standby.name} ({standby.model}).")
@@ -2522,6 +2665,90 @@ class LLMBrain:
             model = None
         return model, route["effort"]
 
+    # -- the front door ------------------------------------------------
+
+    def _awaiting_answer(self) -> bool:
+        """
+        True when the last thing Jarvis said was a question.
+
+        "Bangkok" and "yes" only mean something as answers to the
+        parameter question or the finalize-this-poll confirmation that
+        SYSTEM_PROMPT has the supervisor ask. A front door that read
+        them as small talk would end that dialogue with a pleasantry
+        instead of the tool call, so the supervisor keeps those turns.
+        """
+        if not self._history or self._history[-1].kind != "assistant":
+            return False
+        # Drop the note ask() appends for the model after a background
+        # dispatch, or a question followed by it would not end in "?".
+        last = self._history[-1].text.split(" [Already dispatched", 1)[0]
+        return last.rstrip().endswith("?")
+
+    def _front_door_skip_reason(self, user_text: str, intent: str) -> str:
+        """Why this question should bypass the front door, or "" if it should not."""
+        if intent == INTENT_COMPLEX:
+            return "reasoning-tier question"
+        if _looks_like_tool_command(user_text):
+            return "tool command"
+        if self._awaiting_answer():
+            return "answer to Jarvis's own question"
+        return ""
+
+    def _front_door(self, user_text: str, intent: str) -> Optional[str]:
+        """
+        Lets the cheap tier answer greetings and general conversation.
+
+        Returns the sentence to speak, or None to carry on into the
+        supervisor loop. None covers every way this can fail to produce
+        an answer - switched off, skipped, provider trouble, unreadable
+        JSON, a hand-off to the ORCHESTRATOR - because the front door is
+        an optimisation and never a dependency: the supervisor can
+        answer anything the front door can.
+        """
+        if not self._front_door_enabled:
+            return None
+
+        skip = self._front_door_skip_reason(user_text, intent)
+        if skip:
+            print(f"[Brain] Front door skipped ({skip}).")
+            return None
+
+        # The history rides along because the router has to see what it
+        # is interrupting. The tool list does not: a router that can call
+        # tools is a second supervisor.
+        working: list[Turn] = list(self._history)
+        working.append(Turn(kind="user", text=user_text.strip()))
+        model, effort = self._route(INTENT_SIMPLE)
+
+        try:
+            turn = self._call_provider(
+                working, tools=[], model=model, effort=effort, system=FRONT_DOOR_PROMPT
+            )
+        except ProviderError as exc:
+            # No speaking the error here: the supervisor is about to make
+            # the same kind of call and will report it if it fails too.
+            print(f"[Brain] Front door unavailable ({exc.kind}); using the supervisor.")
+            return None
+
+        decision = _parse_front_door(turn.text) if turn.kind == "assistant" else None
+        if decision is None:
+            print(
+                f"[Brain] Front door gave no usable verdict ({turn.text[:80]!r}); "
+                "using the supervisor."
+            )
+            return None
+
+        reply = decision.spoken
+        if reply is None:
+            print(
+                f"[Brain] Front door: {decision.intent_type} -> {decision.route_to}; "
+                "handing to the supervisor."
+            )
+            return None
+
+        print(f"[Brain] Front door: answered directly ({model or self._provider.model}).")
+        return reply
+
     def ask(self, user_text: str) -> str:
         """
         Answers `user_text`, calling tools as needed, and returns one
@@ -2565,6 +2792,16 @@ class LLMBrain:
             f"[Brain] Routing: {intent.upper()} ({why}) "
             f"-> {model or self._provider.model}, effort {effort}."
         )
+
+        # Feature 6: greetings and general conversation stop here, answered
+        # by the cheap tier without the tool list. Anything else falls
+        # through to the loop below on the model chosen above.
+        spoken = self._front_door(user_text, intent)
+        if spoken is not None:
+            self._history.append(Turn(kind="user", text=user_text.strip()))
+            self._history.append(Turn(kind="assistant", text=spoken))
+            self._trim_history()
+            return spoken
 
         # A working copy: only the question and the final answer are kept
         # in history. The tool round trips are scaffolding for this one
@@ -2623,18 +2860,22 @@ class LLMBrain:
         tools: Optional[list[ToolSpec]] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        system: Optional[str] = None,
     ) -> Turn:
         """
         One provider round trip, with a single failover retry.
 
         Only errors that retrying cannot fix trigger the switch - see
-        ProviderError.is_fatal_for_provider.
+        ProviderError.is_fatal_for_provider. `system` replaces the
+        persona for this one call (the front door has its own prompt);
+        `tools=[]` means no tools, where None means the active set.
         """
         assert self._provider is not None
         tools = self._active_tools() if tools is None else tools
+        prompt = self._system_prompt if system is None else system
 
         try:
-            return self._provider.complete(self._system_prompt, working, tools, model, effort)
+            return self._provider.complete(prompt, working, tools, model, effort)
         except ProviderError as exc:
             if not exc.is_fatal_for_provider:
                 raise
@@ -2644,7 +2885,7 @@ class LLMBrain:
             # The standby provider names its models differently, so the
             # Anthropic-flavoured override is dropped rather than sent
             # somewhere it means nothing.
-            return self._provider.complete(self._system_prompt, working, tools, None, effort)
+            return self._provider.complete(prompt, working, tools, None, effort)
 
 
 if __name__ == "__main__":

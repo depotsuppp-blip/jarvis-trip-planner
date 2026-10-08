@@ -1,4 +1,4 @@
-import type { NextAuthOptions } from "next-auth";
+import { getServerSession, type NextAuthOptions } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import EmailProvider from "next-auth/providers/email";
 import { PrismaAdapter } from "@auth/prisma-adapter";
@@ -64,3 +64,14 @@ export const authOptions: NextAuthOptions = {
     },
   },
 };
+
+/**
+ * The signed-in user's id, or null for a signed-out caller - the check
+ * every route handler that must answer 401 makes before doing anything
+ * (see app/api/trip/swipe/route.ts). Reads the database session behind
+ * the session cookie, so it costs one session lookup per call.
+ */
+export async function getSessionUserId(): Promise<string | null> {
+  const session = await getServerSession(authOptions);
+  return session?.user?.id ?? null;
+}

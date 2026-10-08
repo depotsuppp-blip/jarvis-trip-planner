@@ -80,6 +80,46 @@ export interface Itinerary {
   weather?: WeatherSummary | null;
 }
 
+// ---------------------------------------------------------------------
+// Swipe deck (Phase 2 "pick the places you'd love" step) - see
+// GET /api/places/deck, POST/GET /api/trip/swipe, and
+// components/trip/SwipeDeck.tsx.
+// ---------------------------------------------------------------------
+
+/** Mirrors the SwipeAction enum in prisma/schema.prisma. */
+export type SwipeChoice = "LIKE" | "DISLIKE";
+
+/** Which of the deck's three searches surfaced a place - see lib/placeDeck.ts. */
+export type DeckPlaceCategory = "attraction" | "restaurant" | "cafe";
+
+/**
+ * One card in the swipe deck. `id` is Google's own place id - the only
+ * Places value this app is allowed to store (Google's Places policies
+ * exempt place ids from their caching ban), and exactly what
+ * UserSwipeAction.googlePlaceId holds. Everything else here is display
+ * data for the current session only: never persist it.
+ */
+export interface DeckPlace {
+  id: string;
+  name: string;
+  category: DeckPlaceCategory;
+  /** Google's own label for the place's primary type (e.g. "Thai restaurant"). */
+  categoryLabel: string;
+  rating: number | null;
+  ratingCount: number | null;
+  address: string | null;
+  /**
+   * Same-origin URL (GET /api/places/photo), never a Google URL carrying
+   * the server's API key. null when Google has no photo for this place.
+   */
+  photoUrl: string | null;
+  /**
+   * Google requires crediting a photo's author wherever the photo is
+   * shown - see the Place Photos (New) docs. null with photoUrl.
+   */
+  photoAttribution: { name: string; uri: string | null } | null;
+}
+
 // Rounded, never 0 - "~0 min" would read as broken rather than "very
 // close by". The "(estimate)" wording sits next to this at the call
 // site, not baked in here, since this also feeds the title tooltip.

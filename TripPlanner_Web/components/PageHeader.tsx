@@ -1,9 +1,15 @@
+import type { ReactNode } from "react";
+
 /**
  * Sticky page header: title + trip id, shared by every /trip/* page.
  *
  * Sticky rather than static so the trip id - the thing a friend forwarded
  * this link to confirm - stays visible while scrolling a long vote list or
  * a long draft textarea on a small screen.
+ *
+ * A page can swap the trip id line for its own `subtitle` (the swipe step
+ * shows "Near <destination> / Change" there, because by that point the
+ * destination is what the person needs to confirm, not the id).
  *
  * The profile circle is a static placeholder (no auth/profile data exists
  * yet) - it'll be swapped for the user's LINE profile picture once this
@@ -16,10 +22,13 @@
 export function PageHeader({
   title,
   tripId,
+  subtitle,
   variant = "dark",
 }: {
   title: string;
-  tripId: string;
+  /** Shown as "Trip ID: ..." under the title unless `subtitle` is given. */
+  tripId?: string;
+  subtitle?: ReactNode;
   variant?: "dark" | "light";
 }) {
   if (variant === "light") {
@@ -27,9 +36,13 @@ export function PageHeader({
       <header className="sticky top-0 z-10 flex items-start justify-between border-b border-slate-200 bg-white/80 px-4 py-4 backdrop-blur-xl">
         <div className="min-w-0">
           <h1 className="text-lg font-semibold tracking-tight text-slate-900">{title}</h1>
-          <p className="mt-0.5 text-sm text-slate-500">
-            Trip ID: <span className="font-mono text-slate-600">{tripId}</span>
-          </p>
+          {subtitle ? (
+            <div className="mt-0.5 text-sm text-slate-500">{subtitle}</div>
+          ) : tripId ? (
+            <p className="mt-0.5 text-sm text-slate-500">
+              Trip ID: <span className="font-mono text-slate-600">{tripId}</span>
+            </p>
+          ) : null}
         </div>
 
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-slate-50">
@@ -55,9 +68,13 @@ export function PageHeader({
     <header className="sticky top-0 z-10 flex items-start justify-between border-b border-white/10 bg-black/30 px-4 py-4 backdrop-blur-xl">
       <div className="min-w-0">
         <h1 className="text-lg font-semibold tracking-tight text-white">{title}</h1>
-        <p className="mt-0.5 text-sm text-zinc-400">
-          Trip ID: <span className="font-mono text-zinc-300">{tripId}</span>
-        </p>
+        {subtitle ? (
+          <div className="mt-0.5 text-sm text-zinc-400">{subtitle}</div>
+        ) : tripId ? (
+          <p className="mt-0.5 text-sm text-zinc-400">
+            Trip ID: <span className="font-mono text-zinc-300">{tripId}</span>
+          </p>
+        ) : null}
       </div>
 
       <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-gray-600 bg-gray-800">

@@ -1,0 +1,865 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-08T07:01:47.511Z",
+  "title": "Design System: Trip Planner",
+  "extensions": {
+    "colorMeta": {
+      "desk-mist": {
+        "role": "neutral",
+        "displayName": "Desk Mist",
+        "canonical": "oklch(98.4% 0.003 247.858)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "paper": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#222222",
+          "#3a3a3a",
+          "#555555",
+          "#717171",
+          "#8f8f8f",
+          "#bebebe",
+          "#eeeeee"
+        ]
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "oklch(92.9% 0.013 255.508)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "perforation": {
+        "role": "neutral",
+        "displayName": "Perforation",
+        "canonical": "oklch(86.9% 0.022 252.894)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "stub-grey": {
+        "role": "neutral",
+        "displayName": "Stub Grey",
+        "canonical": "oklch(96.8% 0.007 247.896)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "oklch(20.8% 0.042 265.755)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "ink-strong": {
+        "role": "neutral",
+        "displayName": "Ink Strong",
+        "canonical": "oklch(37.2% 0.044 257.287)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "ink-body": {
+        "role": "neutral",
+        "displayName": "Ink Body",
+        "canonical": "oklch(44.6% 0.043 257.281)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted",
+        "canonical": "oklch(55.4% 0.046 257.417)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "faint": {
+        "role": "neutral",
+        "displayName": "Faint",
+        "canonical": "oklch(70.4% 0.04 256.788)",
+        "tonalRamp": [
+          "#0f172b",
+          "#1d293d",
+          "#314158",
+          "#45556c",
+          "#62748e",
+          "#90a1b9",
+          "#cad5e2",
+          "#f1f5f9"
+        ]
+      },
+      "signal-rose": {
+        "role": "primary",
+        "displayName": "Signal Rose",
+        "canonical": "oklch(64.5% 0.246 16.439)",
+        "tonalRamp": [
+          "#8b0836",
+          "#a50036",
+          "#c70036",
+          "#ec003f",
+          "#ff2056",
+          "#ff637e",
+          "#ffa1ad",
+          "#ffe4e6"
+        ]
+      },
+      "signal-rose-deep": {
+        "role": "primary",
+        "displayName": "Deep Signal Rose",
+        "canonical": "oklch(58.6% 0.253 17.585)",
+        "tonalRamp": [
+          "#8b0836",
+          "#a50036",
+          "#c70036",
+          "#ec003f",
+          "#ff2056",
+          "#ff637e",
+          "#ffa1ad",
+          "#ffe4e6"
+        ]
+      },
+      "rose-wash": {
+        "role": "primary",
+        "displayName": "Rose Wash",
+        "canonical": "oklch(96.9% 0.015 12.422)",
+        "tonalRamp": [
+          "#8b0836",
+          "#a50036",
+          "#c70036",
+          "#ec003f",
+          "#ff2056",
+          "#ff637e",
+          "#ffa1ad",
+          "#ffe4e6"
+        ]
+      },
+      "rose-mist": {
+        "role": "primary",
+        "displayName": "Rose Mist",
+        "canonical": "oklch(94.1% 0.03 12.58)",
+        "tonalRamp": [
+          "#8b0836",
+          "#a50036",
+          "#c70036",
+          "#ec003f",
+          "#ff2056",
+          "#ff637e",
+          "#ffa1ad",
+          "#ffe4e6"
+        ]
+      },
+      "rose-edge": {
+        "role": "primary",
+        "displayName": "Rose Edge",
+        "canonical": "oklch(89.2% 0.058 10.001)",
+        "tonalRamp": [
+          "#8b0836",
+          "#a50036",
+          "#c70036",
+          "#ec003f",
+          "#ff2056",
+          "#ff637e",
+          "#ffa1ad",
+          "#ffe4e6"
+        ]
+      },
+      "wayfinding-blue": {
+        "role": "secondary",
+        "displayName": "Wayfinding Blue",
+        "canonical": "oklch(54.6% 0.245 262.881)",
+        "tonalRamp": [
+          "#1c398e",
+          "#193cb8",
+          "#1447e6",
+          "#155dfc",
+          "#2b7fff",
+          "#51a2ff",
+          "#8ec5ff",
+          "#dbeafe"
+        ]
+      },
+      "blue-wash": {
+        "role": "secondary",
+        "displayName": "Blue Wash",
+        "canonical": "oklch(97% 0.014 254.604)",
+        "tonalRamp": [
+          "#1c398e",
+          "#193cb8",
+          "#1447e6",
+          "#155dfc",
+          "#2b7fff",
+          "#51a2ff",
+          "#8ec5ff",
+          "#dbeafe"
+        ]
+      },
+      "focus-blue": {
+        "role": "secondary",
+        "displayName": "Focus Blue",
+        "canonical": "oklch(70.7% 0.165 254.624)",
+        "tonalRamp": [
+          "#1c398e",
+          "#193cb8",
+          "#1447e6",
+          "#155dfc",
+          "#2b7fff",
+          "#51a2ff",
+          "#8ec5ff",
+          "#dbeafe"
+        ]
+      },
+      "focus-halo": {
+        "role": "secondary",
+        "displayName": "Focus Halo",
+        "canonical": "oklch(93.2% 0.032 255.585)",
+        "tonalRamp": [
+          "#1c398e",
+          "#193cb8",
+          "#1447e6",
+          "#155dfc",
+          "#2b7fff",
+          "#51a2ff",
+          "#8ec5ff",
+          "#dbeafe"
+        ]
+      },
+      "go-green": {
+        "role": "tertiary",
+        "displayName": "Go Green",
+        "canonical": "oklch(50.8% 0.118 165.612)",
+        "tonalRamp": [
+          "#004f3b",
+          "#006045",
+          "#007a55",
+          "#009966",
+          "#00bc7d",
+          "#00d492",
+          "#5ee9b5",
+          "#d0fae5"
+        ]
+      },
+      "go-wash": {
+        "role": "tertiary",
+        "displayName": "Go Wash",
+        "canonical": "oklch(97.9% 0.021 166.113)",
+        "tonalRamp": [
+          "#004f3b",
+          "#006045",
+          "#007a55",
+          "#009966",
+          "#00bc7d",
+          "#00d492",
+          "#5ee9b5",
+          "#d0fae5"
+        ]
+      },
+      "go-edge": {
+        "role": "tertiary",
+        "displayName": "Go Edge",
+        "canonical": "oklch(90.5% 0.093 164.15)",
+        "tonalRamp": [
+          "#004f3b",
+          "#006045",
+          "#007a55",
+          "#009966",
+          "#00bc7d",
+          "#00d492",
+          "#5ee9b5",
+          "#d0fae5"
+        ]
+      },
+      "alert-red": {
+        "role": "tertiary",
+        "displayName": "Alert Red",
+        "canonical": "oklch(50.5% 0.213 27.518)",
+        "tonalRamp": [
+          "#82181a",
+          "#9f0712",
+          "#c10007",
+          "#e7000b",
+          "#fb2c36",
+          "#ff6467",
+          "#ffa2a2",
+          "#ffe2e2"
+        ]
+      },
+      "alert-wash": {
+        "role": "tertiary",
+        "displayName": "Alert Wash",
+        "canonical": "oklch(97.1% 0.013 17.38)",
+        "tonalRamp": [
+          "#82181a",
+          "#9f0712",
+          "#c10007",
+          "#e7000b",
+          "#fb2c36",
+          "#ff6467",
+          "#ffa2a2",
+          "#ffe2e2"
+        ]
+      },
+      "alert-edge": {
+        "role": "tertiary",
+        "displayName": "Alert Edge",
+        "canonical": "oklch(88.5% 0.062 18.334)",
+        "tonalRamp": [
+          "#82181a",
+          "#9f0712",
+          "#c10007",
+          "#e7000b",
+          "#fb2c36",
+          "#ff6467",
+          "#ffa2a2",
+          "#ffe2e2"
+        ]
+      },
+      "alert-icon": {
+        "role": "tertiary",
+        "displayName": "Alert Icon Red",
+        "canonical": "oklch(63.7% 0.237 25.331)",
+        "tonalRamp": [
+          "#82181a",
+          "#9f0712",
+          "#c10007",
+          "#e7000b",
+          "#fb2c36",
+          "#ff6467",
+          "#ffa2a2",
+          "#ffe2e2"
+        ]
+      },
+      "star-amber": {
+        "role": "tertiary",
+        "displayName": "Star Amber",
+        "canonical": "oklch(82.8% 0.189 84.429)",
+        "tonalRamp": [
+          "#7b3306",
+          "#973c00",
+          "#bb4d00",
+          "#e17100",
+          "#fe9a00",
+          "#ffb900",
+          "#ffd230",
+          "#fef3c6"
+        ]
+      },
+      "night-desk": {
+        "role": "neutral",
+        "displayName": "Night Desk",
+        "canonical": "#0d0d0d",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#222222",
+          "#3a3a3a",
+          "#555555",
+          "#717171",
+          "#8f8f8f",
+          "#bebebe",
+          "#eeeeee"
+        ]
+      },
+      "night-card": {
+        "role": "neutral",
+        "displayName": "Night Card",
+        "canonical": "#1a1a1a",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#222222",
+          "#3a3a3a",
+          "#555555",
+          "#717171",
+          "#8f8f8f",
+          "#bebebe",
+          "#eeeeee"
+        ]
+      },
+      "night-inset": {
+        "role": "neutral",
+        "displayName": "Night Inset",
+        "canonical": "#141414",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#222222",
+          "#3a3a3a",
+          "#555555",
+          "#717171",
+          "#8f8f8f",
+          "#bebebe",
+          "#eeeeee"
+        ]
+      },
+      "night-field": {
+        "role": "neutral",
+        "displayName": "Night Field",
+        "canonical": "#222222",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#222222",
+          "#3a3a3a",
+          "#555555",
+          "#717171",
+          "#8f8f8f",
+          "#bebebe",
+          "#eeeeee"
+        ]
+      },
+      "night-hairline": {
+        "role": "neutral",
+        "displayName": "Night Hairline",
+        "canonical": "rgba(255, 255, 255, 0.1)",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#222222",
+          "#3a3a3a",
+          "#555555",
+          "#717171",
+          "#8f8f8f",
+          "#bebebe",
+          "#eeeeee"
+        ]
+      },
+      "night-ink": {
+        "role": "neutral",
+        "displayName": "Night Ink",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#222222",
+          "#3a3a3a",
+          "#555555",
+          "#717171",
+          "#8f8f8f",
+          "#bebebe",
+          "#eeeeee"
+        ]
+      },
+      "night-body": {
+        "role": "neutral",
+        "displayName": "Night Body",
+        "canonical": "oklch(92% 0.004 286.32)",
+        "tonalRamp": [
+          "#18181b",
+          "#27272a",
+          "#3f3f46",
+          "#52525c",
+          "#71717b",
+          "#9f9fa9",
+          "#d4d4d8",
+          "#f4f4f5"
+        ]
+      },
+      "night-muted": {
+        "role": "neutral",
+        "displayName": "Night Muted",
+        "canonical": "oklch(70.5% 0.015 286.067)",
+        "tonalRamp": [
+          "#18181b",
+          "#27272a",
+          "#3f3f46",
+          "#52525c",
+          "#71717b",
+          "#9f9fa9",
+          "#d4d4d8",
+          "#f4f4f5"
+        ]
+      },
+      "night-button": {
+        "role": "neutral",
+        "displayName": "Night Button",
+        "canonical": "oklch(92% 0.004 286.32)",
+        "tonalRamp": [
+          "#18181b",
+          "#27272a",
+          "#3f3f46",
+          "#52525c",
+          "#71717b",
+          "#9f9fa9",
+          "#d4d4d8",
+          "#f4f4f5"
+        ]
+      },
+      "night-button-ink": {
+        "role": "neutral",
+        "displayName": "Night Button Ink",
+        "canonical": "oklch(21% 0.006 285.885)",
+        "tonalRamp": [
+          "#18181b",
+          "#27272a",
+          "#3f3f46",
+          "#52525c",
+          "#71717b",
+          "#9f9fa9",
+          "#d4d4d8",
+          "#f4f4f5"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "One hero numeral per screen, such as the dashboard 'Total Joined' count."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Screen and gate titles."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Card and section names, the destination, a place name."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "All interface text and captions."
+      },
+      "body-lg": {
+        "displayName": "Body Large",
+        "purpose": "Typed input and form-submit text."
+      },
+      "button": {
+        "displayName": "Button",
+        "purpose": "Labels on buttons and chips inside cards."
+      },
+      "button-lg": {
+        "displayName": "Button Large",
+        "purpose": "Form-submit and sticky-bar buttons."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Form labels and card eyebrows; uppercase, tracked."
+      },
+      "label-micro": {
+        "displayName": "Label Micro",
+        "purpose": "Ticket field names (CREW, TRIP CODE, DATES); uppercase, tracked."
+      },
+      "eyebrow": {
+        "displayName": "Eyebrow",
+        "purpose": "The document title line in Wayfinding Blue, e.g. 'Digital Boarding Pass'."
+      },
+      "code": {
+        "displayName": "Code",
+        "purpose": "Trip codes and ids only; Geist Mono."
+      }
+    },
+    "shadows": [
+      {
+        "name": "card-rest",
+        "value": "0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)",
+        "purpose": "Every content card at rest, always with a 1px Hairline."
+      },
+      {
+        "name": "gate-float",
+        "value": "0 20px 25px -5px rgb(15 23 43 / 0.05), 0 8px 10px -6px rgb(15 23 43 / 0.05)",
+        "purpose": "The login card."
+      },
+      {
+        "name": "stack-lift",
+        "value": "0 20px 25px -5px rgb(15 23 43 / 0.1), 0 8px 10px -6px rgb(15 23 43 / 0.1)",
+        "purpose": "Swipe cards in the stack."
+      },
+      {
+        "name": "cta-tint",
+        "value": "0 4px 6px -1px rgb(255 32 86 / 0.2), 0 2px 4px -2px rgb(255 32 86 / 0.2)",
+        "purpose": "Signal Rose buttons; the sticky bar uses 0 10px 15px -3px / 0.25."
+      },
+      {
+        "name": "field-inset",
+        "value": "inset 0 2px 4px 0 rgb(15 23 43 / 0.05)",
+        "purpose": "Text inputs."
+      },
+      {
+        "name": "focus-halo",
+        "value": "0 0 0 4px #dbeafe",
+        "purpose": "Keyboard focus on fields; #ffccd3 on rose buttons, #e2e8f0 on secondary buttons."
+      },
+      {
+        "name": "night-card",
+        "value": "0 25px 50px -12px rgb(0 0 0 / 0.4)",
+        "purpose": "Every dark card, with a 1px Night Hairline."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-standard",
+        "value": "cubic-bezier(0.4, 0, 0.2, 1)",
+        "purpose": "Default 150ms easing for state changes (Tailwind transition)."
+      },
+      {
+        "name": "press",
+        "value": "scale(0.98) on :active (0.97 for chips)",
+        "purpose": "Every pill control compresses slightly when pressed."
+      },
+      {
+        "name": "card-settle",
+        "value": "300ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+        "purpose": "A dragged swipe card springing back or the next card rising into place."
+      },
+      {
+        "name": "card-exit",
+        "value": "240ms ease-in",
+        "purpose": "A swiped card flying off (a 120ms fade in place under reduced motion)."
+      },
+      {
+        "name": "card-undo",
+        "value": "320ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+        "purpose": "Undo lays the last card back down from the side it left; the first-run nudge (1.1s, once) uses the same family."
+      },
+      {
+        "name": "skeleton-pulse",
+        "value": "2s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+        "purpose": "Loading skeletons (Tailwind animate-pulse, opacity only; static under reduced motion)."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "md",
+        "value": "768px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      },
+      {
+        "name": "xl",
+        "value": "1280px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one Signal Rose capsule per view: submit, send, lock. Presses to 0.98.",
+      "html": "<button class=\"ds-btn-primary\">Send magic link</button>",
+      "css": ".ds-btn-primary{display:flex;align-items:center;justify-content:center;width:100%;border:0;border-radius:9999px;background:#ff2056;color:#fff;padding:14px 16px;font-size:16px;font-weight:600;line-height:24px;font-family:Geist,Arial,Helvetica,sans-serif;cursor:pointer;box-shadow:0 4px 6px -1px rgb(255 32 86 / .2),0 2px 4px -2px rgb(255 32 86 / .2);transition:background-color .15s cubic-bezier(.4,0,.2,1),transform .15s cubic-bezier(.4,0,.2,1)}.ds-btn-primary:hover{background:#ec003f}.ds-btn-primary:active{transform:scale(.98)}.ds-btn-primary:focus-visible{outline:none;box-shadow:0 0 0 4px #ffccd3,0 4px 6px -1px rgb(255 32 86 / .2),0 2px 4px -2px rgb(255 32 86 / .2)}"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Paper capsule with a hairline edge, for the provider sign-in and every second-choice action.",
+      "html": "<button class=\"ds-btn-secondary\"><svg viewBox=\"0 0 18 18\" width=\"18\" height=\"18\" aria-hidden=\"true\"><path fill=\"#4285F4\" d=\"M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.56 2.7-3.87 2.7-6.62Z\"/><path fill=\"#34A853\" d=\"M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.95v2.33A9 9 0 0 0 9 18Z\"/><path fill=\"#FBBC05\" d=\"M3.95 10.7A5.4 5.4 0 0 1 3.66 9c0-.59.1-1.17.29-1.7V4.97H.95A9 9 0 0 0 0 9c0 1.45.35 2.83.95 4.03l3-2.33Z\"/><path fill=\"#EA4335\" d=\"M9 3.58c1.32 0 2.51.46 3.44 1.35l2.58-2.58A9 9 0 0 0 .95 4.97l3 2.33C4.66 5.17 6.65 3.58 9 3.58Z\"/></svg>Continue with Google</button>",
+      "css": ".ds-btn-secondary{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;border:1px solid #e2e8f0;border-radius:9999px;background:#fff;color:#314158;padding:14px 16px;font-size:14px;font-weight:600;line-height:20px;font-family:Geist,Arial,Helvetica,sans-serif;cursor:pointer;box-shadow:0 1px 3px 0 rgb(0 0 0 / .1),0 1px 2px -1px rgb(0 0 0 / .1);transition:background-color .15s,border-color .15s,transform .15s}.ds-btn-secondary:hover{background:#f8fafc;border-color:#cad5e2}.ds-btn-secondary:active{transform:scale(.98)}.ds-btn-secondary:focus-visible{outline:none;box-shadow:0 0 0 4px #e2e8f0,0 1px 3px 0 rgb(0 0 0 / .1)}"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input-field",
+      "description": "Desk Mist field under a tracked uppercase label; focus turns the border blue and raises a 4px halo.",
+      "html": "<div class=\"ds-field\"><label class=\"ds-field-label\" for=\"ds-email\">Your email</label><input class=\"ds-input\" id=\"ds-email\" type=\"email\" placeholder=\"you@example.com\"></div>",
+      "css": ".ds-field{font-family:Geist,Arial,Helvetica,sans-serif;}.ds-field-label{font-size:12px;font-weight:600;line-height:16px;letter-spacing:.05em;text-transform:uppercase;color:#62748e}.ds-input{display:block;box-sizing:border-box;width:100%;margin-top:6px;border:1px solid #e2e8f0;border-radius:16px;background:#f8fafc;padding:14px 16px;font-size:16px;line-height:24px;color:#0f172b;font-family:Geist,Arial,Helvetica,sans-serif;outline:none;box-shadow:inset 0 2px 4px 0 rgb(15 23 43 / .05);transition:border-color .15s,background-color .15s,box-shadow .15s}.ds-input::placeholder{color:#90a1b9}.ds-input:focus{border-color:#51a2ff;background:#fff;box-shadow:0 0 0 4px #dbeafe,inset 0 2px 4px 0 rgb(15 23 43 / .05)}"
+    },
+    {
+      "name": "Vibe Chip",
+      "kind": "chip",
+      "refersTo": "chip-vibe",
+      "description": "Unselected toggle chip: paper pill with a hairline edge.",
+      "html": "<button class=\"ds-chip\" aria-pressed=\"false\">☕ Cafe Hopping</button>",
+      "css": ".ds-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid #e2e8f0;border-radius:9999px;background:#fff;color:#45556c;padding:10px 16px;font-size:14px;font-weight:500;line-height:20px;font-family:Geist,Arial,Helvetica,sans-serif;cursor:pointer;transition:transform .15s,background-color .15s,border-color .15s}.ds-chip:hover{border-color:#cad5e2}.ds-chip:active{transform:scale(.97)}.ds-chip:focus-visible{outline:none;box-shadow:0 0 0 4px #e2e8f0}"
+    },
+    {
+      "name": "Vibe Chip (selected)",
+      "kind": "chip",
+      "refersTo": "chip-vibe-selected",
+      "description": "Selected state: Signal Rose fill, white label, leading check and a rose-tinted lift.",
+      "html": "<button class=\"ds-chip-on\" aria-pressed=\"true\"><span aria-hidden=\"true\">✓</span>📸 Photo Spots</button>",
+      "css": ".ds-chip-on{display:inline-flex;align-items:center;gap:6px;border:1px solid #ff2056;border-radius:9999px;background:#ff2056;color:#fff;padding:10px 16px;font-size:14px;font-weight:500;line-height:20px;font-family:Geist,Arial,Helvetica,sans-serif;cursor:pointer;box-shadow:0 4px 6px -1px rgb(255 32 86 / .25),0 2px 4px -2px rgb(255 32 86 / .25);transition:transform .15s,background-color .15s}.ds-chip-on:hover{background:#ec003f}.ds-chip-on:active{transform:scale(.97)}.ds-chip-on:focus-visible{outline:none;box-shadow:0 0 0 4px #ffccd3}"
+    },
+    {
+      "name": "Bento Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "The workhorse cell: white 24px card, hairline edge, card-rest shadow, one idea, with inset mini tiles.",
+      "html": "<section class=\"ds-card\"><p class=\"ds-card-label\">Destination</p><h3 class=\"ds-card-title\">Chiang Mai</h3><div class=\"ds-card-tiles\"><div class=\"ds-tile\"><p class=\"ds-tile-label\">Budget / person</p><p class=\"ds-tile-value\">12,400 THB</p></div><div class=\"ds-tile\"><p class=\"ds-tile-label\">Weather</p><p class=\"ds-tile-value\">~29°C · Sunny</p></div></div></section>",
+      "css": ".ds-card{box-sizing:border-box;border:1px solid #e2e8f0;border-radius:24px;background:#fff;padding:20px;color:#0f172b;font-family:Geist,Arial,Helvetica,sans-serif;box-shadow:0 1px 3px 0 rgb(0 0 0 / .1),0 1px 2px -1px rgb(0 0 0 / .1)}.ds-card-label{margin:0;font-size:11px;font-weight:500;line-height:16px;letter-spacing:.1em;text-transform:uppercase;color:#62748e}.ds-card-title{margin:4px 0 0;font-size:18px;font-weight:700;line-height:28px;letter-spacing:-.025em}.ds-card-tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}.ds-tile{border:1px solid #e2e8f0;border-radius:16px;background:#f8fafc;padding:12px}.ds-tile-label{margin:0;font-size:12px;font-weight:500;line-height:16px;color:#62748e}.ds-tile-value{margin:2px 0 0;font-size:14px;font-weight:600;line-height:20px;color:#0f172b}"
+    },
+    {
+      "name": "Boarding Pass",
+      "kind": "custom",
+      "refersTo": "card",
+      "description": "Signature card of the poll and the north star made literal: blue eyebrow, ticket row with a rose plane over a dashed line, notched tear, stub, barcode.",
+      "html": "<article class=\"ds-pass\"><div class=\"ds-pass-head\"><div><p class=\"ds-pass-eyebrow\">Digital Boarding Pass</p><p class=\"ds-pass-title\">Trip Poll</p></div><span class=\"ds-pass-pill\">Poll Open</span></div><div class=\"ds-pass-row\"><div class=\"ds-pass-col\"><p class=\"ds-pass-label\">Crew</p><p class=\"ds-pass-big\">4 joined</p></div><div class=\"ds-pass-plane\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"#ff2056\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z\"/></svg><div class=\"ds-pass-dash\"></div></div><div class=\"ds-pass-col ds-pass-right\"><p class=\"ds-pass-label\">Trip code</p><p class=\"ds-pass-code\">8F3A21C0</p></div></div><div class=\"ds-pass-tear\"><span class=\"ds-pass-notch ds-pass-notch-l\"></span><span class=\"ds-pass-notch ds-pass-notch-r\"></span></div><div class=\"ds-pass-stub\"><div><p class=\"ds-pass-label\">Dates</p><p class=\"ds-pass-small\">12 Nov – 16 Nov</p></div><div><p class=\"ds-pass-label\">Status</p><p class=\"ds-pass-small\">Awaiting lock-in</p></div></div><div class=\"ds-pass-bars\"><span style=\"width:3px\"></span><span style=\"width:4px\"></span><span style=\"width:2px\"></span><span style=\"width:5px\"></span><span style=\"width:3px\"></span><span style=\"width:2px\"></span><span style=\"width:4px\"></span><span style=\"width:3px\"></span><span style=\"width:5px\"></span><span style=\"width:2px\"></span><span style=\"width:3px\"></span><span style=\"width:4px\"></span><span style=\"width:2px\"></span><span style=\"width:5px\"></span><span style=\"width:3px\"></span><span style=\"width:4px\"></span><span style=\"width:2px\"></span><span style=\"width:3px\"></span><span style=\"width:5px\"></span><span style=\"width:4px\"></span><span style=\"width:2px\"></span><span style=\"width:3px\"></span><span style=\"width:4px\"></span><span style=\"width:5px\"></span><span style=\"width:2px\"></span><span style=\"width:3px\"></span><span style=\"width:4px\"></span><span style=\"width:2px\"></span><span style=\"width:5px\"></span><span style=\"width:3px\"></span><span style=\"width:4px\"></span><span style=\"width:2px\"></span></div></article>",
+      "css": ".ds-pass{position:relative;overflow:hidden;border:1px solid #e2e8f0;border-radius:24px;background:#fff;color:#0f172b;font-family:Geist,Arial,Helvetica,sans-serif;box-shadow:0 1px 3px 0 rgb(0 0 0 / .1),0 1px 2px -1px rgb(0 0 0 / .1)}.ds-pass p{margin:0}.ds-pass-head{display:flex;align-items:flex-start;justify-content:space-between;padding:20px 20px 0}.ds-pass-eyebrow{font-size:11px;font-weight:600;line-height:16px;letter-spacing:.2em;text-transform:uppercase;color:#155dfc}.ds-pass-title{margin-top:4px!important;font-size:20px;font-weight:700;line-height:28px}.ds-pass-pill{border:1px solid #a4f4cf;border-radius:9999px;background:#ecfdf5;padding:4px 12px;font-size:11px;font-weight:600;line-height:16px;letter-spacing:.025em;text-transform:uppercase;color:#007a55}.ds-pass-row{display:flex;align-items:center;gap:12px;margin-top:20px;padding:0 20px}.ds-pass-col{flex:1;min-width:0}.ds-pass-right{text-align:right}.ds-pass-label{font-size:11px;font-weight:500;line-height:16px;letter-spacing:.1em;text-transform:uppercase;color:#62748e}.ds-pass-big{font-size:24px;font-weight:700;line-height:32px}.ds-pass-code{font-family:'Geist Mono',ui-monospace,Menlo,Consolas,monospace;font-size:24px;font-weight:700;line-height:32px}.ds-pass-plane{display:flex;flex-direction:column;align-items:center;width:40px;flex:none}.ds-pass-dash{margin-top:4px;width:100%;height:0;border-top:1px dashed #cad5e2}.ds-pass-tear{position:relative;margin:20px 0;border-top:1px dashed #e2e8f0}.ds-pass-notch{position:absolute;top:0;width:20px;height:20px;border-radius:9999px;background:#f8fafc;transform:translateY(-50%)}.ds-pass-notch-l{left:-10px}.ds-pass-notch-r{right:-10px}.ds-pass-stub{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 20px 20px;text-align:center}.ds-pass-small{margin-top:4px!important;font-size:14px;font-weight:600;line-height:20px}.ds-pass-bars{display:flex;align-items:flex-end;gap:3px;box-sizing:border-box;height:32px;overflow:hidden;padding:0 20px 20px}.ds-pass-bars span{display:block;height:100%;background:#e2e8f0}"
+    },
+    {
+      "name": "Swipe Ticket",
+      "kind": "custom",
+      "refersTo": "card",
+      "description": "The swipe deck's card: a ticket with the photo on top, a dashed Perforation with two half-moon notches, and a fixed-height stub where name and rating sit together. No scrim, blur or gradient on the photo; the photo area here is a flat stand-in.",
+      "html": "<article class=\"ds-ticket\"><div class=\"ds-ticket-photo\"><span class=\"ds-ticket-chip\">Museum</span><span class=\"ds-ticket-credit\"><b>Photo</b> &middot; <u>Napat K.</u></span></div><div class=\"ds-ticket-tear\"><span class=\"ds-ticket-notch ds-ticket-notch-l\"></span><span class=\"ds-ticket-notch ds-ticket-notch-r\"></span></div><div class=\"ds-ticket-stub\"><p class=\"ds-ticket-name\">Jim Thompson House Museum</p><p class=\"ds-ticket-rating\"><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"#ffb900\" stroke=\"#ffb900\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z\"/></svg><b>4.5</b><span>(12K)</span></p></div></article>",
+      "css": ".ds-ticket{position:relative;box-sizing:border-box;width:100%;border:1px solid #e2e8f0;border-radius:24px;background:#fff;color:#0f172b;font-family:Geist,Arial,Helvetica,sans-serif;box-shadow:0 20px 25px -5px rgb(15 23 43 / .1),0 8px 10px -6px rgb(15 23 43 / .1)}.ds-ticket p{margin:0}.ds-ticket-photo{position:relative;height:190px;overflow:hidden;border-radius:23px 23px 0 0;background:#cad5e2}.ds-ticket-chip{position:absolute;left:12px;top:12px;border:1px solid #e2e8f0;border-radius:9999px;background:#fff;padding:6px 12px;font-size:11px;font-weight:500;line-height:1;letter-spacing:.1em;text-transform:uppercase;color:#45556c;box-shadow:0 1px 3px 0 rgb(0 0 0 / .1),0 1px 2px -1px rgb(0 0 0 / .1)}.ds-ticket-credit{position:absolute;left:12px;bottom:12px;border-radius:9999px;background:rgb(15 23 43 / .7);padding:4px 12px;font-size:12px;font-weight:500;line-height:16px;color:#fff}.ds-ticket-credit b{font-weight:600;letter-spacing:.05em;text-transform:uppercase}.ds-ticket-credit u{text-decoration-color:rgb(255 255 255 / .5);text-underline-offset:2px}.ds-ticket-tear{position:relative;border-top:1px dashed #cad5e2}.ds-ticket-notch{position:absolute;top:-10px;box-sizing:border-box;width:10px;height:20px;border:1px solid #e2e8f0;background:#f8fafc}.ds-ticket-notch-l{left:-1px;border-left:0;border-radius:0 10px 10px 0}.ds-ticket-notch-r{right:-1px;border-right:0;border-radius:10px 0 0 10px}.ds-ticket-stub{display:flex;flex-direction:column;justify-content:center;box-sizing:border-box;min-height:120px;padding:16px 20px 20px}.ds-ticket-name{font-size:20px;font-weight:700;line-height:1.4}.ds-ticket-rating{display:flex;align-items:center;gap:6px;margin-top:8px!important;font-size:14px;line-height:20px}.ds-ticket-rating b{font-weight:600}.ds-ticket-rating span{color:#62748e}"
+    },
+    {
+      "name": "Swipe Controls",
+      "kind": "custom",
+      "refersTo": "button-primary",
+      "description": "Undo (48px ghost, half-strength when there is nothing to undo), Pass (64px Paper circle) and Like (64px Signal Rose circle, the one rose block of the view), each with a 12px Muted label.",
+      "html": "<div class=\"ds-ctls\"><div class=\"ds-ctl\"><div class=\"ds-ctl-slot\"><button class=\"ds-ctl-undo\" aria-label=\"Undo last swipe\" aria-disabled=\"true\"><svg viewBox=\"0 0 24 24\" width=\"20\" height=\"20\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M9 14 4 9l5-5\"/><path d=\"M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11\"/></svg></button></div><span>Undo</span></div><div class=\"ds-ctl\"><div class=\"ds-ctl-slot\"><button class=\"ds-ctl-pass\" aria-label=\"Pass\"><svg viewBox=\"0 0 24 24\" width=\"24\" height=\"24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.25\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M18 6 6 18\"/><path d=\"m6 6 12 12\"/></svg></button></div><span>Pass</span></div><div class=\"ds-ctl\"><div class=\"ds-ctl-slot\"><button class=\"ds-ctl-like\" aria-label=\"Like\"><svg viewBox=\"0 0 24 24\" width=\"24\" height=\"24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.25\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M2 9.5a5.5 5.5 0 0 1 9.591-3.676.56.56 0 0 0 .818 0A5.49 5.49 0 0 1 22 9.5c0 2.29-1.5 4-3 5.5l-5.492 5.313a2 2 0 0 1-3 .019L5 15c-1.5-1.5-3-3.2-3-5.5\"/></svg></button></div><span>Like</span></div></div>",
+      "css": ".ds-ctls{display:flex;align-items:flex-start;justify-content:center;gap:28px;font-family:Geist,Arial,Helvetica,sans-serif;}.ds-ctl{display:flex;flex-direction:column;align-items:center;gap:8px}.ds-ctl-slot{display:flex;align-items:center;justify-content:center;width:64px;height:64px}.ds-ctl span{font-size:12px;font-weight:500;line-height:16px;color:#62748e}.ds-ctl button{display:flex;align-items:center;justify-content:center;border-radius:9999px;cursor:pointer;transition:background-color .15s,transform .15s}.ds-ctl button:active{transform:scale(.97)}.ds-ctl-undo{width:48px;height:48px;border:1px solid #e2e8f0;background:transparent;color:#314158}.ds-ctl-undo[aria-disabled=true]{opacity:.5;cursor:default}.ds-ctl-pass{width:64px;height:64px;border:1px solid #e2e8f0;background:#fff;color:#314158;box-shadow:0 1px 3px 0 rgb(0 0 0 / .1),0 1px 2px -1px rgb(0 0 0 / .1)}.ds-ctl-pass:hover{background:#f8fafc}.ds-ctl-pass:focus-visible{outline:none;box-shadow:0 0 0 4px #cad5e2}.ds-ctl-like{width:64px;height:64px;border:0;background:#ff2056;color:#fff;box-shadow:0 4px 6px -1px rgb(255 32 86 / .2),0 2px 4px -2px rgb(255 32 86 / .2)}.ds-ctl-like:hover{background:#ec003f}.ds-ctl-like:focus-visible{outline:none;box-shadow:0 0 0 4px #ffccd3,0 4px 6px -1px rgb(255 32 86 / .2)}"
+    },
+    {
+      "name": "Status Pill",
+      "kind": "chip",
+      "refersTo": "pill-status-go",
+      "description": "Go Green status capsule: open, locked, saved. Uppercase micro-label.",
+      "html": "<span class=\"ds-pill\">Locked</span>",
+      "css": ".ds-pill{display:inline-block;border:1px solid #a4f4cf;border-radius:9999px;background:#ecfdf5;padding:4px 12px;font-size:11px;font-weight:600;line-height:16px;letter-spacing:.025em;text-transform:uppercase;color:#007a55;font-family:Geist,Arial,Helvetica,sans-serif;}"
+    },
+    {
+      "name": "Error Alert",
+      "kind": "custom",
+      "refersTo": "alert-error",
+      "description": "Inline failure banner: Alert Wash, red icon, one plain sentence. role=alert, placed above the controls it concerns.",
+      "html": "<div class=\"ds-alert\" role=\"alert\"><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" fill=\"none\" stroke=\"#fb2c36\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><line x1=\"12\" x2=\"12\" y1=\"8\" y2=\"12\"/><line x1=\"12\" x2=\"12.01\" y1=\"16\" y2=\"16\"/></svg><p>Login failed. Please try again.</p></div>",
+      "css": ".ds-alert{display:flex;align-items:flex-start;gap:10px;border:1px solid #ffc9c9;border-radius:16px;background:#fef2f2;padding:12px 16px;font-family:Geist,Arial,Helvetica,sans-serif;}.ds-alert svg{flex:none;margin-top:2px}.ds-alert p{margin:0;font-size:14px;font-weight:500;line-height:20px;color:#c10007}"
+    },
+    {
+      "name": "Bento Hero (Night)",
+      "kind": "card",
+      "refersTo": "card-night",
+      "description": "The dashboard's opening cell on the Night theme: label and status, trip code and dates, one display numeral (Signal Rose replaces the current indigo).",
+      "html": "<section class=\"ds-night\"><div class=\"ds-night-top\"><p class=\"ds-night-label\">Overview</p><span class=\"ds-night-pill\">Poll Open</span></div><div class=\"ds-night-body\"><div><p class=\"ds-night-micro\">Trip code</p><p class=\"ds-night-code\">8F3A21C0</p><p class=\"ds-night-micro ds-night-gap\">Dates</p><p class=\"ds-night-dates\">12 Nov – 16 Nov</p></div><div class=\"ds-night-count\"><p class=\"ds-night-num\">4</p><p class=\"ds-night-micro\">Total joined</p></div></div></section>",
+      "css": ".ds-night{box-sizing:border-box;border:1px solid rgba(255,255,255,.1);border-radius:24px;background:#1a1a1a;padding:16px;color:#fff;font-family:Geist,Arial,Helvetica,sans-serif;box-shadow:0 25px 50px -12px rgb(0 0 0 / .4)}.ds-night p{margin:0}.ds-night-top{display:flex;align-items:center;justify-content:space-between}.ds-night-label{font-size:12px;font-weight:600;line-height:16px;letter-spacing:.05em;text-transform:uppercase;color:#9f9fa9}.ds-night-pill{border:1px solid rgb(16 185 129 / .2);border-radius:9999px;background:rgb(16 185 129 / .1);padding:4px 12px;font-size:11px;font-weight:600;line-height:16px;letter-spacing:.025em;text-transform:uppercase;color:rgb(52 211 153 / .9)}.ds-night-body{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-top:16px}.ds-night-micro{font-size:11px;font-weight:500;line-height:16px;letter-spacing:.1em;text-transform:uppercase;color:#9f9fa9}.ds-night-gap{margin-top:12px!important}.ds-night-code{font-family:'Geist Mono',ui-monospace,Menlo,Consolas,monospace;font-size:18px;font-weight:700;line-height:28px}.ds-night-dates{font-size:18px;font-weight:700;line-height:28px}.ds-night-count{text-align:right}.ds-night-num{font-size:48px;font-weight:800;line-height:1;color:#ff2056}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Boarding Pass Desk",
+    "overview": "Everything in Trip Planner arrives as a document laid on a clean desk. The desk is a pale slate wash (Desk Mist); the documents are white cards with a hairline edge: a boarding pass for the poll, a day card for each itinerary day, a summary card for the locked plan. Screens are Bento grids of these cards, each holding exactly one idea, so a group of friends can read a trip at a glance on a phone. Structure comes from the cards and the grid, not from decoration. There is no chrome to look at, only the content and the next thing to do.\n\nThe palette is almost entirely slate and white. One vivid rose (Signal Rose) is the only voice in the system, and it is rare on purpose: it marks the single next action and its echoes. Blue helps you find your way and never asks for a click; green, red and amber report status. A dark theme sits beside the light one as an equal, with the same grid, radii and accent on a near-black desk. Type is Geist: friendly sans for sentences, Geist Mono for ticket codes, and small tracked uppercase labels as the \"field names\" of every document.\n\nThe tone is friendly and warm, crisp and clear, and playful where it counts: soft pill controls and 24px corners, strict labels and big numerals, a plane glyph, ticket notches and the LIKE / PASS stamps on the swipe deck. The user's confirmed visual rejection is AI-slop: template-looking decoration, with purple or indigo gradients as the named example. Light and dark are both official; today the theme is chosen per route (light: login, poll, swipe; dark: home, dashboard, draft board).",
+    "keyCharacteristics": [
+      "Pale desk (#f8fafc) with white 24px cards, a 1px slate hairline and a whisper shadow.",
+      "One rare accent, Signal Rose (#ff2056), on at most about 10% of any screen; the same accent in both themes.",
+      "Bento grids: a two-column dashboard grid where hero and wishlist cells span both columns, and a 12-column plan grid on large screens.",
+      "Tracked uppercase micro-labels and monospace codes give every card its \"printed document\" feel.",
+      "Pill controls that compress slightly when pressed; no gradients, no glow, no glass except sticky bars.",
+      "Measured contrast: faint grey and white-on-rose fall short of AA and are restricted (see Colors)."
+    ],
+    "rules": [
+      {
+        "name": "The One Voice Rule",
+        "body": "Signal Rose covers at most about 10% of any screen: one primary action plus its echoes. It is never a section background and never appears as two competing primaries.",
+        "section": "colors"
+      },
+      {
+        "name": "The Same Accent Rule",
+        "body": "Light and dark share one accent. No indigo, violet or purple anywhere in the system.",
+        "section": "colors"
+      },
+      {
+        "name": "The Readable Ink Rule",
+        "body": "Contrast is measured, not assumed: Ink on white 17.8:1; Ink Strong 10.4:1; Ink Body 7.6:1; Muted 4.8:1 on white and 4.6:1 on Desk Mist (the lightest text allowed for captions), but only 4.35:1 on Stub Grey, so text on that fill uses Ink Body; Faint 2.6:1 (placeholders and decorative icons only, never text that must be read); Night Muted 6.6:1 on Night Card, but #71717b only 3.6:1 (do not use it for text). White on Signal Rose is 3.75:1: it clears only the 3:1 large-text bar, so today's rose-filled labels (14 to 16px semibold) fall short of the 4.5:1 AA bar for text that size. Rose-filled text is therefore limited to button labels, never body copy; where AA conformance is required, fill the button with Deep Signal Rose (#ec003f), which measures 4.53:1 with white. Whether the resting fill changes is an open brand decision. Go Green text uses #007a55 (5.1:1 on Go Wash), not the lighter #009966 (3.65:1).",
+        "section": "colors"
+      },
+      {
+        "name": "The Form-Field Rule",
+        "body": "Every label under 12px is uppercase with widened tracking, like the printed field names of a ticket. Sentence-case micro-text is not part of the system.",
+        "section": "typography"
+      },
+      {
+        "name": "The Mono Means Code Rule",
+        "body": "Geist Mono appears only where the content is a code or an id (the trip code). It is never decoration.",
+        "section": "typography"
+      },
+      {
+        "name": "The Whisper Rule",
+        "body": "On the light desk a shadow never exceeds 10% opacity (the rose CTA tint is the one exception). If the shadow is noticed before the border, it is too strong.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Flat Fill Rule",
+        "body": "Surfaces, buttons, badges and text are flat fills. No gradients, no glow. Blur is allowed only on sticky bars. The one permitted gradient is the 28px hairline grid on the map placeholder, which is a pattern, not a fill.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** build every screen from one-idea cards: white 24px cards on Desk Mist (light) or Night Card on Night Desk (dark), arranged in a Bento grid with a single gutter.",
+      "**Do** use Signal Rose once per view for the primary action and let its echoes (Like, selected chip, progress, plane glyph) stay small.",
+      "**Do** give each card a 1px Hairline and at most the Card rest shadow; lift only gate and stack cards, at 10% or less.",
+      "**Do** write labels as tracked uppercase small text and show ids and codes in Geist Mono.",
+      "**Do** make every control a pill that compresses to 0.98 on press, with a 4px focus-visible halo.",
+      "**Do** keep the same structure in the dark theme: same radii, same grid, same accent, same hierarchy.",
+      "**Do** use Muted (#62748e) or darker for any text a person must read; reserve Faint for placeholders and decorative icons.",
+      "**Do** use lucide line icons at 16 to 24px for interface icons; emoji appear only inside content labels such as vibe chips, and the boarding pass uses its single plane glyph.",
+      "**Do** keep gate screens free of raw trip ids; an id is shown only where it is the content (a \"Trip code\" field)."
+    ],
+    "donts": [
+      "**Don't** use gradient fills on surfaces, buttons, badges or text, and never purple or indigo ones: that is the named anti-reference. Known offender: the dark sticky button's `from-slate-100 to-indigo-100`.",
+      "**Don't** use indigo, violet or purple anywhere. Known offenders: the dashboard's `text-indigo-300` numeral (flagged by the detector at `app/trip/dashboard/[id]/page.tsx:143`) and `bg-indigo-500` bars; replace with Signal Rose.",
+      "**Don't** let rose become a background, a banner or a second primary in the same view.",
+      "**Don't** lay a scrim, blur or gradient over a place photo: the type and credit chips are solid, and a missing photo is a flat Stub Grey.",
+      "**Don't** add glow, neon, glass cards or coloured shadows other than the rose CTA tint.",
+      "**Don't** mix radii inside a card or introduce sharp corners.",
+      "**Don't** put any text other than a button label on Signal Rose, and don't set captions in Faint. Known offenders: `text-slate-400` captions (2.6:1), the `text-emerald-600` cost line (3.65:1), and `text-zinc-500` micro-labels on dark (3.6:1).",
+      "**Don't** hard-code the dark hexes (#1A1A1A, #222222, #141414, #262626) as one-off arbitrary values in new code; reference the Night tokens."
+    ]
+  }
+}

@@ -3,7 +3,9 @@
  * itinerary venue names in real data instead of letting the LLM invent
  * them - see app/api/trigger-jarvis/route.ts's two-stage generation
  * (Text Search) and app/api/trip/alternative/route.ts's live fallback
- * suggestion (Nearby Search).
+ * suggestion (Nearby Search). The swipe deck (searchPlacesForDeck /
+ * fetchPlacePhotoUri, at the bottom) is the other consumer - see
+ * app/api/places/deck/route.ts.
  *
  * This is a DIFFERENT product from the legacy Places API
  * (maps.googleapis.com/maps/api/place/textsearch/json) that
@@ -117,22 +119,41 @@ function mapPlace(place: NonNullable<PlacesResponse["places"]>[number]): PlaceRe
   };
 }
 
-async function postPlacesRequest(url: string, body: Record<string, unknown>): Promise<PlaceResult[]> {
+/**
+ * The one place every Places API (New) call - Text Search, Nearby Search,
+ * Place Photos - gets its key attached and its failures turned into a
+ * PlacesApiError, so each caller below only deals with a success.
+ */
+async function placesFetch(
+  url: string,
+  init: {
+    method: "GET" | "POST";
+    headers?: Record<string, string>;
+    body?: string;
+    /**
+     * Send the key as a ?key= parameter instead of the X-Goog-Api-Key
+     * header. Only for Place Photos, whose docs show the key that way and
+     * don't say the header is honored on that endpoint; every other call
+     * here uses the header.
+     */
+    keyAsQueryParam?: boolean;
+  }
+): Promise<Response> {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) {
     throw new PlacesApiError("GOOGLE_MAPS_API_KEY is not configured.", "MISSING_API_KEY");
   }
 
+  const { keyAsQueryParam, ...fetchInit } = init;
+  const target = keyAsQueryParam
+    ? `${url}${url.includes("?") ? "&" : "?"}key=${encodeURIComponent(apiKey)}`
+    : url;
+
   let response: Response;
   try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask": FIELD_MASK,
-      },
-      body: JSON.stringify(body),
+    response = await fetch(target, {
+      ...fetchInit,
+      headers: keyAsQueryParam ? fetchInit.headers : { ...fetchInit.headers, "X-Goog-Api-Key": apiKey },
     });
   } catch (err) {
     throw new PlacesApiError(
@@ -153,7 +174,24 @@ async function postPlacesRequest(url: string, body: Record<string, unknown>): Pr
     throw new PlacesApiError(message, reason);
   }
 
-  const data: PlacesResponse = await response.json().catch(() => ({}));
+  return response;
+}
+
+async function postPlacesRequestRaw<T>(
+  url: string,
+  body: Record<string, unknown>,
+  fieldMask: string
+): Promise<T> {
+  const response = await placesFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Goog-FieldMask": fieldMask },
+    body: JSON.stringify(body),
+  });
+  return (await response.json().catch(() => ({}))) as T;
+}
+
+async function postPlacesRequest(url: string, body: Record<string, unknown>): Promise<PlaceResult[]> {
+  const data = await postPlacesRequestRaw<PlacesResponse>(url, body, FIELD_MASK);
   return (data.places ?? []).map(mapPlace);
 }
 
@@ -237,4 +275,149 @@ export async function searchPlacesTextNear(
       },
     },
   });
+}
+
+// ---------------------------------------------------------------------
+// Swipe deck - app/api/places/deck and app/api/places/photo
+//
+// Google's Places policies forbid pre-fetching, caching or storing Places
+// content other than place ids, and the Place Photos docs say outright
+// that a photo name can't be cached and can expire. Nothing below caches
+// anything: every deck is a fresh search, and a photo name is only ever
+// resolved at the moment its image is shown.
+// ---------------------------------------------------------------------
+
+// A separate, richer mask than FIELD_MASK above on purpose: a swipe card
+// needs a stable place id, a photo, and a human type label, none of which
+// the itinerary prompt wants. Billing is unchanged by the extra fields -
+// rating already puts this call at the Enterprise tier and everything
+// else here is Pro, per Google's Text Search (New) field list (re-check
+// that if rating/userRatingCount are ever dropped).
+const DECK_FIELD_MASK = [
+  "places.id",
+  "places.displayName",
+  "places.primaryTypeDisplayName",
+  "places.shortFormattedAddress",
+  "places.rating",
+  "places.userRatingCount",
+  "places.businessStatus",
+  "places.photos",
+].join(",");
+
+export interface DeckSearchPlace {
+  id: string;
+  name: string;
+  /** Google's label for the place's primary type, e.g. "Thai restaurant". */
+  typeLabel: string | null;
+  address: string | null;
+  rating: number | null;
+  ratingCount: number | null;
+  /** e.g. "OPERATIONAL" / "CLOSED_PERMANENTLY"; null if Google omitted it. */
+  businessStatus: string | null;
+  /** "places/<id>/photos/<ref>" - resolve with fetchPlacePhotoUri, never store. */
+  photoName: string | null;
+  /** The first photo's author - Google requires showing it with the photo. */
+  photoAttribution: { name: string; uri: string | null } | null;
+}
+
+interface DeckPlacesResponse {
+  places?: {
+    id?: string;
+    displayName?: { text?: string };
+    primaryTypeDisplayName?: { text?: string };
+    shortFormattedAddress?: string;
+    rating?: number;
+    userRatingCount?: number;
+    businessStatus?: string;
+    photos?: {
+      name?: string;
+      authorAttributions?: { displayName?: string; uri?: string }[];
+    }[];
+  }[];
+}
+
+/**
+ * One Text Search for the swipe deck. `includedType` (a Place Types (New)
+ * value such as "cafe") only BIASES results toward that type - strict
+ * filtering is deliberately off, since a strict "tourist_attraction"
+ * filter would hide temples, museums and parks a traveler would count as
+ * attractions. English labels are requested explicitly so the cards read
+ * consistently regardless of the destination's local language.
+ *
+ * Text Search bills per request, not per result, so asking for a full
+ * page (pageSize up to 20) costs the same as asking for a few - a bigger
+ * pool just gives lib/placeDeck.ts more to filter (closed, photo-less)
+ * before dealing the final deck.
+ */
+export async function searchPlacesForDeck(
+  query: string,
+  includedType: string,
+  pageSize: number
+): Promise<DeckSearchPlace[]> {
+  const data = await postPlacesRequestRaw<DeckPlacesResponse>(
+    PLACES_TEXT_SEARCH_URL,
+    { textQuery: query, includedType, pageSize, languageCode: "en" },
+    DECK_FIELD_MASK
+  );
+
+  return (data.places ?? []).flatMap((place): DeckSearchPlace[] => {
+    const name = place.displayName?.text;
+    if (!place.id || !name) return [];
+
+    const photo = place.photos?.find((p) => typeof p.name === "string" && p.name !== "");
+    const author = photo?.authorAttributions?.find(
+      (a) => typeof a.displayName === "string" && a.displayName !== ""
+    );
+
+    return [
+      {
+        id: place.id,
+        name,
+        typeLabel: place.primaryTypeDisplayName?.text ?? null,
+        address: place.shortFormattedAddress ?? null,
+        rating: typeof place.rating === "number" ? place.rating : null,
+        ratingCount: typeof place.userRatingCount === "number" ? place.userRatingCount : null,
+        businessStatus: place.businessStatus ?? null,
+        photoName: photo?.name ?? null,
+        photoAttribution: author?.displayName
+          ? { name: author.displayName, uri: author.uri ?? null }
+          : null,
+      },
+    ];
+  });
+}
+
+/**
+ * The only shape of photo name this app will ever interpolate into a
+ * Places URL - checked both by GET /api/places/photo (to answer 400) and
+ * again inside fetchPlacePhotoUri, so a stray caller can't turn that route
+ * into "call any Places endpoint with the server's key".
+ */
+export const PLACE_PHOTO_NAME_RE = /^places\/[A-Za-z0-9_-]{1,300}\/photos\/[A-Za-z0-9_-]{1,1000}$/;
+
+/**
+ * Resolves a photo name to a direct image URL. skipHttpRedirect=true makes
+ * Google answer with JSON ({ photoUri }) instead of a 302 to the image, so
+ * the API key travels only on this one server-to-Google request (as the
+ * ?key= parameter Google's docs show for this endpoint) - the returned
+ * photoUri is keyless, which is what lets the browser fetch the image
+ * straight from Google without the key ever reaching it. Google describes
+ * the URI as short-lived: callers must use it immediately (the photo route
+ * redirects to it) and never store it.
+ */
+export async function fetchPlacePhotoUri(photoName: string, maxWidthPx: number): Promise<string> {
+  if (!PLACE_PHOTO_NAME_RE.test(photoName)) {
+    throw new PlacesApiError("Invalid photo name.", "INVALID_PHOTO_NAME");
+  }
+
+  const response = await placesFetch(
+    `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=${maxWidthPx}&skipHttpRedirect=true`,
+    { method: "GET", keyAsQueryParam: true }
+  );
+  const data: { photoUri?: unknown } | null = await response.json().catch(() => null);
+
+  if (typeof data?.photoUri !== "string" || !data.photoUri.startsWith("https://")) {
+    throw new PlacesApiError("The Places API returned no photo URI.", "NO_PHOTO_URI");
+  }
+  return data.photoUri;
 }
