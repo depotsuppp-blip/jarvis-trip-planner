@@ -34,6 +34,23 @@ export const authOptions: NextAuthOptions = {
       from: process.env.EMAIL_FROM,
     }),
   ],
+  // Replaces every NextAuth-rendered screen with our own login UI
+  // (components/auth/LoginScreen.tsx, served standalone at app/login/
+  // page.tsx), so its default unstyled pages never appear. signIn AND
+  // error both need setting: NextAuth sends an OAuth failure
+  // (OAuthCallback, OAuthSignin, OAuthAccountNotLinked, ...) to
+  // pages.signIn as ?callbackUrl=...&error=..., but everything else - an
+  // expired or already-used magic link ("Verification"), a bad server
+  // config ("Configuration") - to pages.error as a bare ?error=....
+  // verifyRequest isn't navigated to today (LoginScreen calls
+  // signIn("email") with redirect: false and shows its own "Check your
+  // inbox" state), but pointing it here keeps the default page
+  // unreachable if that ever changes.
+  pages: {
+    signIn: "/login",
+    error: "/login",
+    verifyRequest: "/login",
+  },
   callbacks: {
     // Adapter's default session callback only forwards name/email/image -
     // attach the adapter user id too, since every Phase 2 model above

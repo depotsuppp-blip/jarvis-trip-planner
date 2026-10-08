@@ -1,11 +1,19 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { signIn } from "next-auth/react";
-import { Mail, ArrowLeft } from "lucide-react";
+import { ArrowLeft, CircleAlert, Mail, Plane } from "lucide-react";
 
 const fieldClass =
   "mt-1.5 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3.5 text-base text-slate-900 placeholder:text-slate-400 shadow-inner shadow-slate-900/5 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100";
+
+const primaryButtonClass =
+  "flex w-full items-center justify-center gap-2.5 rounded-full bg-rose-500 px-4 py-3.5 text-sm font-semibold text-white shadow-md shadow-rose-500/20 outline-none transition hover:bg-rose-600 focus-visible:ring-4 focus-visible:ring-rose-200 active:scale-[0.98] disabled:opacity-50";
+
+// Shown for ANY ?error= value. NextAuth's codes (OAuthCallback,
+// Verification, Configuration, ...) are meant for developers - someone
+// opening a trip link just needs to know it didn't work and to try again.
+const LOGIN_FAILED_MESSAGE = "Login failed. Please try again.";
 
 function GoogleIcon() {
   return (
@@ -31,19 +39,51 @@ function GoogleIcon() {
 }
 
 /**
- * Full-screen gate shown in place of the poll/dashboard content whenever a
- * visitor isn't signed in and didn't arrive with the organizer's ?admin=
- * token - see the gate check in app/trip/poll/[id]/page.tsx and
- * app/trip/dashboard/[id]/page.tsx. Deliberately calls signIn() with an
- * explicit provider id ("google"/"email") rather than the bare signIn(),
- * so NextAuth's own unstyled chooser/verify-request pages never appear -
- * this component is the entire sign-in UI.
+ * Where NextAuth should send the visitor once they're signed in, in order:
  *
- * tripId is optional purely for the "Trip code" chip below, which exists
- * to reassure someone landing here that they followed the right link, not
- * as any kind of access control.
+ * 1. ?callbackUrl= - NextAuth adds it itself when it bounces a failed
+ *    sign-in to /login (see `pages` in lib/auth.ts), so retrying still
+ *    lands back on the trip they were trying to open. NextAuth re-validates
+ *    it (same origin only) before honoring it, so passing a tampered value
+ *    straight through is safe.
+ * 2. `fallback` - for the standalone /login route, which has no trip of its
+ *    own to come back to.
+ * 3. The current URL - the inline gate on the trip poll/dashboard pages,
+ *    where "here" is exactly where to return to.
+ *
+ * Browser-only (reads window), so call it from event handlers, never during
+ * render.
  */
-export function LoginScreen({ tripId }: { tripId?: string }) {
+function resolveCallbackUrl(fallback?: string) {
+  const fromQuery = new URLSearchParams(window.location.search).get(
+    "callbackUrl"
+  );
+  return fromQuery || fallback || window.location.href;
+}
+
+/**
+ * The entire sign-in UI. Rendered inline in place of the poll/dashboard
+ * content whenever a visitor isn't signed in and didn't arrive with the
+ * organizer's ?admin= token - see the gate check in app/trip/poll/[id]/
+ * page.tsx and app/trip/dashboard/[id]/page.tsx - and standalone at /login
+ * (app/login/page.tsx), which is where NextAuth redirects a failed
+ * sign-in instead of showing its own error page. Deliberately calls
+ * signIn() with an explicit provider id ("google"/"email") rather than the
+ * bare signIn(), so NextAuth's own unstyled chooser/verify-request pages
+ * never appear.
+ *
+ * Intentionally shows no trip id or other trip details: this is a signed-out
+ * screen, and a raw database id on it reads as a bug rather than reassurance.
+ *
+ * fallbackCallbackUrl is where to land after sign-in when the URL itself
+ * doesn't say - see resolveCallbackUrl. Omit it to return to the current
+ * page.
+ */
+export function LoginScreen({
+  fallbackCallbackUrl,
+}: {
+  fallbackCallbackUrl?: string;
+}) {
   const [showEmailForm, setShowEmailForm] = useState(false);
   const [email, setEmail] = useState("");
   const [isSendingLink, setIsSendingLink] = useState(false);
@@ -51,15 +91,29 @@ export function LoginScreen({ tripId }: { tripId?: string }) {
   const [linkSentTo, setLinkSentTo] = useState("");
   const [error, setError] = useState("");
 
-  function callbackUrl() {
-    return typeof window !== "undefined" ? window.location.href : "/";
-  }
+  useEffect(() => {
+    // NextAuth reports a failed sign-in by redirecting back here with
+    // ?error=<Code> (see `pages` in lib/auth.ts) - turn that into the
+    // same inline message the interactive failures below use. Read from
+    // window.location rather than next/navigation's useSearchParams(),
+    // which would force every page that renders this component into a
+    // Suspense boundary just to avoid a static-prerender build error; the
+    // microtask wrapper matches the ?admin= read in app/trip/poll/[id]/
+    // page.tsx, for the same synchronize-with-an-external-system reason.
+    queueMicrotask(() => {
+      if (new URLSearchParams(window.location.search).get("error")) {
+        setError(LOGIN_FAILED_MESSAGE);
+      }
+    });
+  }, []);
 
   async function handleGoogleSignIn() {
     setError("");
     setIsRedirectingToGoogle(true);
     try {
-      await signIn("google", { callbackUrl: callbackUrl() });
+      await signIn("google", {
+        callbackUrl: resolveCallbackUrl(fallbackCallbackUrl),
+      });
     } catch {
       setError("Couldn't reach Google sign-in. Please try again.");
       setIsRedirectingToGoogle(false);
@@ -81,7 +135,7 @@ export function LoginScreen({ tripId }: { tripId?: string }) {
       const result = await signIn("email", {
         email: trimmed,
         redirect: false,
-        callbackUrl: callbackUrl(),
+        callbackUrl: resolveCallbackUrl(fallbackCallbackUrl),
       });
 
       if (result?.error) {
@@ -98,37 +152,52 @@ export function LoginScreen({ tripId }: { tripId?: string }) {
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4 py-12">
-      <div className="w-full max-w-sm rounded-3xl border border-slate-200 bg-white p-8 shadow-xl shadow-slate-900/5">
+      <div className="w-full max-w-sm rounded-3xl border border-slate-200 bg-white p-8 shadow-xl shadow-slate-900/5 sm:p-10">
         <div className="flex flex-col items-center text-center">
-          <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 text-2xl">
-            &#9992;
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-rose-50 text-rose-500 ring-1 ring-rose-100">
+            <Plane className="h-6 w-6" aria-hidden="true" />
           </div>
 
-          {tripId && (
-            <span className="mt-4 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 font-mono text-xs font-semibold uppercase tracking-widest text-slate-500">
-              Trip {tripId.toUpperCase()}
-            </span>
-          )}
-
-          <h1 className="mt-4 text-xl font-bold text-slate-900">
-            Sign in to continue
+          <h1 className="mt-5 text-2xl font-bold tracking-tight text-slate-900">
+            Join the Trip
           </h1>
-          <p className="mt-1.5 text-sm text-slate-500">
-            You&apos;ve been invited to a trip - sign in to vote and see the
-            plan.
+          <p className="mt-2 text-sm leading-relaxed text-slate-500">
+            Sign in to vote on dates, pick your vibes, and see the plan come
+            together.
           </p>
         </div>
 
-        <div className="mt-7 space-y-3">
+        {error && (
+          <div
+            role="alert"
+            className="mt-6 flex items-start gap-2.5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3"
+          >
+            <CircleAlert
+              className="mt-0.5 h-4 w-4 shrink-0 text-red-500"
+              aria-hidden="true"
+            />
+            <p className="text-sm font-medium text-red-700">{error}</p>
+          </div>
+        )}
+
+        <div className="mt-6 space-y-3">
           <button
             type="button"
             onClick={handleGoogleSignIn}
             disabled={isRedirectingToGoogle}
-            className="flex w-full items-center justify-center gap-3 rounded-full border border-slate-200 bg-white px-4 py-3.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 active:scale-[0.98] disabled:opacity-50"
+            className="flex w-full items-center justify-center gap-3 rounded-full border border-slate-200 bg-white px-4 py-3.5 text-sm font-semibold text-slate-700 shadow-sm outline-none transition hover:border-slate-300 hover:bg-slate-50 focus-visible:ring-4 focus-visible:ring-slate-200 active:scale-[0.98] disabled:opacity-50"
           >
             <GoogleIcon />
             {isRedirectingToGoogle ? "Redirecting..." : "Continue with Google"}
           </button>
+
+          <div className="flex items-center gap-3 py-1" aria-hidden="true">
+            <span className="h-px flex-1 bg-slate-200" />
+            <span className="text-xs font-medium uppercase tracking-wider text-slate-400">
+              or
+            </span>
+            <span className="h-px flex-1 bg-slate-200" />
+          </div>
 
           {!showEmailForm ? (
             <button
@@ -137,13 +206,16 @@ export function LoginScreen({ tripId }: { tripId?: string }) {
                 setError("");
                 setShowEmailForm(true);
               }}
-              className="flex w-full items-center justify-center gap-2.5 rounded-full bg-rose-500 px-4 py-3.5 text-sm font-semibold text-white shadow-md shadow-rose-500/20 transition hover:bg-rose-600 active:scale-[0.98]"
+              className={primaryButtonClass}
             >
               <Mail className="h-4 w-4" aria-hidden="true" />
               Continue with Email
             </button>
           ) : linkSentTo ? (
-            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-center">
+            <div
+              role="status"
+              className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-center"
+            >
               <p className="text-sm font-medium text-emerald-800">
                 Check your inbox
               </p>
@@ -191,17 +263,13 @@ export function LoginScreen({ tripId }: { tripId?: string }) {
               <button
                 type="submit"
                 disabled={isSendingLink}
-                className="w-full rounded-full bg-rose-500 px-4 py-3.5 text-sm font-semibold text-white shadow-md shadow-rose-500/20 transition hover:bg-rose-600 active:scale-[0.98] disabled:opacity-50"
+                className={primaryButtonClass}
               >
                 {isSendingLink ? "Sending..." : "Send magic link"}
               </button>
             </form>
           )}
         </div>
-
-        {error && (
-          <p className="mt-4 text-center text-sm text-red-600">{error}</p>
-        )}
       </div>
     </div>
   );

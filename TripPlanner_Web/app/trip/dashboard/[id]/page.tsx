@@ -101,7 +101,7 @@ export default function TripDashboardPage({
   }
 
   if (!canAccess) {
-    return <LoginScreen tripId={id} />;
+    return <LoginScreen />;
   }
 
   return (

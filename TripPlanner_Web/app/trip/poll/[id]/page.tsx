@@ -461,7 +461,7 @@ export default function TripPollPage({
   }
 
   if (!canAccess) {
-    return <LoginScreen tripId={id} />;
+    return <LoginScreen />;
   }
 
   return (
