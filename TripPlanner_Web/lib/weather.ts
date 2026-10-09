@@ -2,8 +2,8 @@
  * WeatherAPI.com forecast lookup (https://www.weatherapi.com/) - used by
  * app/api/trigger-jarvis/route.ts to attach an average-temperature/
  * condition summary for a locked trip's date window, stored on the
- * itinerary (see lib/itinerary.ts's `weather` field) so the poll page's
- * "Weather" card (components/trip/TripSummary.tsx) has real data instead
+ * itinerary (see lib/itinerary.ts's `weather` field) so the plan view's
+ * weather item (components/trip/TripBar.tsx) has real data instead
  * of "Coming soon". WEATHER_API_KEY is a WeatherAPI.com key - a different
  * product from GOOGLE_MAPS_API_KEY, with its own free tier.
  *

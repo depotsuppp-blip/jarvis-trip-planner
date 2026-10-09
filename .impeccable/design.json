@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-08T07:01:47.511Z",
+  "generatedAt": "2026-10-09T07:36:13.000Z",
   "title": "Design System: Trip Planner",
   "extensions": {
     "colorMeta": {
@@ -604,6 +604,58 @@
       "code": {
         "displayName": "Code",
         "purpose": "Trip codes and ids only; Geist Mono."
+      },
+      "plan-bar-title": {
+        "displayName": "Plan Bar Title",
+        "purpose": "Plan view: the destination in the sticky bar (15px 600, -0.025em)."
+      },
+      "plan-bar-value": {
+        "displayName": "Plan Bar Value",
+        "purpose": "Plan view: dates, travelers, budget and weather in the bar (13px 400, tabular)."
+      },
+      "plan-day-heading": {
+        "displayName": "Plan Day Heading",
+        "purpose": "Plan view: 'Day N' heading, 22px 600, optional title in 400 Muted."
+      },
+      "plan-day-meta": {
+        "displayName": "Plan Day Meta",
+        "purpose": "Plan view: one meta line under the day heading (13px Muted, tabular)."
+      },
+      "plan-stop": {
+        "displayName": "Plan Stop (fallback)",
+        "purpose": "Plan view: the single-sentence fallback for plans stored before placeName/shortDescription existed (15px on 24px, Ink Strong); also the no-venue statement, set in Muted."
+      },
+      "plan-fact": {
+        "displayName": "Plan Fact",
+        "purpose": "Plan view: stop facts beside content (Meal, cost); 11px 500 uppercase, 0.08em, Muted."
+      },
+      "plan-leg": {
+        "displayName": "Plan Leg",
+        "purpose": "Plan view: travel leg in sentence case, e.g. '~14 min walk'."
+      },
+      "plan-tab": {
+        "displayName": "Plan Tab",
+        "purpose": "Plan view: day tab label, 14px 500."
+      },
+      "plan-number": {
+        "displayName": "Plan Number",
+        "purpose": "Plan view: the number inside a stop node and map pin, 11px 500 tabular."
+      },
+      "plan-switch": {
+        "displayName": "Plan Switch",
+        "purpose": "Plan view (phone): List|Map switch label, 12px 500."
+      },
+      "plan-stop-name": {
+        "displayName": "Plan Stop Name",
+        "purpose": "Plan view: the venue's own name from Places, 15px 600 on 24px, Ink."
+      },
+      "plan-stop-caption": {
+        "displayName": "Plan Stop Caption",
+        "purpose": "Plan view: one brief caption under the name, 14px 400 on 20px, Ink Body; at most 15 words, no trailing period."
+      },
+      "plan-trip-code": {
+        "displayName": "Plan Trip Code",
+        "purpose": "Plan view: first 8 characters of the trip code in Geist Mono 11px Muted; below lg under the destination after a Geist 'Trip' label, from lg at the right end of the bar."
       }
     },
     "shadows": [
@@ -673,6 +725,36 @@
         "name": "skeleton-pulse",
         "value": "2s cubic-bezier(0.4, 0, 0.6, 1) infinite",
         "purpose": "Loading skeletons (Tailwind animate-pulse, opacity only; static under reduced motion)."
+      },
+      {
+        "name": "plan-ease-out",
+        "value": "cubic-bezier(0.23, 1, 0.32, 1)",
+        "purpose": "Plan view: tab underline slide, route redraw and pin settle."
+      },
+      {
+        "name": "plan-tab-slide",
+        "value": "180ms plan-ease-out (transform, FLIP)",
+        "purpose": "Plan view: the selected-day underline moves between tabs on pointer or touch; keyboard changes swap instantly."
+      },
+      {
+        "name": "plan-panel-fade",
+        "value": "150ms ease-out (opacity); map stage 200ms",
+        "purpose": "Plan view: a new day's list and map stage fade in; opacity only."
+      },
+      {
+        "name": "plan-route-draw",
+        "value": "320ms plan-ease-out stroke draw; pins 200ms, stagger 40ms",
+        "purpose": "Plan view: a day change redraws that day's route."
+      },
+      {
+        "name": "plan-lit-layer",
+        "value": "150ms ease-out (opacity, scale 1.1 on a lit pin)",
+        "purpose": "Plan view: the accent fill is a separate layer that fades in over a node or pin; rings fade the same way."
+      },
+      {
+        "name": "plan-press",
+        "value": "scale(0.97) on tabs, switch and swap; scale(0.95) on number buttons",
+        "purpose": "Plan view press feedback; all plan motion is skipped under prefers-reduced-motion."
       }
     ],
     "breakpoints": [
@@ -790,18 +872,59 @@
       "description": "The dashboard's opening cell on the Night theme: label and status, trip code and dates, one display numeral (Signal Rose replaces the current indigo).",
       "html": "<section class=\"ds-night\"><div class=\"ds-night-top\"><p class=\"ds-night-label\">Overview</p><span class=\"ds-night-pill\">Poll Open</span></div><div class=\"ds-night-body\"><div><p class=\"ds-night-micro\">Trip code</p><p class=\"ds-night-code\">8F3A21C0</p><p class=\"ds-night-micro ds-night-gap\">Dates</p><p class=\"ds-night-dates\">12 Nov – 16 Nov</p></div><div class=\"ds-night-count\"><p class=\"ds-night-num\">4</p><p class=\"ds-night-micro\">Total joined</p></div></div></section>",
       "css": ".ds-night{box-sizing:border-box;border:1px solid rgba(255,255,255,.1);border-radius:24px;background:#1a1a1a;padding:16px;color:#fff;font-family:Geist,Arial,Helvetica,sans-serif;box-shadow:0 25px 50px -12px rgb(0 0 0 / .4)}.ds-night p{margin:0}.ds-night-top{display:flex;align-items:center;justify-content:space-between}.ds-night-label{font-size:12px;font-weight:600;line-height:16px;letter-spacing:.05em;text-transform:uppercase;color:#9f9fa9}.ds-night-pill{border:1px solid rgb(16 185 129 / .2);border-radius:9999px;background:rgb(16 185 129 / .1);padding:4px 12px;font-size:11px;font-weight:600;line-height:16px;letter-spacing:.025em;text-transform:uppercase;color:rgb(52 211 153 / .9)}.ds-night-body{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-top:16px}.ds-night-micro{font-size:11px;font-weight:500;line-height:16px;letter-spacing:.1em;text-transform:uppercase;color:#9f9fa9}.ds-night-gap{margin-top:12px!important}.ds-night-code{font-family:'Geist Mono',ui-monospace,Menlo,Consolas,monospace;font-size:18px;font-weight:700;line-height:28px}.ds-night-dates{font-size:18px;font-weight:700;line-height:28px}.ds-night-count{text-align:right}.ds-night-num{font-size:48px;font-weight:800;line-height:1;color:#ff2056}"
+    },
+    {
+      "name": "Plan Bar",
+      "kind": "nav",
+      "refersTo": "plan-bar",
+      "description": "Plan (Editorial): the sticky summary. Ink dot and an Ink Body 'Locked', then icon-and-value items. 56px one row from lg (trip code at the right end); two rows (68px) below, with the trip code as a small 'Trip' line under the destination.",
+      "html": "<header class=\"ds-pbar\"><div class=\"ds-pbar-id\"><div class=\"ds-pbar-top\"><h1 class=\"ds-pbar-title\">Chiang Mai</h1><span class=\"ds-pbar-lock\"><i></i>Locked</span></div><p class=\"ds-pbar-sub\">Trip <b>9F2C1A7E</b></p></div><ul class=\"ds-pbar-items\"><li>Nov 12 – Nov 16</li><li>4 <em>travelers</em></li><li>~4,850 THB <em>/ person</em></li><li>~28°C · Partly cloudy</li><li class=\"ds-pbar-code\">9F2C1A7E</li></ul></header>",
+      "css": ".ds-pbar{display:flex;align-items:center;gap:24px;box-sizing:border-box;height:56px;padding:0 24px;border-bottom:1px solid #e2e8f0;background:#fff;font-family:Geist,Arial,Helvetica,sans-serif;color:#0f172b}.ds-pbar-title{margin:0;font-size:15px;font-weight:600;letter-spacing:-.025em;color:#0f172b}.ds-pbar-lock{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:500;color:#45556c}.ds-pbar-lock i{width:6px;height:6px;border-radius:9999px;background:#0f172b}.ds-pbar-items{display:flex;flex:1;align-items:center;gap:20px;margin:0;padding:0;list-style:none;font-size:13px;font-variant-numeric:tabular-nums;color:#314158}.ds-pbar-items em{font-style:normal;color:#62748e}.ds-pbar-code{margin-left:auto;font-family:'Geist Mono',ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#62748e}.ds-pbar-id{display:flex;flex-direction:column}.ds-pbar-top{display:flex;align-items:center;gap:12px}.ds-pbar-sub{display:none;margin:0;font-size:11px;line-height:16px;color:#62748e}.ds-pbar-sub b{font:400 11px 'Geist Mono',ui-monospace,Menlo,Consolas,monospace}@media (max-width:1023px){.ds-pbar-sub{display:block}.ds-pbar-code{display:none}}"
+    },
+    {
+      "name": "Day Tabs",
+      "kind": "nav",
+      "refersTo": "plan-tab",
+      "description": "Plan (Editorial): underline tabs, Muted until selected; the selected tab is Ink with a 2px Deep Signal Rose underline. Never pills.",
+      "html": "<div class=\"ds-ptabs\" role=\"tablist\" aria-label=\"Itinerary days\"><button class=\"ds-ptab\" role=\"tab\" aria-selected=\"true\">Day 1<span></span></button><button class=\"ds-ptab\" role=\"tab\" aria-selected=\"false\">Day 2</button><button class=\"ds-ptab\" role=\"tab\" aria-selected=\"false\">Day 3</button></div>",
+      "css": ".ds-ptabs{display:flex;gap:4px;border-bottom:1px solid #e2e8f0;background:#fff;padding:0 0;font-family:Geist,Arial,Helvetica,sans-serif}.ds-ptab{position:relative;display:flex;align-items:center;height:44px;padding:0 8px;border:0;background:transparent;font:inherit;font-size:14px;font-weight:500;color:#62748e;cursor:pointer;outline:none;transition:color .15s ease-out,scale .15s ease-out}.ds-ptab:hover{color:#0f172b}.ds-ptab:active{scale:.97}.ds-ptab:focus-visible{color:#0f172b;outline:2px solid #ec003f;outline-offset:-2px}.ds-ptab[aria-selected=true]{color:#0f172b}.ds-ptab span{position:absolute;left:8px;right:8px;bottom:0;height:2px;background:#ec003f}"
+    },
+    {
+      "name": "Timeline Stop",
+      "kind": "custom",
+      "refersTo": "plan-node",
+      "description": "Plan (Editorial): a numbered node on a hairline spine, the venue name in bold with one brief caption under it, a facts line, and the travel connector with the mode icon on the spine. The number doubles as the map pin; hover or focus lights it, press selects it with a ring. A no-venue stop shows its plain statement alone in Muted.",
+      "html": "<div class=\"ds-tl\"><div class=\"ds-tl-row\"><div class=\"ds-tl-rail\"><button class=\"ds-tl-node\" aria-label=\"Show stop 1 on the map\"><span class=\"ds-tl-fill\"></span><span class=\"ds-tl-num\">1</span></button><i class=\"ds-tl-spine\"></i></div><div><p class=\"ds-tl-name\">Wat Phra Singh</p><p class=\"ds-tl-cap\">Revered temple with Lanna murals inside the Viharn Lai Kham</p><p class=\"ds-tl-fact\">~50 THB</p></div></div><div class=\"ds-tl-leg\"><div class=\"ds-tl-rail\"><i class=\"ds-tl-spine\"></i><svg class=\"ds-tl-mode\" viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" fill=\"none\" stroke=\"#90a1b9\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M5 20v-6m4 6V8m6 12V6m4 14v-9\"/></svg></div><p>~14 min walk</p></div><div class=\"ds-tl-row ds-tl-lit\"><div class=\"ds-tl-rail\"><button class=\"ds-tl-node\" aria-label=\"Show stop 2 on the map\"><span class=\"ds-tl-fill\"></span><span class=\"ds-tl-num\">2</span></button></div><div><p class=\"ds-tl-name\">Khao Soi Khun Yai</p><p class=\"ds-tl-cap\">No-frills local favourite for rich, coconut-y khao soi</p><p class=\"ds-tl-fact\">Meal · ~90 THB</p></div></div></div>",
+      "css": ".ds-tl{width:340px;font-family:Geist,Arial,Helvetica,sans-serif}.ds-tl p{margin:0}.ds-tl-row,.ds-tl-leg{display:grid;grid-template-columns:24px 1fr;column-gap:12px}.ds-tl-rail{position:relative}.ds-tl-spine{position:absolute;left:50%;top:24px;bottom:0;width:1px;background:#e2e8f0;transform:translateX(-50%)}.ds-tl-leg .ds-tl-spine{top:0}.ds-tl-mode{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#fff;padding:5px;box-sizing:content-box}.ds-tl-leg{min-height:36px;align-items:center}.ds-tl-leg p{font-size:12px;font-variant-numeric:tabular-nums;color:#62748e}.ds-tl-node{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;width:40px;height:40px;margin:-8px;padding:0;border:0;border-radius:9999px;background:transparent;outline:none;cursor:pointer;transition:scale .15s ease-out}.ds-tl-node:active{scale:.95}.ds-tl-num{position:relative;display:flex;align-items:center;justify-content:center;width:24px;height:24px;box-sizing:border-box;border:1px solid #0f172b;border-radius:9999px;background:#fff;font-size:11px;font-weight:500;font-family:inherit;font-variant-numeric:tabular-nums;color:#0f172b;transition:color .15s ease-out}.ds-tl-fill{position:absolute;width:24px;height:24px;border-radius:9999px;background:#ec003f;opacity:0;transition:opacity .15s ease-out;z-index:1;mix-blend-mode:normal}.ds-tl-num{z-index:2}.ds-tl-node:hover .ds-tl-fill,.ds-tl-lit .ds-tl-fill{opacity:1}.ds-tl-node:hover .ds-tl-num,.ds-tl-lit .ds-tl-num{color:#fff;background:transparent;border-color:#ec003f}.ds-tl-node:focus-visible .ds-tl-num{outline:2px solid #ec003f;outline-offset:2px}.ds-tl-text{font-size:15px;line-height:24px;color:#314158}.ds-tl-fact{margin-top:6px!important;font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;font-variant-numeric:tabular-nums;color:#62748e;padding-bottom:12px}.ds-tl-name{font-size:15px;font-weight:600;line-height:24px;color:#0f172b}.ds-tl-cap{font-size:14px;line-height:20px;color:#45556c}.ds-tl-flag{font-size:15px;line-height:24px;color:#62748e}"
+    },
+    {
+      "name": "Route Pane",
+      "kind": "custom",
+      "refersTo": "plan-route-pane",
+      "description": "Plan (Editorial): the schematic route sketch: hairline-grid canvas, numbered pins joined by an Ink line, caption 'Route sketch · not to scale' and the 'Google Maps' attribution. No basemap.",
+      "html": "<div class=\"ds-route\"><svg class=\"ds-route-line\" viewBox=\"0 0 100 100\" preserveAspectRatio=\"none\" aria-hidden=\"true\"><polyline points=\"14,70 40,50 62,24 80,52\" fill=\"none\" stroke=\"#0f172b\" stroke-width=\".4\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span class=\"ds-route-pin\" style=\"left:14%;top:70%\">1</span><span class=\"ds-route-pin\" style=\"left:40%;top:50%\">2</span><span class=\"ds-route-pin ds-route-pin-on\" style=\"left:62%;top:24%\">3</span><span class=\"ds-route-pin\" style=\"left:80%;top:52%\">4</span><p class=\"ds-route-cap\">Route sketch · not to scale</p><p class=\"ds-route-attr\">Google Maps</p></div>",
+      "css": ".ds-route{position:relative;box-sizing:border-box;width:360px;height:300px;overflow:hidden;border-left:1px solid #e2e8f0;background-color:#fff;background-image:linear-gradient(to right,rgba(15,23,43,.07) 1px,transparent 1px),linear-gradient(to bottom,rgba(15,23,43,.07) 1px,transparent 1px);background-size:32px 32px;font-family:Geist,Arial,Helvetica,sans-serif}.ds-route-line{position:absolute;inset:0;width:100%;height:100%}.ds-route-pin{position:absolute;display:flex;align-items:center;justify-content:center;width:24px;height:24px;box-sizing:border-box;transform:translate(-50%,-50%);border:1px solid #0f172b;border-radius:9999px;background:#fff;font-size:11px;font-weight:500;font-variant-numeric:tabular-nums;color:#0f172b;transition:scale .15s ease-out,background-color .15s ease-out,color .15s ease-out}.ds-route-pin-on{background:#ec003f;border-color:#ec003f;color:#fff;scale:1.1;outline:2px solid #ec003f;outline-offset:2px}.ds-route-cap,.ds-route-attr{position:absolute;bottom:12px;margin:0;font-size:12px;color:#62748e}.ds-route-cap{left:12px}.ds-route-attr{right:12px}"
+    },
+    {
+      "name": "List|Map Switch",
+      "kind": "chip",
+      "refersTo": "plan-switch",
+      "description": "Plan (Editorial), phone only: two-segment control, 6px radius, Hairline edge. The selected segment is filled Ink with white text.",
+      "html": "<div class=\"ds-psw\" role=\"group\" aria-label=\"Show\"><button aria-pressed=\"true\" class=\"ds-psw-on\">List</button><button aria-pressed=\"false\">Map</button></div>",
+      "css": ".ds-psw{display:inline-flex;overflow:hidden;border:1px solid #e2e8f0;border-radius:6px;font-family:Geist,Arial,Helvetica,sans-serif}.ds-psw button{display:flex;align-items:center;height:40px;padding:0 14px;border:0;background:#fff;font:inherit;font-size:12px;font-weight:500;color:#45556c;cursor:pointer;outline:none;transition:background-color .15s ease-out,color .15s ease-out,scale .15s ease-out}.ds-psw button:hover{color:#0f172b}.ds-psw button:active{scale:.97}.ds-psw button:focus-visible{outline:2px solid #ec003f;outline-offset:-2px}.ds-psw .ds-psw-on{background:#0f172b;color:#fff}"
     }
   ],
   "narrative": {
     "northStar": "The Boarding Pass Desk",
-    "overview": "Everything in Trip Planner arrives as a document laid on a clean desk. The desk is a pale slate wash (Desk Mist); the documents are white cards with a hairline edge: a boarding pass for the poll, a day card for each itinerary day, a summary card for the locked plan. Screens are Bento grids of these cards, each holding exactly one idea, so a group of friends can read a trip at a glance on a phone. Structure comes from the cards and the grid, not from decoration. There is no chrome to look at, only the content and the next thing to do.\n\nThe palette is almost entirely slate and white. One vivid rose (Signal Rose) is the only voice in the system, and it is rare on purpose: it marks the single next action and its echoes. Blue helps you find your way and never asks for a click; green, red and amber report status. A dark theme sits beside the light one as an equal, with the same grid, radii and accent on a near-black desk. Type is Geist: friendly sans for sentences, Geist Mono for ticket codes, and small tracked uppercase labels as the \"field names\" of every document.\n\nThe tone is friendly and warm, crisp and clear, and playful where it counts: soft pill controls and 24px corners, strict labels and big numerals, a plane glyph, ticket notches and the LIKE / PASS stamps on the swipe deck. The user's confirmed visual rejection is AI-slop: template-looking decoration, with purple or indigo gradients as the named example. Light and dark are both official; today the theme is chosen per route (light: login, poll, swipe; dark: home, dashboard, draft board).",
+    "overview": "Everything in Trip Planner arrives as a document laid on a clean desk. The desk is a pale slate wash (Desk Mist); the documents are white cards with a hairline edge: a boarding pass for the poll, a day card for each itinerary day, a summary card for the locked plan (the locked plan view no longer uses day or summary cards; see Plan (Editorial)). Screens are Bento grids of these cards, each holding exactly one idea, so a group of friends can read a trip at a glance on a phone. Structure comes from the cards and the grid, not from decoration. There is no chrome to look at, only the content and the next thing to do.\n\nThe palette is almost entirely slate and white. One vivid rose (Signal Rose) is the only voice in the system, and it is rare on purpose: it marks the single next action and its echoes. Blue helps you find your way and never asks for a click; green, red and amber report status. A dark theme sits beside the light one as an equal, with the same grid, radii and accent on a near-black desk. Type is Geist: friendly sans for sentences, Geist Mono for ticket codes, and small tracked uppercase labels as the \"field names\" of every document.\n\nThe tone is friendly and warm, crisp and clear, and playful where it counts: soft pill controls and 24px corners, strict labels and big numerals, a plane glyph, ticket notches and the LIKE / PASS stamps on the swipe deck. The user's confirmed visual rejection is AI-slop: template-looking decoration, with purple or indigo gradients as the named example. Light and dark are both official; today the theme is chosen per route (light: login, poll, swipe; dark: home, dashboard, draft board).\n\n**Two dialects, by decision (owner-confirmed 2026-10-09).** The app currently carries two visual dialects. The Boarding Pass Desk described throughout this file governs every page except one: login, the vote form and boarding pass, the swipe deck, the dashboard and the draft board. The locked plan view (`/trip/poll/[id]` once a trip has a plan) speaks **Plan (Editorial)**, recorded in its own section after Do's and Don'ts: a white, ruled timetable beside a sticky route sketch, with no cards and no shadows. Editorial is not the new global world, and whether it spreads is the owner's call. Do not carry Editorial rules onto other pages, and do not put Boarding Pass cards on the plan view.",
     "keyCharacteristics": [
       "Pale desk (#f8fafc) with white 24px cards, a 1px slate hairline and a whisper shadow.",
       "One rare accent, Signal Rose (#ff2056), on at most about 10% of any screen; the same accent in both themes.",
-      "Bento grids: a two-column dashboard grid where hero and wishlist cells span both columns, and a 12-column plan grid on large screens.",
+      "Bento grids: a two-column dashboard grid where hero and wishlist cells span both columns, and (before the Editorial plan view replaced it) a 12-column plan grid on large screens.",
       "Tracked uppercase micro-labels and monospace codes give every card its \"printed document\" feel.",
       "Pill controls that compress slightly when pressed; no gradients, no glow, no glass except sticky bars.",
-      "Measured contrast: faint grey and white-on-rose fall short of AA and are restricted (see Colors)."
+      "Measured contrast: faint grey and white-on-rose fall short of AA and are restricted (see Colors).",
+      "One page, the locked plan, is the Plan (Editorial) dialect: white, ruled, cardless, with the accent reserved for selection and focus."
     ],
     "rules": [
       {
@@ -836,8 +959,23 @@
       },
       {
         "name": "The Flat Fill Rule",
-        "body": "Surfaces, buttons, badges and text are flat fills. No gradients, no glow. Blur is allowed only on sticky bars. The one permitted gradient is the 28px hairline grid on the map placeholder, which is a pattern, not a fill.",
+        "body": "Surfaces, buttons, badges and text are flat fills. No gradients, no glow. Blur is allowed only on sticky bars. The one permitted gradient is a hairline grid pattern, which is a pattern, not a fill (the old map placeholder's 28px grid is gone; the plan view's Route pane draws its own 32px grid).",
         "section": "elevation"
+      },
+      {
+        "name": "The Ruled Page Rule",
+        "body": "White ground, one hairline weight, no cards. If a thing needs a box to be understood, it needs a rule or a gap instead. (Plan view only.)",
+        "section": "plan"
+      },
+      {
+        "name": "The Number Is The Pin Rule",
+        "body": "A stop's number is the same glyph in the list and on the map, and pressing it is how the two are linked. Never number one and not the other. (Plan view only.)",
+        "section": "plan"
+      },
+      {
+        "name": "The Accent Is Selection Rule",
+        "body": "Deep Signal Rose means \"this one\": selected, focused or primary. It is never decoration, and \"active\" is a fading layer, not a swapped colour. (Plan view only.)",
+        "section": "plan"
       }
     ],
     "dos": [
@@ -849,7 +987,13 @@
       "**Do** keep the same structure in the dark theme: same radii, same grid, same accent, same hierarchy.",
       "**Do** use Muted (#62748e) or darker for any text a person must read; reserve Faint for placeholders and decorative icons.",
       "**Do** use lucide line icons at 16 to 24px for interface icons; emoji appear only inside content labels such as vibe chips, and the boarding pass uses its single plane glyph.",
-      "**Do** keep gate screens free of raw trip ids; an id is shown only where it is the content (a \"Trip code\" field)."
+      "**Do** keep gate screens free of raw trip ids; an id is shown only where it is the content (a \"Trip code\" field).",
+      "**Do** (plan view only) keep the page and every surface pure white (#ffffff) and let 1px Hairline (#e2e8f0) rules be the only structure.",
+      "**Do** (plan view only) reserve Deep Signal Rose (#ec003f) for the selected day's underline, the lit stop and its pin, focus rings, the selected-stop ring, the swap spinner and the text selection.",
+      "**Do** (plan view only) make an active state a separate layer that fades in (opacity), not a swapped background colour.",
+      "**Do** (plan view only) give stop numbers a 40px press area around a 24px circle, and make the same number the map pin.",
+      "**Do** (plan view only) put micro-labels beside content, and mark estimates with \"~\" plus one footnote.",
+      "**Do** (plan view only) omit Budget and Weather when a plan has none, instead of printing \"unavailable\"."
     ],
     "donts": [
       "**Don't** use gradient fills on surfaces, buttons, badges or text, and never purple or indigo ones: that is the named anti-reference. Known offender: the dark sticky button's `from-slate-100 to-indigo-100`.",
@@ -858,8 +1002,12 @@
       "**Don't** lay a scrim, blur or gradient over a place photo: the type and credit chips are solid, and a missing photo is a flat Stub Grey.",
       "**Don't** add glow, neon, glass cards or coloured shadows other than the rose CTA tint.",
       "**Don't** mix radii inside a card or introduce sharp corners.",
-      "**Don't** put any text other than a button label on Signal Rose, and don't set captions in Faint. Known offenders: `text-slate-400` captions (2.6:1), the `text-emerald-600` cost line (3.65:1), and `text-zinc-500` micro-labels on dark (3.6:1).",
-      "**Don't** hard-code the dark hexes (#1A1A1A, #222222, #141414, #262626) as one-off arbitrary values in new code; reference the Night tokens."
+      "**Don't** put any text other than a button label on Signal Rose, and don't set captions in Faint. Known offenders: `text-slate-400` captions (2.6:1), the `text-emerald-600` cost line (3.65:1; no longer exists, since the plan view's costs are Muted caps on white), and `text-zinc-500` micro-labels on dark (3.6:1).",
+      "**Don't** hard-code the dark hexes (#1A1A1A, #222222, #141414, #262626) as one-off arbitrary values in new code; reference the Night tokens.",
+      "**Don't** (plan view only) wrap days, stops or the summary in cards, give them shadows or panel radii, or add side stripes.",
+      "**Don't** (plan view only) put a kicker, eyebrow or micro-label above a heading; section numbers exist only because stop order is information.",
+      "**Don't** (plan view only) use the accent for decoration, or a green \"Locked\" pill: Locked is an ink dot and an Ink Body word here.",
+      "**Don't** (plan view only) let a future real basemap break the contract: pins must stay numbered to match the list."
     ]
   }
 }

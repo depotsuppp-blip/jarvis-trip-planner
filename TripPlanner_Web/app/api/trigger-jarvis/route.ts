@@ -14,6 +14,7 @@ import {
 import { PlacesApiError, searchPlacesForSlot, searchPlacesText, type LatLng, type PlaceResult } from "@/lib/places";
 import { checkRateLimit } from "@/lib/rateLimit";
 import { computeDayRoute, computeDepartureTimeForDay, type TravelLeg } from "@/lib/routes";
+import { clampShortDescription, composeStopText, namesAgree } from "@/lib/stopCopy";
 import {
   claimPollForGeneration,
   getDraft,
@@ -52,18 +53,39 @@ const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
 // travelFromPrevious/location - those are attached afterward, in code,
 // by enrichItineraryWithTravelTimes (Stage 2.5), never narrated by the
 // model.
+//
+// A stop is a NAME and ONE brief caption, never a paragraph: the plan view
+// shows the name in bold with the caption under it. A JSON schema can't
+// hold the model to a word count (and a zod .max() would fail the whole
+// generation the first time Haiku overshot it), so the limit is stated
+// three times instead - in these field descriptions, in buildFinalPrompt,
+// and in code (lib/stopCopy.ts's clampShortDescription, applied to
+// whatever comes back). The fields are ordered so the model commits to the
+// venue (placeIndex) before it writes about it.
 // ---------------------------------------------------------------------
 
 const ItineraryStopLLMSchema = z.object({
   slotType: z.enum(["activity", "meal"]),
-  text: z.string(),
   // 0-based index into the slot's candidate list (see formatSlotForPrompt)
-  // indicating exactly which real venue this stop's text is about. -1
-  // means "no real venue was available for this slot" (formatSlotForPrompt's
-  // NO REAL VENUES FOUND case) - any value outside the slot's actual
-  // candidate range is treated the same way by enrichItineraryWithTravelTimes,
-  // never trusted blindly.
+  // indicating exactly which real venue this stop is. -1 means "no real
+  // venue was available for this slot" (formatSlotForPrompt's NO REAL
+  // VENUES FOUND case) - any value outside the slot's actual candidate
+  // range is treated the same way by enrichItineraryWithTravelTimes, never
+  // trusted blindly.
   placeIndex: z.number().int(),
+  // The chosen candidate's name as listed. Used as a cross-check only: the
+  // name that is stored is the Places candidate's own (see
+  // enrichItineraryWithTravelTimes), so a misspelled or invented one here
+  // can't reach the plan.
+  placeName: z
+    .string()
+    .describe("The chosen candidate's name copied exactly as listed, nothing else. Empty string when placeIndex is -1."),
+  shortDescription: z
+    .string()
+    .describe(
+      "ONE brief sentence of at most 15 words (aim for 8 to 12): what to do or why it is worth the stop. " +
+        "No second sentence, no list, no semicolon, no trailing period, and never the place name itself."
+    ),
   // A realistic per-person cost in `currency` below, grounded in the
   // candidate's real Places priceLevel (see formatSlotForPrompt) - null
   // for a stop with no real venue to estimate from.
@@ -72,14 +94,18 @@ const ItineraryStopLLMSchema = z.object({
 
 const ItineraryDayLLMSchema = z.object({
   day: z.number(),
-  summary: z.string(),
+  summary: z
+    .string()
+    .describe("A label of at most 6 words naming the day's theme, such as 'Old City and night markets'. Not a sentence."),
   stops: z.array(ItineraryStopLLMSchema),
 });
 
 const ItineraryLLMSchema = z.object({
   destination: z.string(),
   days: z.array(ItineraryDayLLMSchema),
-  notes: z.string(),
+  notes: z
+    .string()
+    .describe("Empty, or at most two short sentences (30 words in all) of practical advice such as dress code or booking."),
   // The ISO 4217-ish currency code the model determined for the
   // destination (e.g. "THB") - every stop's estimatedCostPerPerson is
   // denominated in this same currency.
@@ -309,8 +335,8 @@ function formatSlotForPrompt(slot: GroundedSlot, slotPosition: number): string {
   if (slot.places.length === 0) {
     return (
       `  - Stop ${slotPosition} [${slot.slotType}]${requestedNote} ${slot.category} near ${slot.area}: ` +
-      "NO REAL VENUES FOUND. Say so plainly in this stop's text rather than inventing one, set " +
-      "placeIndex to -1, and set estimatedCostPerPerson to null."
+      "NO REAL VENUES FOUND. Say so plainly in this stop's shortDescription rather than inventing " +
+      "one, set placeIndex to -1, placeName to an empty string, and estimatedCostPerPerson to null."
     );
   }
   const candidates = slot.places
@@ -331,6 +357,13 @@ function formatSlotForPrompt(slot: GroundedSlot, slotPosition: number): string {
  * one stop per slot, IN ORDER, since Stage 2.5 (enrichItineraryWithTravelTimes)
  * matches Claude's returned stops array back to groundedSlots by that
  * same array position, not by any name matching.
+ *
+ * Brevity is stated as a hard rule for EVERY field the model writes, not
+ * just the caption: Stage 2 used to return a free sentence-or-more per stop
+ * plus a paragraph per day, and the plan view had to render all of it. Now
+ * a stop is a name and one caption of at most 15 words, a day's summary is
+ * a six-word label, and notes are two short sentences at most - see
+ * ItineraryStopLLMSchema for why the code backs this up as well.
  */
 function buildFinalPrompt(skeleton: ItinerarySkeleton, groundedSlots: GroundedSlot[]): string {
   const daysText = skeleton.days
@@ -345,14 +378,27 @@ function buildFinalPrompt(skeleton: ItinerarySkeleton, groundedSlots: GroundedSl
     `Write the final trip itinerary for ${skeleton.destination}, following this planned structure, ` +
     "using the REAL Google Places search results listed for each stop below. Only use venues from " +
     "the provided candidates - never invent a name not present in this data. For each day, return " +
-    "exactly one stop object per Stop listed, IN THE SAME ORDER, with: slotType (copy from the Stop), " +
-    "text (a short one-sentence description, incorporating the chosen venue's real name), placeIndex " +
-    "(the candidate number - 0, 1, or 2 - that your text is about), and estimatedCostPerPerson (a " +
-    "realistic estimated cost per person for that activity or meal, as a plain number, using the " +
-    "venue's price level above as a guide where one is shown). If a Stop says NO REAL VENUES FOUND, " +
-    "say so plainly in that stop's text rather than inventing a fallback, set placeIndex to -1, and " +
-    "set estimatedCostPerPerson to null. For a Stop marked USER-REQUESTED, use that candidate even if " +
-    "its category label doesn't perfectly match, since the group explicitly asked for it by name.\n\n" +
+    "exactly one stop object per Stop listed, IN THE SAME ORDER, with these fields:\n" +
+    "- slotType: copy from the Stop.\n" +
+    "- placeIndex: the candidate number (0, 1, or 2) you chose.\n" +
+    "- placeName: that candidate's name copied EXACTLY as listed - the name only, no address, rating " +
+    "or extra words.\n" +
+    "- shortDescription: ONE brief sentence of at most 15 words (aim for 8 to 12) saying what to do " +
+    "there or why it is worth the stop. It sits directly under the place name, so never repeat the " +
+    "name in it. A second sentence, a list, a semicolon, a paragraph or a trailing period is a " +
+    "mistake. Good: \"Walk the quiet forest tunnels and ponds\", \"Try the rich, creamy coconut khao " +
+    "soi\", \"Browse local crafts and street snacks\".\n" +
+    "- estimatedCostPerPerson: a realistic estimated cost per person for that activity or meal, as a " +
+    "plain number, using the venue's price level above as a guide where one is shown.\n" +
+    "If a Stop says NO REAL VENUES FOUND, set placeIndex to -1, placeName to an empty string, " +
+    "shortDescription to a plain statement of at most 10 words that no real venue was found for it " +
+    "(never invent a fallback), and estimatedCostPerPerson to null. For a Stop marked USER-REQUESTED, " +
+    "use that candidate even if its category label doesn't perfectly match, since the group explicitly " +
+    "asked for it by name.\n\n" +
+    "Brevity is a hard rule for EVERYTHING you write: no field may contain a paragraph. Each day's " +
+    "summary is a label of at most 6 words naming that day's theme (for example \"Old City and night " +
+    "markets\"), not a sentence. notes is empty, or at most two short sentences (30 words in all) of " +
+    "practical advice such as dress code or booking.\n\n" +
     `Also return currency: the ISO 4217 currency code actually used day-to-day in ${skeleton.destination} ` +
     "(e.g. \"THB\", \"USD\", \"JPY\") - every estimatedCostPerPerson value above must be a realistic " +
     "amount in this same currency, not USD by default.\n\n" +
@@ -394,18 +440,19 @@ async function generateFinalItinerary(
 type ItineraryStopLLM = z.infer<typeof ItineraryStopLLMSchema>;
 
 /**
- * Resolves one LLM-returned stop's placeIndex back to real coordinates,
- * or null if there aren't any - an out-of-range or -1 placeIndex, a
- * slot Stage 1.5 found zero candidates for, or a candidate Google
- * returned with no location. Never trusts placeIndex blindly: Claude's
- * structured output is schema-validated, not content-validated, so an
- * out-of-bounds integer is treated the same as "no venue" rather than
- * throwing.
+ * Resolves one LLM-returned stop's placeIndex back to the real Places
+ * candidate it chose, or null if there isn't one - an out-of-range or -1
+ * placeIndex, or a slot Stage 1.5 found zero candidates for. Never trusts
+ * placeIndex blindly: Claude's structured output is schema-validated, not
+ * content-validated, so an out-of-bounds integer is treated the same as
+ * "no venue" rather than throwing. The stop's coordinates (which may still
+ * be null - a candidate Google returned with no location) AND its stored
+ * name come from this candidate, never from the model's own wording.
  */
-function resolveStopLocation(stop: ItineraryStopLLM, slot: GroundedSlot | undefined): LatLng | null {
+function resolveStopPlace(stop: ItineraryStopLLM, slot: GroundedSlot | undefined): PlaceResult | null {
   if (!slot) return null;
   if (stop.placeIndex < 0 || stop.placeIndex >= slot.places.length) return null;
-  return slot.places[stop.placeIndex].location;
+  return slot.places[stop.placeIndex];
 }
 
 /**
@@ -435,7 +482,8 @@ async function enrichItineraryWithTravelTimes(
   const days = await Promise.all(
     itinerary.days.map(async (day) => {
       const daySlots = groundedSlots.filter((s) => s.day === day.day);
-      const locations = day.stops.map((stop, i) => resolveStopLocation(stop, daySlots[i]));
+      const places = day.stops.map((stop, i) => resolveStopPlace(stop, daySlots[i]));
+      const locations = places.map((place) => place?.location ?? null);
 
       const geocodedIndices = locations
         .map((loc, i) => (loc ? i : -1))
@@ -463,13 +511,31 @@ async function enrichItineraryWithTravelTimes(
         }
       }
 
-      const stops: ItineraryStop[] = day.stops.map((stop, i) => ({
-        slotType: stop.slotType,
-        text: stop.text,
-        travelFromPrevious: travelByStopIndex.get(i) ?? null,
-        location: locations[i],
-        estimatedCostPerPerson: stop.estimatedCostPerPerson,
-      }));
+      const stops: ItineraryStop[] = day.stops.map((stop, i) => {
+        // The stored name is the chosen candidate's own; the model's
+        // placeName only cross-checks that its placeIndex and its words
+        // agree (a mismatch is logged, never shown). With no candidate
+        // behind the stop there is no name at all.
+        const place = places[i];
+        const placeName = place?.name ?? "";
+        const shortDescription = clampShortDescription(stop.shortDescription, placeName);
+        if (place && stop.placeName && !namesAgree(stop.placeName, place.name)) {
+          console.warn(
+            `[trigger-jarvis] day ${day.day} stop ${i + 1}: the model wrote "${stop.placeName}" but ` +
+              `placeIndex ${stop.placeIndex} is "${place.name}" - keeping the candidate's name.`
+          );
+        }
+
+        return {
+          slotType: stop.slotType,
+          text: composeStopText(placeName, shortDescription),
+          placeName: placeName || undefined,
+          shortDescription: shortDescription || undefined,
+          travelFromPrevious: travelByStopIndex.get(i) ?? null,
+          location: locations[i],
+          estimatedCostPerPerson: stop.estimatedCostPerPerson,
+        };
+      });
 
       return { day: day.day, summary: day.summary, stops };
     })

@@ -20,6 +20,7 @@ import {
 } from "@/lib/places";
 import { checkRateLimit } from "@/lib/rateLimit";
 import { computeDayRoute, computeDepartureTimeForDay } from "@/lib/routes";
+import { clampShortDescription, composeStopText } from "@/lib/stopCopy";
 import { getDraft, saveDraft } from "@/lib/store";
 
 // A live, in-the-moment swap - never as costly to bound as "Lock &
@@ -141,7 +142,17 @@ const AlternativeChoiceSchema = z.object({
   // placeIndex in app/api/trigger-jarvis/route.ts): an out-of-range value
   // falls back to the closest candidate (index 0) rather than throwing.
   chosenIndex: z.number().int(),
-  text: z.string(),
+  // Cross-check only, same as Stage 2's placeName: the stop that is stored
+  // carries the chosen candidate's own name.
+  placeName: z.string().describe("The chosen candidate's name copied exactly as listed, nothing else."),
+  // The same caption rule as an itinerary stop (see lib/stopCopy.ts): one
+  // brief sentence, clamped in code because a schema can't hold a word count.
+  shortDescription: z
+    .string()
+    .describe(
+      "ONE brief sentence of at most 15 words (aim for 8 to 12): what to do or why it is worth the stop. " +
+        "No second sentence, no list, no trailing period, and never the place name itself."
+    ),
   estimatedCostPerPerson: z.number().nullable(),
 });
 
@@ -168,10 +179,12 @@ function buildAlternativePrompt(
     `Real nearby candidates found via Google Places, closest first: ${candidatesText}\n\n` +
     "Pick the single best candidate for someone with that much time available, favoring a quicker " +
     "option if time is short. Only choose from the candidates listed - never invent a name not " +
-    "present in this data. Return chosenIndex (the candidate number your pick corresponds to), text " +
-    "(one short sentence describing this replacement stop, incorporating the venue's real name, in " +
-    "the same style as an itinerary stop), and estimatedCostPerPerson (a realistic cost per person, " +
-    "using the price level shown as a guide, or null if you can't reasonably estimate one)."
+    "present in this data. Return chosenIndex (the candidate number your pick corresponds to), " +
+    "placeName (that candidate's name copied exactly as listed - the name only), shortDescription " +
+    "(ONE brief sentence of at most 15 words, aim for 8 to 12, saying what to do there or why it is " +
+    "worth the stop; it sits directly under the place name, so never repeat the name in it, and no " +
+    "second sentence, list or trailing period), and estimatedCostPerPerson (a realistic cost per " +
+    "person, using the price level shown as a guide, or null if you can't reasonably estimate one)."
   );
 }
 
@@ -339,9 +352,14 @@ export async function POST(request: NextRequest) {
     const previousStop = stopIndex > 0 ? day.stops[stopIndex - 1] : null;
     const nextStop = stopIndex + 1 < day.stops.length ? day.stops[stopIndex + 1] : null;
 
+    const placeName = chosen.name;
+    const shortDescription = clampShortDescription(choice.shortDescription, placeName);
+
     const newStop: ItineraryStop = {
       slotType: originalStop.slotType,
-      text: choice.text,
+      text: composeStopText(placeName, shortDescription),
+      placeName,
+      shortDescription: shortDescription || undefined,
       location: chosen.location,
       estimatedCostPerPerson: choice.estimatedCostPerPerson,
       travelFromPrevious: await recomputeLegInto(

@@ -1,6 +1,6 @@
 ---
 name: Trip Planner
-description: "Boarding-pass cards on a quiet desk: light Bento/Airbnb minimalism with one rare rose accent, and an equal dark theme."
+description: "Boarding-pass cards on a quiet desk: light Bento/Airbnb minimalism with one rare rose accent, and an equal dark theme. The locked plan view alone speaks a second, white and ruled Editorial dialect."
 colors:
   desk-mist: "#f8fafc"
   paper: "#ffffff"
@@ -106,7 +106,79 @@ typography:
     fontWeight: 700
     lineHeight: 1.556
     letterSpacing: "normal"
+  plan-bar-title:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.9375rem"
+    fontWeight: 600
+    letterSpacing: "-0.025em"
+  plan-bar-value:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.8125rem"
+    fontWeight: 400
+    letterSpacing: "normal"
+  plan-day-heading:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "1.375rem"
+    fontWeight: 600
+    lineHeight: 1.25
+    letterSpacing: "-0.02em"
+  plan-day-meta:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.8125rem"
+    fontWeight: 400
+    letterSpacing: "normal"
+  plan-stop:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.9375rem"
+    fontWeight: 400
+    lineHeight: 1.6
+    letterSpacing: "normal"
+  plan-stop-name:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.9375rem"
+    fontWeight: 600
+    lineHeight: 1.6
+    letterSpacing: "normal"
+  plan-stop-caption:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.875rem"
+    fontWeight: 400
+    lineHeight: 1.429
+    letterSpacing: "normal"
+  plan-trip-code:
+    fontFamily: "Geist Mono, ui-monospace, Menlo, Consolas, monospace"
+    fontSize: "0.6875rem"
+    fontWeight: 400
+    lineHeight: 1.45
+    letterSpacing: "normal"
+  plan-fact:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.6875rem"
+    fontWeight: 500
+    letterSpacing: "0.08em"
+  plan-leg:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.75rem"
+    fontWeight: 400
+    lineHeight: 1.333
+    letterSpacing: "normal"
+  plan-tab:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.875rem"
+    fontWeight: 500
+    letterSpacing: "normal"
+  plan-number:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.6875rem"
+    fontWeight: 500
+    letterSpacing: "normal"
+  plan-switch:
+    fontFamily: "Geist, Arial, Helvetica, sans-serif"
+    fontSize: "0.75rem"
+    fontWeight: 500
+    letterSpacing: "normal"
 rounded:
+  md: "6px"
   xl: "12px"
   2xl: "16px"
   3xl: "24px"
@@ -205,6 +277,42 @@ components:
     typography: "{typography.button}"
     rounded: "{rounded.2xl}"
     padding: "12px 16px"
+  plan-bar:
+    backgroundColor: "{colors.paper}"
+    textColor: "{colors.ink-strong}"
+    typography: "{typography.plan-bar-value}"
+    height: "56px"
+  plan-tab:
+    backgroundColor: "{colors.paper}"
+    textColor: "{colors.muted}"
+    typography: "{typography.plan-tab}"
+    height: "44px"
+    padding: "0 8px"
+  plan-tab-selected:
+    textColor: "{colors.ink}"
+  plan-node:
+    backgroundColor: "{colors.paper}"
+    textColor: "{colors.ink}"
+    typography: "{typography.plan-number}"
+    rounded: "{rounded.full}"
+    size: "24px"
+  plan-node-lit:
+    backgroundColor: "{colors.signal-rose-deep}"
+    textColor: "{colors.paper}"
+  plan-switch:
+    backgroundColor: "{colors.paper}"
+    textColor: "{colors.ink-body}"
+    typography: "{typography.plan-switch}"
+    rounded: "{rounded.md}"
+    height: "40px"
+    padding: "0 14px"
+  plan-switch-selected:
+    backgroundColor: "{colors.ink}"
+    textColor: "{colors.paper}"
+  plan-route-pane:
+    backgroundColor: "{colors.paper}"
+    textColor: "{colors.muted}"
+    typography: "{typography.plan-leg}"
 ---
 
 # Design System: Trip Planner
@@ -213,26 +321,29 @@ components:
 
 **Creative North Star: "The Boarding Pass Desk"**
 
-Everything in Trip Planner arrives as a document laid on a clean desk. The desk is a pale slate wash (Desk Mist); the documents are white cards with a hairline edge: a boarding pass for the poll, a day card for each itinerary day, a summary card for the locked plan. Screens are Bento grids of these cards, each holding exactly one idea, so a group of friends can read a trip at a glance on a phone. Structure comes from the cards and the grid, not from decoration. There is no chrome to look at, only the content and the next thing to do.
+Everything in Trip Planner arrives as a document laid on a clean desk. The desk is a pale slate wash (Desk Mist); the documents are white cards with a hairline edge: a boarding pass for the poll, a day card for each itinerary day, a summary card for the locked plan (the locked plan view no longer uses day or summary cards; see Plan (Editorial)). Screens are Bento grids of these cards, each holding exactly one idea, so a group of friends can read a trip at a glance on a phone. Structure comes from the cards and the grid, not from decoration. There is no chrome to look at, only the content and the next thing to do.
 
 The palette is almost entirely slate and white. One vivid rose (Signal Rose) is the only voice in the system, and it is rare on purpose: it marks the single next action and its echoes. Blue helps you find your way and never asks for a click; green, red and amber report status. A dark theme sits beside the light one as an equal, with the same grid, radii and accent on a near-black desk. Type is Geist: friendly sans for sentences, Geist Mono for ticket codes, and small tracked uppercase labels as the "field names" of every document.
 
 The tone is friendly and warm, crisp and clear, and playful where it counts: soft pill controls and 24px corners, strict labels and big numerals, a plane glyph, ticket notches and the LIKE / PASS stamps on the swipe deck. The user's confirmed visual rejection is AI-slop: template-looking decoration, with purple or indigo gradients as the named example. Light and dark are both official; today the theme is chosen per route (light: login, poll, swipe; dark: home, dashboard, draft board).
 
+**Two dialects, by decision (owner-confirmed 2026-10-09).** The app currently carries two visual dialects. The Boarding Pass Desk described throughout this file governs every page except one: login, the vote form and boarding pass, the swipe deck, the dashboard and the draft board. The locked plan view (`/trip/poll/[id]` once a trip has a plan) speaks **Plan (Editorial)**, recorded in its own section after Do's and Don'ts: a white, ruled timetable beside a sticky route sketch, with no cards and no shadows. Editorial is not the new global world, and whether it spreads is the owner's call. Do not carry Editorial rules onto other pages, and do not put Boarding Pass cards on the plan view.
+
 **Key Characteristics:**
 - Pale desk (#f8fafc) with white 24px cards, a 1px slate hairline and a whisper shadow.
 - One rare accent, Signal Rose (#ff2056), on at most about 10% of any screen; the same accent in both themes.
-- Bento grids: a two-column dashboard grid where hero and wishlist cells span both columns, and a 12-column plan grid on large screens.
+- Bento grids: a two-column dashboard grid where hero and wishlist cells span both columns, and (before the Editorial plan view replaced it) a 12-column plan grid on large screens.
 - Tracked uppercase micro-labels and monospace codes give every card its "printed document" feel.
 - Pill controls that compress slightly when pressed; no gradients, no glow, no glass except sticky bars.
 - Measured contrast: faint grey and white-on-rose fall short of AA and are restricted (see Colors).
+- One page, the locked plan, is the Plan (Editorial) dialect: white, ruled, cardless, with the accent reserved for selection and focus.
 
 ## Colors
 
 A slate-and-paper neutral system carries everything; one vivid rose speaks rarely, blue only points the way, and green, red and amber are reserved for status. Hex values are computed from the Tailwind v4 palette the project uses.
 
 ### Primary
-- **Signal Rose** (#ff2056): the system's only accent. The single primary button per view, Like, selected chips, progress fill, the plane glyph, timeline dots, the day-number badge. Pressed and hover: **Deep Signal Rose** (#ec003f). Tints for soft containers and rings: **Rose Wash** (#fff1f2), **Rose Mist** (#ffe4e6), **Rose Edge** (#ffccd3).
+- **Signal Rose** (#ff2056): the system's only accent. The single primary button per view, Like, selected chips, progress fill, the plane glyph, timeline dots and a day-number badge (both of which the plan view no longer has; it uses Deep Signal Rose only as Plan (Editorial) describes). Pressed and hover: **Deep Signal Rose** (#ec003f). Tints for soft containers and rings: **Rose Wash** (#fff1f2), **Rose Mist** (#ffe4e6), **Rose Edge** (#ffccd3).
 
 ### Secondary
 - **Wayfinding Blue** (#155dfc): never an action, only orientation: the boarding-pass eyebrow, links such as "Change", destination and map icon tiles on **Blue Wash** (#eff6ff). Input focus uses **Focus Blue** (#51a2ff) for the border and **Focus Halo** (#dbeafe) for the 4px ring.
@@ -292,13 +403,13 @@ Mobile first. Pages are a single centered column, `max-w-md` (448px), with 16px 
 
 The Bento Grid is the structural idea, and it appears in two forms:
 - **Dashboard grid:** `grid-cols-2` with a 16px gap inside the 448px column. The hero (Overview) spans both columns; two half-width cells (Top Vibes, Voters) share the next row; the Wishlist Summary spans both columns again. Card padding is 16px.
-- **Locked-plan grid:** the container widens to `max-w-7xl`; at `lg` a 12-column grid with a 24px gap puts the summary card in 4 columns and the map in 8; the day cards below flow into 1, 2 (`md`) or 3 (`xl`) columns.
+- **Locked-plan grid (superseded on the plan view by Plan (Editorial); kept as the Boarding Pass way to lay out a multi-card plan):** the container widens to `max-w-7xl`; at `lg` a 12-column grid with a 24px gap puts the summary card in 4 columns and the map in 8; the day cards below flow into 1, 2 (`md`) or 3 (`xl`) columns.
 
-Rules of the grid: one idea per cell; a grid uses one gutter (16px on the dashboard, 24px on the plan); spans are half, full, or 4/12 and 8/12; cells in a row stretch to equal height (`h-full`) instead of leaving holes. Sticky chrome: a translucent header (blurred) at the top, and a fixed bottom action bar padded with `max(0.75rem, env(safe-area-inset-bottom))`; pages that have the bar reserve 128px (`pb-32`) so content clears it. The spacing steps in use are 8, 12, 16, 20, 24 and 32px on a 4px base. Controls are 48 to 56px tall and the swipe action buttons are 64px (Undo is 48px); chips are 40px.
+Rules of the grid: one idea per cell; a grid uses one gutter (16px on the dashboard, 24px on the plan); spans are half, full, or 4/12 and 8/12; cells in a row stretch to equal height (`h-full`) instead of leaving holes. Sticky chrome: a translucent header (blurred) at the top, and a fixed bottom action bar padded with `max(0.75rem, env(safe-area-inset-bottom))`; pages that have the bar reserve 128px (`pb-32`) so content clears it. The spacing steps in use are 8, 12, 16, 20, 24 and 32px on a 4px base. Controls are 48 to 56px tall and the swipe action buttons are 64px (Undo is 48px); chips are 40px. The locked plan view does not follow this section: its split screen, sticky bars and type ladder are in Plan (Editorial).
 
 ## Elevation & Depth
 
-A hybrid that leads with line, not shadow. A card rests on the desk by its 1px Hairline plus the faintest shadow; only gate cards and the swipe stack lift higher, and only the rose button carries a coloured shadow. In the dark theme depth is a 10% white hairline plus a deep black shadow. Nothing glows.
+A hybrid that leads with line, not shadow. A card rests on the desk by its 1px Hairline plus the faintest shadow; only gate cards and the swipe stack lift higher, and only the rose button carries a coloured shadow. In the dark theme depth is a 10% white hairline plus a deep black shadow. Nothing glows. (The Plan (Editorial) view uses no shadow at all.)
 
 ### Shadow Vocabulary
 - **Card rest** (`box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)`): every content card, with a 1px Hairline.
@@ -312,13 +423,15 @@ A hybrid that leads with line, not shadow. A card rests on the desk by its 1px H
 ### Named Rules
 **The Whisper Rule.** On the light desk a shadow never exceeds 10% opacity (the rose CTA tint is the one exception). If the shadow is noticed before the border, it is too strong.
 
-**The Flat Fill Rule.** Surfaces, buttons, badges and text are flat fills. No gradients, no glow. Blur is allowed only on sticky bars. The one permitted gradient is the 28px hairline grid on the map placeholder, which is a pattern, not a fill.
+**The Flat Fill Rule.** Surfaces, buttons, badges and text are flat fills. No gradients, no glow. Blur is allowed only on sticky bars. The one permitted gradient is a hairline grid pattern, which is a pattern, not a fill (the old map placeholder's 28px grid is gone; the plan view's Route pane draws its own 32px grid).
 
 ## Shapes
 
-A soft, document-like form language with exactly four radii. Pills (9999px) for every button, chip, badge and status; 24px panels for every card; 16px tiles for fields, mini tiles, alerts and icon tiles; 12px for the swipe stamps. Circles for avatars, day numbers and the swipe buttons (64px, 48px for Undo). Every card has a 1px Hairline edge; dashed Perforation lines mean a ticket tear, and a boarding pass shows it with two 20px notches in Desk Mist at the ends of the divider. Photos clip to the card radius. There are no sharp corners and no mixed radii inside one component.
+A soft, document-like form language with exactly four radii. Pills (9999px) for every button, chip, badge and status; 24px panels for every card; 16px tiles for fields, mini tiles, alerts and icon tiles; 12px for the swipe stamps. Circles for avatars, day numbers and the swipe buttons (64px, 48px for Undo). Every card has a 1px Hairline edge; dashed Perforation lines mean a ticket tear, and a boarding pass shows it with two 20px notches in Desk Mist at the ends of the divider. Photos clip to the card radius. There are no sharp corners and no mixed radii inside one component. The locked plan view is the exception by decision: it has no panels, and uses circles plus a 6px radius (see Plan (Editorial)).
 
 ## Components
+
+These are the Boarding Pass Desk components. The locked plan view has its own set (Plan bar, Day tabs, Timeline, Route pane, List|Map switch), recorded under Plan (Editorial).
 
 ### Buttons
 - **Shape:** capsule (9999px); 48px tall in cards (14px 16px), 52 to 56px for form-submit and the sticky bar.
@@ -348,7 +461,7 @@ A soft, document-like form language with exactly four radii. Pills (9999px) for 
 - **Bottom action bar:** fixed, a similar translucent surface (white at 90% in light, black at 40% in dark) with a top hairline, holding one full-width pill (the sticky primary button).
 
 ### Status Pill and Alert
-- **Status pill:** 11px 600 uppercase label in Go Green on Go Wash with a Go Edge border, pill-shaped (Poll Open, Locked, Saved). Dark pills use an emerald tint at 10% fill with a 20% edge.
+- **Status pill:** 11px 600 uppercase label in Go Green on Go Wash with a Go Edge border, pill-shaped (Poll Open, Locked, Saved). The plan view does not use it: there "Locked" is an ink dot and a word. Dark pills use an emerald tint at 10% fill with a 20% edge.
 - **Alert:** a 16px-corner banner of Alert Wash with an Alert Edge border, a red icon and a 14px 500 Alert Red message; it sits above the controls it concerns and uses `role="alert"`.
 
 ### Boarding Pass (signature)
@@ -382,5 +495,74 @@ Under the stack are three controls with 12px Muted labels: Undo (a 48px ghost ci
 - **Don't** lay a scrim, blur or gradient over a place photo: the type and credit chips are solid, and a missing photo is a flat Stub Grey.
 - **Don't** add glow, neon, glass cards or coloured shadows other than the rose CTA tint.
 - **Don't** mix radii inside a card or introduce sharp corners.
-- **Don't** put any text other than a button label on Signal Rose, and don't set captions in Faint. Known offenders: `text-slate-400` captions (2.6:1), the `text-emerald-600` cost line (3.65:1), and `text-zinc-500` micro-labels on dark (3.6:1).
+- **Don't** put any text other than a button label on Signal Rose, and don't set captions in Faint. Known offenders: `text-slate-400` captions (2.6:1), the `text-emerald-600` cost line (3.65:1; no longer exists, since the plan view's costs are Muted caps on white), and `text-zinc-500` micro-labels on dark (3.6:1).
 - **Don't** hard-code the dark hexes (#1A1A1A, #222222, #141414, #262626) as one-off arbitrary values in new code; reference the Night tokens.
+
+### Plan view (Editorial) only
+Applies to the locked plan view and nothing else; the Do's and Don'ts above still govern every other page.
+
+- **Do** keep the page and every surface pure white (#ffffff) and let 1px Hairline (#e2e8f0) rules be the only structure.
+- **Do** reserve Deep Signal Rose (#ec003f) for the selected day's underline, the lit stop and its pin, focus rings, the selected-stop ring, the swap spinner and the text selection.
+- **Do** make an active state a separate layer that fades in (opacity), not a swapped background colour.
+- **Do** give stop numbers a 40px press area around a 24px circle, and make the same number the map pin.
+- **Do** put micro-labels beside content (a stop's Meal and cost line sits under its name and caption), and mark estimates with "~" plus one footnote.
+- **Do** omit Budget and Weather when a plan has none, instead of printing "unavailable".
+- **Don't** wrap days, stops or the summary in cards, give them shadows or panel radii, or add side stripes.
+- **Don't** put a kicker, eyebrow or micro-label above a heading; section numbers exist only because stop order is information.
+- **Don't** use the accent for decoration (every dot, icon or tab); a green "Locked" pill is also out, since Locked is an ink dot and an Ink Body word here.
+- **Don't** let a future real basemap break the contract: pins must stay numbered to match the list.
+
+## Plan (Editorial)
+
+**Scope: the locked plan view only** (`TripPlanner_Web/components/trip/PlanView.tsx`, `TripBar.tsx`, `DayTabs.tsx`, `TimelineList.tsx`, `MapPanel.tsx`, mounted by `app/trip/poll/[id]/page.tsx` once a trip has a plan). An approved additive system change, decided with the owner on 2026-10-09. Everything above this section stays the Boarding Pass Desk; this is a second dialect beside it, not a replacement. All new tokens carry the `plan-` prefix in the frontmatter; the colours are existing tokens used differently.
+
+**Idea: "A timetable beside its map."** The plan is read, not browsed: one calm, ruled column of days beside one sticky route, with no cards. The traveler sees destination, dates and budget in one bar, picks a day, reads its stops in order, and watches the route redraw.
+
+### Colors
+- **Ground:** the page and every surface is Paper (#ffffff). There is no Desk Mist wash, no card, no shadow.
+- **Structure:** 1px Hairline (#e2e8f0) is the only structure: the bar's bottom edge, the tab rule, the footnote and Notes rules, the spine and the map pane's left edge.
+- **Text:** Ink (#0f172b) for headings and the selected tab; Ink Strong (#314158) for stop sentences and bar values; Ink Body (#45556c) for the "Locked" word, the inactive List|Map label and Notes text; Muted (#62748e, 4.76:1 on white) for meta, legs, footnotes, inactive tabs, the caption and the attribution; Faint (#90a1b9) for decorative icons only.
+- **Accent:** Deep Signal Rose (#ec003f, Tailwind rose-600) and only on: the selected day's 2px underline; the lit stop's node fill and its pin fill (a white number on it is 4.53:1); focus rings and the selected-stop ring (2px outline, 2px offset); the admin swap spinner; the text-selection highlight (white on rose). Signal Rose (#ff2056) does not appear on this view.
+- **Locked** is a 6px Ink dot plus the word in Ink Body. No green pill.
+
+### Typography
+Geist only; numerals tabular everywhere; the ladder is hard and short (22 / 15 / 14 / 13 / 12 / 11).
+- **Bar destination** (600, 15px, -0.025em). **Bar values** (400, 13px, tabular).
+- **Day heading** (600, 22px, 1.25, -0.02em) with the optional day title in 400 Muted after a colon. **Day meta** (13px Muted, tabular): date, stop count, day cost.
+- **Stop name** (600, 15px on 24px, Ink): the venue's own name from Places, stored as `placeName`. **Stop caption** (400, 14px on 20px, Ink Body #45556c, 7.6:1) under it: `shortDescription`, one sentence of at most 15 words with no trailing period. **No-venue stop:** the plain statement alone, 15px on 24px 400 Muted, so it reads as a flagged state. **Fallback sentence** (400, 15px on 24px, Ink Strong): only for plans stored before these fields existed. **Stop facts** (500, 11px, uppercase, 0.08em, Muted, tabular): "Meal", cost.
+- **Travel leg** (12px sentence case Muted, "~14 min walk"). **Tab label** (500, 14px). **Footnote** (12px Muted). **Notes heading** (600, 14px). **Trip code** (first 8 characters, uppercase, Muted 11px: Geist Mono at the right end of the bar from `lg`; below `lg` a "Trip" label in Geist followed by the code in Geist Mono).
+- "~" marks an estimate; one footnote says costs are per person. This does not conflict with The Form-Field Rule: only the 11px stop-facts line is uppercase, and it is the only micro-text of its kind here.
+
+### Shape and depth
+No cards, no shadows, no side stripes. Circles for stop nodes and map pins (24px visible, a 40px button hit area). 6px (`rounded-md`) for the List|Map switch and the admin swap button. Underline tabs, never pills. No 24px panels on this view. Depth is conveyed by the hairline rules and the sticky bars alone.
+
+### Layout
+- **Below `lg` (1024px):** one column. A two-row Plan bar of 68px (destination, Locked and the List|Map switch, with the trip code as a small line directly under the destination; then dates, travelers, budget per person, and weather only from 640px, scrolling sideways if needed), a sticky 44px tab strip (plus its 1px rule) beneath it, then the list. The switch swaps the list for a full-height map, and the tabs stay so the day can change on the map view. The trip code costs the bar no height: the first row is already 40px tall for the switch.
+- **From `lg`:** a one-row 56px bar; a 50/50 split. The left column is max-width 36rem and centred; the map pane is sticky under the bar, 100svh minus the bar tall, full-bleed to the right edge with a hairline on its left.
+- Two CSS variables on the view's root, `--bar-h` (68px, 56px from `lg`) and `--tabs-h` (45px), drive every sticky offset and the pane height. From `lg` the trip code sits at the right end of the one-row bar.
+
+### Components
+- **Plan bar:** sticky, white, hairline below; destination, "Locked" dot and word, the trip code (a small "Trip" + Geist Mono line under the destination below `lg`; at the right end of the row from `lg`), then icon-and-value items (Dates, Travelers, Budget `~N / person`, Weather) with Faint icons; Budget and Weather are omitted when absent. The List|Map switch sits at its end below `lg` only.
+- **Day tabs:** a real tablist, one tab per day that has stops (days with none are hidden); 44px tall, 14px 500, Muted until selected, then Ink with a 2px Deep Signal Rose underline that slides between tabs (FLIP, 180ms) on pointer or touch. Arrow keys, Home and End move and select; only the selected tab is in the tab order. Keyboard focus is a 2px rose outline drawn inside the tab.
+- **Timeline:** one day: heading, meta, then a numbered list on a hairline spine. Each stop is a node button (24px circle, 1px Ink border, Paper fill, Ink number), the venue name in bold with one brief caption beneath it (no card, no trailing period), and an optional facts line. A stop with no real venue shows its plain statement alone in Muted; an old plan without the new fields shows its single sentence. The connector into each stop carries the travel-mode icon (Faint, on the spine, on a white patch) and the leg time beside it. Pointing at or focusing a stop lights its node; pressing the number selects it; the admin swap button is a 40px, 6px-radius ghost with a hover Ink border.
+- **Route pane:** a white canvas with a 32px hairline grid (Ink at 7%), a square stage holding the route as a 0.4-unit Ink polyline with numbered pins identical to the nodes, a bottom-left caption "Route sketch · not to scale" (plus "N stops have no coordinates" when relevant) and a bottom-right "Google Maps" attribution, both 12px Muted.
+- **List|Map switch:** a 6px-radius segmented control with a 1px Hairline, 40px tall, 12px 500 with a small line icon; the selected segment is filled Ink with white text, the other Ink Body on white. Phone only.
+
+### Signature move
+Stop numbers double as map pins. Pointing at or focusing a number lights its pin (accent fill, pin scales to 1.1); pressing it selects the stop and the ring stays, and it carries across the phone's List|Map switch; pressing again or Escape clears it. A day change redraws that day's route.
+
+### Motion
+One ease-out, `cubic-bezier(0.23, 1, 0.32, 1)` for the authored moments; Tailwind's `ease-out` for the small fades. Tab underline slide 180ms (pointer or touch only; keyboard changes swap instantly). Day panel fade 150ms and map stage fade 200ms, opacity only. Route redraw: stroke draw 320ms, pins settle 200ms staggered 40ms apiece. Lit fills and rings fade 150ms (opacity and scale only). Press feedback scales to 0.97 on tabs, the switch and the swap button, and 0.95 on number buttons. Hover styles apply only where hover exists. Everything is skipped under `prefers-reduced-motion`.
+
+### Named Rules
+**The Ruled Page Rule.** White ground, one hairline weight, no cards. If a thing needs a box to be understood, it needs a rule or a gap instead.
+
+**The Number Is The Pin Rule.** A stop's number is the same glyph in the list and on the map, and pressing it is how the two are linked. Never number one and not the other.
+
+**The Accent Is Selection Rule.** Deep Signal Rose means "this one": selected, focused or primary. It is never decoration, and "active" is a fading layer, not a swapped colour.
+
+### Honest limits
+- The Route pane is a schematic sketch with no basemap; it plots stored coordinates and says "not to scale". A real basemap must keep numbered pins that match the list.
+- The day heading shows an optional `title` that no generator writes yet; without it the heading is just "Day N".
+- Budget and Weather are omitted, not shown as unavailable, when a plan lacks them.
+- A stop's name is the Places candidate's own name, not model text; the caption is asked for by the Stage 2 prompt and schema and clamped in code (`lib/stopCopy.ts`, at most 15 words, first sentence, no trailing period), so it can end in an ellipsis when cut. A day's `summary` is now a label of at most 6 words and `notes` at most two short sentences; the plan view does not show `summary` and shows `notes` as Notes.

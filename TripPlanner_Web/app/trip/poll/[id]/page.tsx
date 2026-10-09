@@ -6,9 +6,7 @@ import { ensureLiffInit, liff } from "@/lib/liff";
 import { PageHeader } from "@/components/PageHeader";
 import { StickyActionButton } from "@/components/StickyActionButton";
 import { LoginScreen } from "@/components/auth/LoginScreen";
-import { TripSummary } from "@/components/trip/TripSummary";
-import { MapPlaceholderCard } from "@/components/trip/MapPlaceholderCard";
-import { TimelineList } from "@/components/trip/TimelineList";
+import { PlanView } from "@/components/trip/PlanView";
 import { computeDateRangeLabel, formatShortDate } from "@/lib/tripSummary";
 import type { Itinerary, PollVote } from "@/lib/tripTypes";
 
@@ -464,15 +462,28 @@ export default function TripPollPage({
     return <LoginScreen />;
   }
 
+  // Once the trip has a plan the whole page is the plan view: a full-bleed
+  // split screen with its own sticky bar, so it takes over from the vote
+  // page below rather than sitting inside its narrow column.
+  if (!isLoadingVotes && generatedPlan) {
+    return (
+      <PlanView
+        itinerary={generatedPlan}
+        headcount={votes.length}
+        dateLabel={lockedDateLabel}
+        tripId={id}
+        isAdmin={isAdmin}
+        adminToken={adminToken}
+        onSwap={(itinerary) => setGeneratedPlan(itinerary)}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 pb-32">
       <PageHeader title="Trip Poll" tripId={id} variant="light" />
 
-      <main
-        className={`mx-auto space-y-8 px-4 py-6 ${
-          generatedPlan ? "max-w-7xl" : "max-w-md"
-        }`}
-      >
+      <main className="mx-auto max-w-md space-y-8 px-4 py-6">
         {lockError && <p className="text-sm text-red-600">{lockError}</p>}
 
         {isLoadingVotes ? (
@@ -485,43 +496,6 @@ export default function TripPollPage({
           <div className="rounded-3xl border border-slate-200 bg-white p-10 text-center text-sm text-slate-500 shadow-sm">
             Loading trip...
           </div>
-        ) : generatedPlan ? (
-          <section aria-label="Trip itinerary" className="space-y-6">
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-              <div className="lg:col-span-4">
-                <TripSummary
-                  destination={generatedPlan.destination}
-                  dateLabel={lockedDateLabel}
-                  headcount={votes.length}
-                  totalEstimatedCost={generatedPlan.totalTripEstimatedCost}
-                  currency={generatedPlan.currency}
-                  weather={generatedPlan.weather}
-                />
-              </div>
-
-              <div className="lg:col-span-8">
-                <MapPlaceholderCard />
-              </div>
-            </div>
-
-            <TimelineList
-              days={generatedPlan.days}
-              currency={generatedPlan.currency}
-              tripId={id}
-              isAdmin={isAdmin}
-              adminToken={adminToken}
-              onSwap={(itinerary) => setGeneratedPlan(itinerary)}
-            />
-
-            {generatedPlan.notes && (
-              <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
-                <p className="text-[11px] font-semibold uppercase tracking-widest text-slate-400">
-                  Notes
-                </p>
-                <p className="mt-1.5 text-sm text-slate-600">{generatedPlan.notes}</p>
-              </div>
-            )}
-          </section>
         ) : (
           <BoardingPass id={id} votes={votes} />
         )}

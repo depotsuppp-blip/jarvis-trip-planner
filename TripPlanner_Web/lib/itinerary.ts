@@ -33,7 +33,19 @@ export const TravelLegSchema = z.object({
 
 export const ItineraryStopSchema = z.object({
   slotType: z.enum(["activity", "meal"]),
+  // Always written. For a stop with the two fields below it is composed from
+  // them ("Name: caption", see lib/stopCopy.ts's composeStopText) so older
+  // readers and prompts that quote a stop still get one plain string; for a
+  // plan stored before they existed it is the model's whole sentence.
   text: z.string(),
+  // The venue's real name (the Places candidate the stop's placeIndex chose
+  // - never the model's own spelling) and ONE brief caption for it, at most
+  // 15 words (lib/stopCopy.ts's clampShortDescription). What the plan view
+  // shows: the name in bold, the caption under it. Optional: absent on a
+  // plan stored before they existed (the view falls back to `text`), and
+  // placeName is absent on a stop with no real venue behind it.
+  placeName: z.string().optional(),
+  shortDescription: z.string().optional(),
   travelFromPrevious: TravelLegSchema.nullable(),
   // The real venue's coordinates, when Stage 1.5 grounded this stop in
   // one - null for a stop with no real venue found. Needed (not just
@@ -47,6 +59,11 @@ export const ItineraryStopSchema = z.object({
 export const ItineraryDaySchema = z.object({
   day: z.number(),
   summary: z.string(),
+  // A short label for the day ("Riverside"), shown after "Day N" when
+  // present. Optional: nothing writes it yet (the plan view deliberately
+  // does not show `summary`, which is a sentence or more), and a plan
+  // stored before this field existed has none.
+  title: z.string().optional(),
   stops: z.array(ItineraryStopSchema),
 });
 

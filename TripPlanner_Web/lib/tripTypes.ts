@@ -1,6 +1,6 @@
 /**
  * Shared shapes for the Poll page and the components it composes
- * (TripSummary, TimelineList) - split out so those components don't each
+ * (PlanView, TripBar, TimelineList) - split out so those components don't each
  * redeclare the same itinerary/vote shapes the page already reads from
  * the API. Mirrors the server-side persisted shape in lib/itinerary.ts,
  * but as plain TS interfaces (no zod) since the frontend only ever reads
@@ -37,6 +37,12 @@ export interface LatLng {
 export interface ItineraryStop {
   slotType: "activity" | "meal";
   text: string;
+  // Mirror ItineraryStopSchema: the venue's real name and one brief caption
+  // (at most 15 words) - shown bold over the caption by the plan view, which
+  // falls back to `text` when they are absent (a plan stored before they
+  // existed, or a stop with no real venue behind it).
+  placeName?: string;
+  shortDescription?: string;
   // From the PRECEDING stop in this same day's array - null for a day's
   // first stop, or wherever Stage 2.5 (app/api/trigger-jarvis/route.ts)
   // had no route data (no coordinates for one of the two stops, or that
@@ -56,6 +62,9 @@ export interface ItineraryStop {
 export interface ItineraryDay {
   day: number;
   summary: string;
+  // Mirrors ItineraryDaySchema.title: a short label shown after "Day N",
+  // absent on every plan stored so far.
+  title?: string;
   stops: ItineraryStop[];
 }
 

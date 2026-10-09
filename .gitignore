@@ -24,3 +24,8 @@ memory.json
 # Custom wake word training output
 jarvis_training_output/
 my_jarvis.yaml
+
+# --- Impeccable design-review artifacts ---------------------------------
+# Screenshots captured for the finish review (regenerated at will). The older
+# swipe-era ones already committed stay tracked; new ones stay out of git.
+.impeccable/review/
