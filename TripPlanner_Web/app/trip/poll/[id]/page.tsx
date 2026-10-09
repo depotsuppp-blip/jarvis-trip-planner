@@ -1,14 +1,15 @@
 "use client";
 
 import { use, useEffect, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
-import { ensureLiffInit, liff } from "@/lib/liff";
 import { PageHeader } from "@/components/PageHeader";
 import { StickyActionButton } from "@/components/StickyActionButton";
 import { LoginScreen } from "@/components/auth/LoginScreen";
 import { PlanView } from "@/components/trip/PlanView";
 import { computeDateRangeLabel, formatShortDate } from "@/lib/tripSummary";
 import type { Itinerary, PollVote } from "@/lib/tripTypes";
+import { voterDisplayName } from "@/lib/voter";
 
 const fieldClass =
   "mt-1.5 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3.5 text-base text-slate-900 placeholder:text-slate-400 shadow-inner shadow-slate-900/5 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100";
@@ -132,38 +133,37 @@ export default function TripPollPage({
   // otherwise a visitor must hold a NextAuth session - see the early
   // returns near the bottom of this component and components/auth/
   // LoginScreen.tsx, which is the entire sign-in UI for that case.
-  const { status: sessionStatus } = useSession();
+  const { data: session, status: sessionStatus } = useSession();
   const canAccess = isAdmin || sessionStatus === "authenticated";
+  const router = useRouter();
+
+  // Who is voting comes from this session, not from a field the voter
+  // types: POST /api/poll/[id] derives the stored name from the same
+  // session with the same voterDisplayName(), so what "Voting as" shows
+  // below is exactly what lands in the list. Only an organizer opening
+  // their ?admin= link without having signed in has no voter - see the
+  // vote form's sign-in prompt.
+  const voter = session?.user ?? null;
+  const voterName = voter ? voterDisplayName(voter) : "";
 
   const [votes, setVotes] = useState<PollVote[]>([]);
   const [isLoadingVotes, setIsLoadingVotes] = useState(true);
 
-  // LINE identity is now a silent, best-effort enhancement, never a
-  // gate - see the initLiff effect below. `ready` only ever decides
-  // whether the name field shows a silent LINE prefill or stays empty
-  // for manual entry; it never blocks the form itself.
-  const [displayName, setDisplayName] = useState("");
-  const [idToken, setIdToken] = useState("");
-  const [ready, setReady] = useState(false);
-
-  // Whether this device has already voted anonymously, purely to relabel
-  // the submit button to "Update your vote" - see handleSubmit, which
-  // lets a resubmission through either way. Not a security control: a
-  // different browser, device, or cleared site data votes again freely.
-  const [hasVotedOnThisDevice, setHasVotedOnThisDevice] = useState(false);
-
-  // Stable per-(device, trip) identity for an anonymous voter, generated
-  // once and persisted in localStorage - see handleSubmit and
-  // lib/store.ts's addPollVote. This, not the typed name, is what the
-  // server dedups a resubmission against: two different people can type
-  // the same name, but this id is (for practical purposes) never shared.
-  const [anonId, setAnonId] = useState("");
+  // Whether the signed-in voter already has an entry on this trip, as
+  // answered by GET /api/poll/[id] for their session - so it holds on any
+  // device. Only relabels the submit button: a resubmission always
+  // replaces the earlier entry.
+  const [hasVoted, setHasVoted] = useState(false);
 
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [wishlist, setWishlist] = useState("");
   const [vibes, setVibes] = useState<string[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // True from the moment a first vote succeeds until this page is replaced
+  // by the swipe step, so the button stays put instead of flickering back
+  // to "Submit my vote" during the navigation.
+  const [isOpeningSwipe, setIsOpeningSwipe] = useState(false);
   const [error, setError] = useState("");
 
   const [isLocking, setIsLocking] = useState(false);
@@ -177,76 +177,41 @@ export default function TripPollPage({
   }
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function initLiff() {
-      // ensureLiffInit() wraps liff.init() and never throws - it
-      // returns false on any failure (missing NEXT_PUBLIC_LIFF_ID,
-      // strict browser tracking prevention blocking the storage LIFF
-      // needs, etc.) - see lib/liff.ts. This deliberately NEVER calls
-      // liff.login(): the mandatory login redirect used to gate voting
-      // entirely, and real testing showed it repeatedly breaking (wrong
-      // redirectUri landing users back on "/" stuck on "Logging in...").
-      // LINE identity is now a silent, best-effort attachment only - if
-      // isLoggedIn() already happens to be true (typically LINE's own
-      // in-app browser), the name field is prefilled and the vote is
-      // sent with a verified id token; otherwise voting proceeds with a
-      // manually-typed name and no token at all. Either way this never
-      // blocks the form - see `ready` below, which only ever decides
-      // between a prefilled and an empty name field.
-      const ok = await ensureLiffInit();
-      if (!cancelled && ok && liff.isLoggedIn()) {
-        try {
-          const profile = await liff.getProfile();
-          if (!cancelled) {
-            setDisplayName(profile.displayName);
-            setIdToken(liff.getIDToken() || "");
-          }
-        } catch (e) {
-          console.warn("LIFF profile fetch failed, falling back to manual name entry", e);
-        }
-      }
-      if (!cancelled) setReady(true);
-    }
-
-    initLiff();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    // Wrapped in a microtask (rather than reading localStorage directly
-    // in the effect body) so this reads as "synchronize with an
-    // external system," not "derive state during render" - matches
-    // loadVotes below, which defers its setState calls the same way by
-    // virtue of being async.
+    // Wrapped in a microtask (rather than reading the URL directly in the
+    // effect body) so this reads as "synchronize with an external
+    // system," not "derive state during render" - matches loadVotes
+    // below, which defers its setState calls the same way by virtue of
+    // being async.
     queueMicrotask(() => {
+      let token = "";
       try {
-        setAdminToken(new URLSearchParams(window.location.search).get("admin") || "");
+        token = new URLSearchParams(window.location.search).get("admin") || "";
       } catch {
-        // No admin param, or an unparseable query string - either way
-        // this trip's poll page just shows no "Lock & Generate Plan"
-        // button, same as an ordinary voter link.
+        // An unparseable query string - either way this trip's poll page
+        // just shows no "Lock & Generate Plan" button, same as an
+        // ordinary voter link.
       }
 
+      // The token arrives in the URL the organizer was sent, but a first
+      // vote now carries them on to the swipe step (see handleSubmit),
+      // and its "Back to trip" is a plain link to this page with no
+      // ?admin=. Keeping the token for the tab's lifetime means the
+      // organizer still has the Lock button when they come back. Same
+      // secret, same place it already sat (the address bar), and the
+      // server still verifies it independently on every lock.
+      const storageKey = `pollAdmin:${id}`;
       try {
-        setHasVotedOnThisDevice(localStorage.getItem(`voted:${id}`) === "1");
-
-        const anonIdKey = `anonVoterId:${id}`;
-        let storedAnonId = localStorage.getItem(anonIdKey);
-        if (!storedAnonId) {
-          storedAnonId = crypto.randomUUID();
-          localStorage.setItem(anonIdKey, storedAnonId);
+        if (token) {
+          sessionStorage.setItem(storageKey, token);
+        } else {
+          token = sessionStorage.getItem(storageKey) || "";
         }
-        setAnonId(storedAnonId);
       } catch {
-        // localStorage can be unavailable (private browsing, blocked
-        // site data) - hasVotedOnThisDevice is only a UI label, not a
-        // security control, so failing open costs nothing there. An
-        // empty anonId just means this submission won't dedup against a
-        // prior one server-side (see lib/store.ts's addPollVote).
+        // sessionStorage can be unavailable (blocked site data): a token
+        // that came in through the URL still works for this page load.
       }
+
+      setAdminToken(token);
     });
   }, [id]);
 
@@ -269,6 +234,7 @@ export default function TripPollPage({
         const data = await response.json();
         if (!cancelled) {
           setVotes(Array.isArray(data.votes) ? data.votes : []);
+          setHasVoted(data.hasVoted === true);
           // The actual fix for the state-sync bug: this trip's locked
           // itinerary, straight from Postgres (see GET /api/poll/[id]'s
           // docstring) - not just whatever POST /api/trigger-jarvis
@@ -300,12 +266,6 @@ export default function TripPollPage({
     event.preventDefault();
     setError("");
 
-    const trimmedName = displayName.trim();
-    if (!trimmedName) {
-      setError("Please enter your name to vote.");
-      return;
-    }
-
     if (startDate && startDate < todayISO()) {
       setError("The \"From\" date can't be in the past.");
       return;
@@ -318,51 +278,33 @@ export default function TripPollPage({
 
     setIsSubmitting(true);
 
-    // Fetched fresh here rather than trusting the `idToken` state value
-    // cached since page load - diagnosis confirmed this call itself
-    // never throws, but re-checking at the actual moment of use is
-    // cheap insurance against a token that's gone stale while the form
-    // was open, and keeps the request's real identity in one place.
-    let liffIdToken = "";
-    try {
-      if (liff.isLoggedIn()) {
-        liffIdToken = liff.getIDToken() || "";
-      }
-    } catch (tokenError) {
-      console.error("liff.getIDToken() failed at submit time:", tokenError);
-      setError("Something went wrong submitting your vote. Please try again.");
-      setIsSubmitting(false);
-      return;
-    }
+    // Set once a first vote has gone through and this page is about to be
+    // replaced by the swipe step: the button then stays disabled rather
+    // than flickering back to "Submit my vote" mid-navigation.
+    let openingSwipe = false;
 
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (liffIdToken) {
-        // A verified LINE session was silently attached - send it so
-        // the server trusts claims.sub, not just the typed name (see
-        // app/api/poll/[id]/route.ts's POST handler). Omitted entirely
-        // when there is no token: the server treats a request with NO
-        // Authorization header as an intentional anonymous vote, not an
-        // error.
-        headers.Authorization = `Bearer ${liffIdToken}`;
-      }
-
+      // Dates, wishlist and vibes only. Who is voting is the signed-in
+      // session's business (the cookie rides along on its own) - the
+      // server names the vote after that account, so there is no name,
+      // token or device id to send.
       const response = await fetch(`/api/poll/${id}`, {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: trimmedName,
           startDate,
           endDate,
           wishlist: wishlist.trim(),
           vibes,
-          // Only meaningful without a verified LINE session - the server
-          // ignores this field once a token is present, since lineUserId
-          // is the dedup key then instead (see lib/store.ts's
-          // addPollVote).
-          ...(liffIdToken ? {} : { anonId }),
         }),
       });
+
+      if (response.status === 401) {
+        // The session lapsed while the form was open (or this is an
+        // organizer's ?admin= link that was never signed in).
+        setError("Please sign in again to submit your vote.");
+        return;
+      }
 
       if (!response.ok) {
         const data = await response.json().catch(() => null);
@@ -375,26 +317,40 @@ export default function TripPollPage({
 
       const data = await response.json();
       setVotes(Array.isArray(data.votes) ? data.votes : []);
-
-      if (!liffIdToken) {
-        try {
-          localStorage.setItem(`voted:${id}`, "1");
-        } catch {
-          // The vote itself already succeeded server-side either way.
-        }
-        setHasVotedOnThisDevice(true);
-      }
+      setHasVoted(true);
 
       setStartDate("");
       setEndDate("");
       setWishlist("");
       setVibes([]);
+
+      // A FIRST vote on this trip hands the voter straight on to the swipe
+      // step, where they say which places they like - the other half of
+      // what the plan is built from. `created` comes from the server and
+      // is false for a resubmission, so someone coming back to change
+      // their dates stays right here.
+      if (data.created === true) {
+        openingSwipe = true;
+        setIsOpeningSwipe(true);
+        router.push(`/trip/swipe/${encodeURIComponent(id)}`);
+      }
     } catch (error) {
       console.error("Vote submission failed:", error);
       setError("Something went wrong submitting your vote. Please try again.");
     } finally {
-      setIsSubmitting(false);
+      if (!openingSwipe) {
+        setIsSubmitting(false);
+      }
     }
+  }
+
+  // Only reachable from an organizer's ?admin= link opened without being
+  // signed in (everyone else is stopped by the login gate before they can
+  // see a form at all). Back to this exact page - admin token and all -
+  // once signed in: /login hands ?callbackUrl= to NextAuth, which only
+  // honors a same-origin one.
+  function handleSignInToVote() {
+    router.push(`/login?callbackUrl=${encodeURIComponent(window.location.href)}`);
   }
 
   async function handleLockAndGenerate() {
@@ -510,120 +466,136 @@ export default function TripPollPage({
               Let the group know when you&apos;re free and what you&apos;re hoping for.
             </p>
 
-            <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
-              <div>
-                <label htmlFor="voterName" className={labelClass}>
-                  Your name
-                </label>
-                <input
-                  id="voterName"
-                  type="text"
-                  value={displayName}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                  placeholder={ready ? "Your name" : "Checking LINE sign-in..."}
-                  maxLength={100}
-                  className={fieldClass}
-                />
-                {idToken && (
-                  <p className="mt-1.5 text-xs text-emerald-600">
-                    Signed in with LINE - your vote is linked to your account.
+            {voter ? (
+              <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
+                <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                  <span
+                    aria-hidden="true"
+                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white text-sm font-semibold uppercase text-slate-600"
+                  >
+                    {Array.from(voterName)[0]}
+                  </span>
+                  <div className="min-w-0">
+                    <p className={labelClass}>Voting as</p>
+                    <p className="truncate text-sm font-semibold text-slate-900">{voterName}</p>
+                    {voter?.email && (
+                      <p className="truncate text-xs text-slate-500">{voter.email}</p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="startDate" className={labelClass}>
+                      From
+                    </label>
+                    <input
+                      id="startDate"
+                      type="date"
+                      value={startDate}
+                      min={todayISO()}
+                      onChange={(event) => setStartDate(event.target.value)}
+                      className={`${fieldClass} [color-scheme:light]`}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="endDate" className={labelClass}>
+                      To
+                    </label>
+                    <input
+                      id="endDate"
+                      type="date"
+                      value={endDate}
+                      min={startDate || todayISO()}
+                      onChange={(event) => setEndDate(event.target.value)}
+                      className={`${fieldClass} [color-scheme:light]`}
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label htmlFor="wishlist" className={labelClass}>
+                    Specific Places (Optional)
+                  </label>
+                  <textarea
+                    id="wishlist"
+                    value={wishlist}
+                    onChange={(event) => setWishlist(event.target.value)}
+                    placeholder="Cafe, art gallery, chill vibes..."
+                    rows={3}
+                    maxLength={WISHLIST_MAX_LENGTH}
+                    className={`${fieldClass} resize-none`}
+                  />
+                  <p className="text-right text-xs text-slate-400">
+                    {wishlist.length}/{WISHLIST_MAX_LENGTH}
+                  </p>
+                </div>
+
+                <div className="space-y-2 pt-1">
+                  <p className={labelClass}>Or choose the vibes you want</p>
+                  <div className="flex flex-wrap gap-2">
+                    {VIBE_OPTIONS.map((vibe) => {
+                      const isSelected = vibes.includes(vibe);
+                      return (
+                        <button
+                          key={vibe}
+                          type="button"
+                          onClick={() => toggleVibe(vibe)}
+                          aria-pressed={isSelected}
+                          className={`inline-flex items-center gap-1.5 rounded-full border px-4 py-2.5 text-sm font-medium transition active:scale-[0.97] ${
+                            isSelected
+                              ? "border-rose-500 bg-rose-500 text-white shadow-md shadow-rose-500/25"
+                              : "border-slate-200 bg-white text-slate-600"
+                          }`}
+                        >
+                          {isSelected && <span aria-hidden="true">✓</span>}
+                          {vibe}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {error && <p className="text-sm text-red-600">{error}</p>}
+
+                {hasVoted && (
+                  <p className="text-sm text-slate-500">
+                    You&apos;ve already voted - submitting again will update your
+                    entry.
                   </p>
                 )}
-              </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label htmlFor="startDate" className={labelClass}>
-                    From
-                  </label>
-                  <input
-                    id="startDate"
-                    type="date"
-                    value={startDate}
-                    min={todayISO()}
-                    onChange={(event) => setStartDate(event.target.value)}
-                    className={`${fieldClass} [color-scheme:light]`}
-                  />
-                </div>
-                <div>
-                  <label htmlFor="endDate" className={labelClass}>
-                    To
-                  </label>
-                  <input
-                    id="endDate"
-                    type="date"
-                    value={endDate}
-                    min={startDate || todayISO()}
-                    onChange={(event) => setEndDate(event.target.value)}
-                    className={`${fieldClass} [color-scheme:light]`}
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <label htmlFor="wishlist" className={labelClass}>
-                  Specific Places (Optional)
-                </label>
-                <textarea
-                  id="wishlist"
-                  value={wishlist}
-                  onChange={(event) => setWishlist(event.target.value)}
-                  placeholder="Cafe, art gallery, chill vibes..."
-                  rows={3}
-                  maxLength={WISHLIST_MAX_LENGTH}
-                  className={`${fieldClass} resize-none`}
-                />
-                <p className="text-right text-xs text-slate-400">
-                  {wishlist.length}/{WISHLIST_MAX_LENGTH}
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="w-full rounded-full bg-rose-500 px-4 py-3.5 text-base font-semibold text-white shadow-md shadow-rose-500/20 transition hover:bg-rose-600 active:scale-[0.98] disabled:opacity-50"
+                >
+                  {isOpeningSwipe
+                    ? "Opening your swipe deck..."
+                    : isSubmitting
+                      ? "Submitting..."
+                      : hasVoted
+                        ? "Update your vote"
+                        : "Submit my vote"}
+                </button>
+              </form>
+            ) : sessionStatus === "loading" ? (
+              <p className="mt-4 text-sm text-slate-500">Loading...</p>
+            ) : (
+              <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                <p className="text-sm text-slate-600">
+                  Sign in to add your availability - your vote is saved under
+                  your account.
                 </p>
+                <button
+                  type="button"
+                  onClick={handleSignInToVote}
+                  className="mt-3 inline-flex min-h-12 items-center justify-center rounded-full border border-slate-200 bg-white px-5 text-sm font-semibold text-slate-700 shadow-sm outline-none transition hover:bg-slate-50 focus-visible:ring-4 focus-visible:ring-slate-300 active:scale-[0.98]"
+                >
+                  Sign in
+                </button>
               </div>
-
-              <div className="space-y-2 pt-1">
-                <p className={labelClass}>Or choose the vibes you want</p>
-                <div className="flex flex-wrap gap-2">
-                  {VIBE_OPTIONS.map((vibe) => {
-                    const isSelected = vibes.includes(vibe);
-                    return (
-                      <button
-                        key={vibe}
-                        type="button"
-                        onClick={() => toggleVibe(vibe)}
-                        aria-pressed={isSelected}
-                        className={`inline-flex items-center gap-1.5 rounded-full border px-4 py-2.5 text-sm font-medium transition active:scale-[0.97] ${
-                          isSelected
-                            ? "border-rose-500 bg-rose-500 text-white shadow-md shadow-rose-500/25"
-                            : "border-slate-200 bg-white text-slate-600"
-                        }`}
-                      >
-                        {isSelected && <span aria-hidden="true">✓</span>}
-                        {vibe}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {error && <p className="text-sm text-red-600">{error}</p>}
-
-              {!idToken && hasVotedOnThisDevice && (
-                <p className="text-sm text-slate-500">
-                  You&apos;ve already voted on this device - submitting again
-                  will update your entry.
-                </p>
-              )}
-
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                className="w-full rounded-full bg-rose-500 px-4 py-3.5 text-base font-semibold text-white shadow-md shadow-rose-500/20 transition hover:bg-rose-600 active:scale-[0.98] disabled:opacity-50"
-              >
-                {isSubmitting
-                  ? "Submitting..."
-                  : !idToken && hasVotedOnThisDevice
-                    ? "Update your vote"
-                    : "Submit my vote"}
-              </button>
-            </form>
+            )}
           </section>
 
           <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">

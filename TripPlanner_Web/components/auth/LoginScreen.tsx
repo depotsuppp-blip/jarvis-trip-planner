@@ -2,13 +2,17 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import { signIn } from "next-auth/react";
-import { ArrowLeft, CircleAlert, Mail, Plane } from "lucide-react";
+import { ArrowLeft, CircleAlert, Mail } from "lucide-react";
 
-const fieldClass =
-  "mt-1.5 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3.5 text-base text-slate-900 placeholder:text-slate-400 shadow-inner shadow-slate-900/5 outline-none transition focus:border-blue-400 focus:bg-white focus:ring-4 focus:ring-blue-100";
+// Jarvis sign-in speaks the Modern Editorial dialect: white ground, 1px slate
+// rules, ink text, 6px corners, no shadows. The only colour is the rose focus
+// outline, which means "this one".
+const focusClass =
+  "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600";
 
-const primaryButtonClass =
-  "flex w-full items-center justify-center gap-2.5 rounded-full bg-rose-500 px-4 py-3.5 text-sm font-semibold text-white shadow-md shadow-rose-500/20 outline-none transition hover:bg-rose-600 focus-visible:ring-4 focus-visible:ring-rose-200 active:scale-[0.98] disabled:opacity-50";
+const fieldClass = `mt-1.5 h-12 w-full rounded-md border border-slate-300 bg-white px-3 text-base text-slate-900 placeholder:text-slate-500 focus:border-slate-900 ${focusClass}`;
+
+const primaryButtonClass = `flex h-12 w-full items-center justify-center gap-2.5 rounded-md bg-slate-900 px-4 text-sm font-semibold text-white transition hover:bg-slate-700 active:scale-[0.98] disabled:opacity-50 ${focusClass}`;
 
 // Shown for ANY ?error= value. NextAuth's codes (OAuthCallback,
 // Verification, Configuration, ...) are meant for developers - someone
@@ -72,8 +76,8 @@ function resolveCallbackUrl(fallback?: string) {
  * bare signIn(), so NextAuth's own unstyled chooser/verify-request pages
  * never appear.
  *
- * Intentionally shows no trip id or other trip details: this is a signed-out
- * screen, and a raw database id on it reads as a bug rather than reassurance.
+ * The sign-in for all of Jarvis, not for any one tool: it carries no trip
+ * wording, id or other details of what the visitor was opening.
  *
  * fallbackCallbackUrl is where to land after sign-in when the URL itself
  * doesn't say - see resolveCallbackUrl. Omit it to return to the current
@@ -81,8 +85,13 @@ function resolveCallbackUrl(fallback?: string) {
  */
 export function LoginScreen({
   fallbackCallbackUrl,
+  googleReady = true,
+  emailReady = true,
 }: {
   fallbackCallbackUrl?: string;
+  /** False when the server has no credentials for that provider (see lib/authConfig.ts). */
+  googleReady?: boolean;
+  emailReady?: boolean;
 }) {
   const [showEmailForm, setShowEmailForm] = useState(false);
   const [email, setEmail] = useState("");
@@ -151,124 +160,104 @@ export function LoginScreen({
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4 py-12">
-      <div className="w-full max-w-sm rounded-3xl border border-slate-200 bg-white p-8 shadow-xl shadow-slate-900/5 sm:p-10">
-        <div className="flex flex-col items-center text-center">
-          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-rose-50 text-rose-500 ring-1 ring-rose-100">
-            <Plane className="h-6 w-6" aria-hidden="true" />
-          </div>
+    <div className="flex min-h-screen items-center justify-center bg-white px-4 py-12 text-slate-900">
+      <div className="w-full max-w-sm">
+        <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-slate-500">Jarvis</p>
+        <h1 className="mt-3 text-[22px] font-semibold leading-tight tracking-tight">Sign in to Jarvis</h1>
+        <p className="mt-2 text-[15px] leading-6 text-slate-600">Your intelligent executive assistant.</p>
 
-          <h1 className="mt-5 text-2xl font-bold tracking-tight text-slate-900">
-            Join the Trip
-          </h1>
-          <p className="mt-2 text-sm leading-relaxed text-slate-500">
-            Sign in to vote on dates, pick your vibes, and see the plan come
-            together.
-          </p>
-        </div>
+        <div className="mt-8 border-t border-slate-200 pt-8">
+          {error && (
+            <div role="alert" className="mb-6 flex items-start gap-2.5 rounded-md border border-slate-900 px-4 py-3">
+              <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" aria-hidden="true" />
+              <p className="text-sm font-medium text-slate-900">{error}</p>
+            </div>
+          )}
 
-        {error && (
-          <div
-            role="alert"
-            className="mt-6 flex items-start gap-2.5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3"
-          >
-            <CircleAlert
-              className="mt-0.5 h-4 w-4 shrink-0 text-red-500"
-              aria-hidden="true"
-            />
-            <p className="text-sm font-medium text-red-700">{error}</p>
-          </div>
-        )}
-
-        <div className="mt-6 space-y-3">
-          <button
-            type="button"
-            onClick={handleGoogleSignIn}
-            disabled={isRedirectingToGoogle}
-            className="flex w-full items-center justify-center gap-3 rounded-full border border-slate-200 bg-white px-4 py-3.5 text-sm font-semibold text-slate-700 shadow-sm outline-none transition hover:border-slate-300 hover:bg-slate-50 focus-visible:ring-4 focus-visible:ring-slate-200 active:scale-[0.98] disabled:opacity-50"
-          >
-            <GoogleIcon />
-            {isRedirectingToGoogle ? "Redirecting..." : "Continue with Google"}
-          </button>
-
-          <div className="flex items-center gap-3 py-1" aria-hidden="true">
-            <span className="h-px flex-1 bg-slate-200" />
-            <span className="text-xs font-medium uppercase tracking-wider text-slate-400">
-              or
-            </span>
-            <span className="h-px flex-1 bg-slate-200" />
-          </div>
-
-          {!showEmailForm ? (
+          <div className="space-y-3">
             <button
               type="button"
-              onClick={() => {
-                setError("");
-                setShowEmailForm(true);
-              }}
-              className={primaryButtonClass}
+              onClick={handleGoogleSignIn}
+              disabled={isRedirectingToGoogle || !googleReady}
+              className={`flex h-12 w-full items-center justify-center gap-3 rounded-md border border-slate-300 bg-white px-4 text-sm font-semibold text-slate-900 transition hover:border-slate-900 active:scale-[0.98] disabled:opacity-50 ${focusClass}`}
             >
-              <Mail className="h-4 w-4" aria-hidden="true" />
-              Continue with Email
+              <GoogleIcon />
+              {isRedirectingToGoogle ? "Redirecting..." : "Continue with Google"}
             </button>
-          ) : linkSentTo ? (
-            <div
-              role="status"
-              className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-center"
-            >
-              <p className="text-sm font-medium text-emerald-800">
-                Check your inbox
-              </p>
-              <p className="mt-1 text-sm text-emerald-700">
-                We sent a magic link to <strong>{linkSentTo}</strong>.
-              </p>
+            {!googleReady && (
+              <p className="text-xs text-slate-600">Google sign-in isn&apos;t set up on this server.</p>
+            )}
+
+            <div className="flex items-center gap-3 py-1" aria-hidden="true">
+              <span className="h-px flex-1 bg-slate-200" />
+              <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-slate-500">or</span>
+              <span className="h-px flex-1 bg-slate-200" />
+            </div>
+
+            {!emailReady ? (
+              <p className="text-xs text-slate-600">Email sign-in isn&apos;t set up on this server.</p>
+            ) : !showEmailForm ? (
               <button
                 type="button"
                 onClick={() => {
-                  setLinkSentTo("");
-                  setEmail("");
+                  setError("");
+                  setShowEmailForm(true);
                 }}
-                className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 underline underline-offset-2"
+                className={primaryButtonClass}
               >
-                Use a different email
+                <Mail className="h-4 w-4" aria-hidden="true" />
+                Continue with Email
               </button>
-            </div>
-          ) : (
-            <form onSubmit={handleEmailSubmit} className="space-y-2.5">
-              <div className="flex items-center gap-1.5">
+            ) : linkSentTo ? (
+              <div role="status" className="rounded-md border border-slate-200 p-4">
+                <p className="text-sm font-semibold">Check your inbox</p>
+                <p className="mt-1 text-sm text-slate-600">
+                  We sent a sign-in link to <strong className="text-slate-900">{linkSentTo}</strong>.
+                </p>
                 <button
                   type="button"
                   onClick={() => {
-                    setError("");
-                    setShowEmailForm(false);
+                    setLinkSentTo("");
+                    setEmail("");
                   }}
-                  aria-label="Back"
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                  className={`mt-3 rounded-md text-xs font-semibold text-slate-900 underline underline-offset-2 ${focusClass}`}
                 >
-                  <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+                  Use a different email
                 </button>
-                <label htmlFor="loginEmail" className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  Your email
-                </label>
               </div>
-              <input
-                id="loginEmail"
-                type="email"
-                autoFocus
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                placeholder="you@example.com"
-                className={fieldClass}
-              />
-              <button
-                type="submit"
-                disabled={isSendingLink}
-                className={primaryButtonClass}
-              >
-                {isSendingLink ? "Sending..." : "Send magic link"}
-              </button>
-            </form>
-          )}
+            ) : (
+              <form onSubmit={handleEmailSubmit} className="space-y-3">
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setError("");
+                      setShowEmailForm(false);
+                    }}
+                    aria-label="Back"
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-600 transition hover:text-slate-900 ${focusClass}`}
+                  >
+                    <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                  <label htmlFor="loginEmail" className="text-[11px] font-medium uppercase tracking-[0.08em] text-slate-600">
+                    Your email
+                  </label>
+                </div>
+                <input
+                  id="loginEmail"
+                  type="email"
+                  autoFocus
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="you@example.com"
+                  className={fieldClass}
+                />
+                <button type="submit" disabled={isSendingLink} className={primaryButtonClass}>
+                  {isSendingLink ? "Sending..." : "Send sign-in link"}
+                </button>
+              </form>
+            )}
+          </div>
         </div>
       </div>
     </div>

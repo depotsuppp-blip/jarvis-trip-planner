@@ -2476,6 +2476,35 @@ class LLMBrain:
         self._history.clear()
         print("[Brain] Conversation history cleared.")
 
+    def set_history(self, turns: list[tuple[str, str]]) -> None:
+        """
+        Replaces conversation memory with `turns`, oldest first, as
+        (role, text) pairs where role is "user" or "assistant".
+
+        For a caller that owns the transcript (the web chat keeps it in
+        its database) and wants this brain stateless between requests.
+        Providers need strictly alternating roles that open on a user
+        turn, and a stored chat can break that (a failed reply leaves two
+        user turns in a row), so same-role neighbours are merged and
+        anything before the first user turn is dropped. The caller's next
+        ask() adds its own user turn, so a trailing user turn is merged
+        into that by being dropped here.
+        """
+        merged: list[Turn] = []
+        for role, text in turns:
+            kind = "user" if role == "user" else "assistant"
+            text = (text or "").strip()
+            if not text:
+                continue
+            if merged and merged[-1].kind == kind:
+                merged[-1] = Turn(kind=kind, text=f"{merged[-1].text}\n{text}")
+            elif merged or kind == "user":
+                merged.append(Turn(kind=kind, text=text))
+        if merged and merged[-1].kind == "user":
+            merged.pop()
+        self._history = merged
+        self._trim_history()
+
     @property
     def turn_count(self) -> int:
         return len(self._history) // 2

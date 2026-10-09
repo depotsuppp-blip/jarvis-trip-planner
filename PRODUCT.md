@@ -32,7 +32,7 @@ Four claims the user confirmed another trip planner could not truthfully make:
 ## Operating Context
 
 - Trip Planner is a separate application from Jarvis (a Python voice assistant). Jarvis only creates trips, generates links into this app (`/trip/poll/[id]`, `/trip/draft/[id]`) and pushes them over LINE; it renders no UI of its own.
-- Group flow as built today: the organizer asks Jarvis by voice, a poll link goes to LINE, participants sign in and add dates, wishlist and vibes, the organizer locks the poll, and the generated itinerary then appears for everyone on the same page.
+- Group flow as built today: the organizer asks Jarvis by voice, a poll link goes to LINE, participants sign in and add dates, wishlist and vibes (a first vote carries them straight on to the swipe deck), the organizer locks the poll, and the generated itinerary then appears for everyone on the same page.
 - Entry points: a link opened in LINE's in-app browser (LIFF), or the open web with sign-in.
 - The organizer's authority is a private admin link sent only to them; locking a plan and swapping a stop both require it.
 
@@ -40,7 +40,7 @@ Four claims the user confirmed another trip planner could not truthfully make:
 
 Built today:
 
-- **Consensus poll** (`/trip/poll/[id]`): each participant adds a name, date range, wishlist places and vibe tags; everyone's entries are listed; the organizer locks the poll and generates the plan.
+- **Consensus poll** (`/trip/poll/[id]`): each signed-in participant adds a date range, wishlist places and vibe tags, named after their account (no name to type; one entry per account, which a later submit replaces); everyone's entries are listed; the organizer locks the poll and generates the plan. A participant's first vote on a trip sends them on to the swipe deck. An organizer who opens their admin link without signing in can lock but must sign in to vote.
 - **Generated itinerary:** destination inferred from the group's input; per-day stops with real venues, travel time between stops, per-person cost estimates and weather (the map is still a placeholder). The organizer can swap a stop for a live nearby alternative.
 - **Dashboard** (`/trip/dashboard/[id]`): participants, top vibes and a wishlist summary.
 - **Swipe deck** (`/trip/swipe/[id]?destination=`): Like or Pass on about 20 Google Places suggestions; answers are saved per signed-in user and trip. Plan generation does not use them yet.

@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import { LoginScreen } from "@/components/auth/LoginScreen";
+import { getAuthConfigStatus, warnAboutAuthConfig } from "@/lib/authConfig";
 
 export const metadata: Metadata = {
-  title: "Sign in | Trip Planner",
+  title: "Sign in | Jarvis",
 };
 
 /**
@@ -20,5 +21,7 @@ export const metadata: Metadata = {
  * callbackUrl).
  */
 export default function LoginPage() {
-  return <LoginScreen fallbackCallbackUrl="/" />;
+  warnAboutAuthConfig();
+  const { googleReady, emailReady } = getAuthConfigStatus();
+  return <LoginScreen fallbackCallbackUrl="/" googleReady={googleReady} emailReady={emailReady} />;
 }

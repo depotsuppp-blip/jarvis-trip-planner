@@ -1,9 +1,17 @@
 import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { addPollVote, getDraft, getPollVotes, isPollLocked, type PollVote } from "@/lib/store";
+import {
+  addPollVote,
+  getDraft,
+  getPollVotes,
+  hasPollVote,
+  isPollLocked,
+  type PollVote,
+} from "@/lib/store";
+import { getSessionUser } from "@/lib/auth";
 import { parseStoredItinerary } from "@/lib/itinerary";
 import { summarizePollVotes } from "@/lib/tripSummary";
-import { verifyBearerLineToken } from "@/lib/lineAuth";
+import { voterDisplayName } from "@/lib/voter";
 import { checkRateLimit } from "@/lib/rateLimit";
 
 // A generous allowance for legitimate double-taps/retries while still
@@ -88,6 +96,21 @@ function verifyHmacSignature(request: NextRequest, id: string): string | null {
   return null;
 }
 
+/**
+ * Never throws: a session lookup that fails must not take the vote list
+ * down with it for the callers that never had a session (the Python
+ * plugin, the dashboard) - `hasVoted` is only there to label a button.
+ */
+async function currentUserHasVoted(tripId: string): Promise<boolean> {
+  try {
+    const user = await getSessionUser();
+    return user ? await hasPollVote(tripId, user.id) : false;
+  } catch (error) {
+    console.error(`GET /api/poll/${tripId}: could not resolve the session:`, error);
+    return false;
+  }
+}
+
 export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id } = await params;
 
@@ -122,12 +145,20 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const draft = locked ? await getDraft(id) : null;
     const itinerary = draft ? parseStoredItinerary(draft.text) : null;
 
+    // Also additive: whether the signed-in caller already has an entry on
+    // this trip, so the poll page can label its button "Update your vote".
+    // Answered per session (cookie), so it holds on any device; false for
+    // a signed-out reader, and for plugins/trip_planner.py's signed calls,
+    // which carry no session.
+    const hasVoted = await currentUserHasVoted(id);
+
     return NextResponse.json({
       tripId: id,
       votes,
       summary: summarizePollVotes(votes),
       locked,
       itinerary,
+      hasVoted,
     });
   } catch (error) {
     // An uncaught throw here (e.g. a corrupted .data/polls.json, a disk
@@ -139,19 +170,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       { status: 500 }
     );
   }
-}
-
-/**
- * Best-effort caller IP for rate-limiting an anonymous vote, which has
- * no lineUserId to key by. Vercel sets X-Forwarded-For; falls back to a
- * single shared bucket if it's absent (e.g. local dev), which is
- * strictly a lower bound on protection, never a hole relative to today
- * - unauthenticated voting is new, so there was no per-caller limit at
- * all on this path before.
- */
-function clientIp(request: NextRequest): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  return forwarded ? forwarded.split(",")[0].trim() : "unknown";
 }
 
 export async function POST(request: NextRequest, { params }: RouteParams) {
@@ -176,28 +194,22 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 }
 
 async function handlePollVote(request: NextRequest, id: string): Promise<NextResponse> {
-  // A LINE session is now optional, not required - see
-  // app/trip/poll/[id]/page.tsx, which no longer forces a liff.login()
-  // redirect before voting is possible (that redirect proved unreliable
-  // in real testing). A header that IS present must still check out,
-  // though: a present-but-bad token fails loudly (401) rather than
-  // silently downgrading to an anonymous vote the user wouldn't know
-  // about. Only a request with NO Authorization header at all is
-  // treated as an intentional anonymous submission.
-  const authHeader = request.headers.get("authorization");
-  let lineUserId = "";
-  if (authHeader) {
-    lineUserId = (await verifyBearerLineToken(authHeader)) || "";
-    if (!lineUserId) {
-      return NextResponse.json(
-        { error: "Invalid or expired LINE ID token." },
-        { status: 401 }
-      );
-    }
+  // Who is voting comes from the NextAuth session - the same one the poll
+  // page's login gate checks (components/auth/LoginScreen.tsx) - and from
+  // nothing the client says about itself: no typed name, no LINE token, no
+  // device id. The page used to collect those because there was no account
+  // to ask. A vote is now one entry per signed-in account per trip (see
+  // addPollVote), named after that account (see lib/voter.ts); any `name`
+  // a client still sends is ignored.
+  const user = await getSessionUser();
+  if (!user) {
+    return NextResponse.json(
+      { error: "Please sign in to submit your vote." },
+      { status: 401 }
+    );
   }
 
-  const rateLimitKey = lineUserId ? `vote:${lineUserId}` : `vote:anon:${clientIp(request)}`;
-  const rateLimit = checkRateLimit(rateLimitKey, VOTE_RATE_LIMIT, VOTE_RATE_WINDOW_MS);
+  const rateLimit = checkRateLimit(`vote:user:${user.id}`, VOTE_RATE_LIMIT, VOTE_RATE_WINDOW_MS);
   if (!rateLimit.allowed) {
     return NextResponse.json(
       { error: "Too many votes submitted - please wait a moment and try again." },
@@ -207,16 +219,16 @@ async function handlePollVote(request: NextRequest, id: string): Promise<NextRes
 
   const body = await request.json().catch(() => null);
 
-  if (!body || typeof body.name !== "string" || !body.name.trim()) {
+  if (!body || typeof body !== "object") {
     return NextResponse.json(
-      { error: "A name is required to submit a vote." },
+      { error: "The vote must be a JSON object." },
       { status: 400 }
     );
   }
 
   const vote: PollVote = {
-    name: body.name.trim(),
-    lineUserId,
+    name: voterDisplayName(user),
+    lineUserId: "",
     startDate: typeof body.startDate === "string" ? body.startDate : "",
     endDate: typeof body.endDate === "string" ? body.endDate : "",
     wishlist: typeof body.wishlist === "string" ? body.wishlist.trim() : "",
@@ -226,14 +238,9 @@ async function handlePollVote(request: NextRequest, id: string): Promise<NextRes
     submittedAt: new Date().toISOString(),
   };
 
-  // The dedup key for a resubmission with no verified LINE session - see
-  // addPollVote's docstring for why this must be a stable client-generated
-  // id (app/trip/poll/[id]/page.tsx's anonVoterId:) and never the typed
-  // name. Capped well above a UUID's length just to keep a malformed
-  // client from writing an unbounded string.
-  const anonId =
-    typeof body.anonId === "string" ? body.anonId.trim().slice(0, 200) : "";
-
-  const votes = await addPollVote(id, vote, anonId);
-  return NextResponse.json({ tripId: id, votes }, { status: 201 });
+  // `created` is what the poll page keys its first-vote redirect to the
+  // swipe step on: true only the first time this account votes on this
+  // trip, false for a resubmission that replaced the earlier entry.
+  const { votes, created } = await addPollVote(id, vote, user.id);
+  return NextResponse.json({ tripId: id, votes, created }, { status: created ? 201 : 200 });
 }

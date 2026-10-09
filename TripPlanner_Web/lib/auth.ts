@@ -2,7 +2,10 @@ import { getServerSession, type NextAuthOptions } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import EmailProvider from "next-auth/providers/email";
 import { PrismaAdapter } from "@auth/prisma-adapter";
+import { warnAboutAuthConfig } from "@/lib/authConfig";
 import { prisma } from "@/lib/prisma";
+
+warnAboutAuthConfig();
 
 /**
  * Shared NextAuth config - imported by app/api/auth/[...nextauth]/route.ts
@@ -74,4 +77,22 @@ export const authOptions: NextAuthOptions = {
 export async function getSessionUserId(): Promise<string | null> {
   const session = await getServerSession(authOptions);
   return session?.user?.id ?? null;
+}
+
+export interface SessionUser {
+  id: string;
+  name: string | null;
+  email: string | null;
+}
+
+/**
+ * The signed-in user - id plus the name and email on their account - or
+ * null for a signed-out caller. For routes that record WHO did something
+ * (the poll vote), not just whether someone is signed in.
+ */
+export async function getSessionUser(): Promise<SessionUser | null> {
+  const session = await getServerSession(authOptions);
+  const user = session?.user;
+  if (!user?.id) return null;
+  return { id: user.id, name: user.name ?? null, email: user.email ?? null };
 }

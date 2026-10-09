@@ -8,7 +8,6 @@
  * which instance handled the next request.
  */
 
-import crypto from "crypto";
 import { prisma } from "./prisma";
 
 // ---------------------------------------------------------------------
@@ -18,10 +17,10 @@ import { prisma } from "./prisma";
 export interface PollVote {
   name: string;
   /**
-   * The verified LINE user id, or "" for a vote submitted without a
-   * LINE session - see app/api/poll/[id]/route.ts's POST handler,
-   * which now accepts both. An anonymous vote has no real identity
-   * behind it beyond the self-reported `name`.
+   * The verified LINE user id of a vote cast before signing in became
+   * required to vote, otherwise "". A vote is now identified by the
+   * NextAuth account that cast it (the row's voterKey, see
+   * pollVoterKey below), not by anything stored in this field.
    */
   lineUserId: string;
   startDate: string;
@@ -48,73 +47,68 @@ export async function getPollVotes(tripId: string): Promise<PollVote[]> {
 }
 
 /**
- * "line:<lineUserId>" or "anon:<anonId>" - whichever identity this vote
- * actually carries - or a one-off value that can never collide when
- * neither is available (an old cached client that predates anonId, or
- * localStorage unavailable), so that submission is simply never deduped
- * rather than colliding with an unrelated voter. See voterKey's comment
- * in prisma/schema.prisma for why this can't just be lineUserId or
- * anonId directly: both default to "" and every anonymous row would
- * otherwise collide with every other anonymous row on lineUserId="" (and
- * likewise every verified row on anonId="").
+ * The dedup key for a signed-in voter: "user:<User.id>" - one vote per
+ * account per trip, the same on every device. Rows written before signing
+ * in was required to vote carry "line:<lineUserId>", "anon:<anonId>" or a
+ * one-off "once:<random>" instead (see voterKey in prisma/schema.prisma);
+ * they stay exactly as they are and simply never match a signed-in voter
+ * again. voterKey is a plain string under @@unique([tripId, voterKey]), so
+ * this needs no schema change.
  */
-function computeVoterKey(lineUserId: string, anonId: string): string {
-  if (lineUserId) return `line:${lineUserId}`;
-  if (anonId) return `anon:${anonId}`;
-  return `once:${crypto.randomUUID()}`;
+export function pollVoterKey(userId: string): string {
+  return `user:${userId}`;
 }
 
 /**
- * anonId is the dedup key for a resubmission with no verified LINE
- * session - a client-generated UUID persisted in the voter's browser
- * localStorage (see anonVoterId: in app/trip/poll/[id]/page.tsx), NOT
- * the typed name. Two different people can type the same or a
- * similarly-cased name; matching on that would silently let one
- * overwrite the other's vote. anonId has no such collision risk in
- * practice, same as lineUserId for a verified voter.
+ * Records `userId`'s vote on a trip, replacing their previous entry if they
+ * had one, and says which of the two happened: `created` is true only the
+ * first time this account votes on this trip (the poll page uses it to send
+ * a first-time voter on to the swipe step).
+ *
+ * The INSERT ... ON CONFLICT DO NOTHING behind createMany's skipDuplicates
+ * is what decides "first": the @@unique([tripId, voterKey]) constraint, not
+ * an application-level look-before-you-write, so two overlapping requests
+ * from one voter (a double-tap) can neither both create a row nor both
+ * report `created`. The loser of that race takes the update below.
  */
 export async function addPollVote(
   tripId: string,
   vote: PollVote,
-  anonId: string
-): Promise<PollVote[]> {
-  const resolvedAnonId = vote.lineUserId ? "" : anonId;
-  const voterKey = computeVoterKey(vote.lineUserId, resolvedAnonId);
+  userId: string
+): Promise<{ votes: PollVote[]; created: boolean }> {
+  const voterKey = pollVoterKey(userId);
+  const entry = {
+    name: vote.name,
+    startDate: vote.startDate,
+    endDate: vote.endDate,
+    wishlist: vote.wishlist,
+    vibes: vote.vibes,
+    submittedAt: new Date(vote.submittedAt),
+  };
 
-  // One vote per voter per trip - a resubmission (a double-tap on the
-  // button, or someone changing their mind and voting again) replaces
-  // their previous entry instead of appending a duplicate. This is a
-  // single atomic INSERT ... ON CONFLICT DO UPDATE against the
-  // @@unique([tripId, voterKey]) constraint in prisma/schema.prisma, so
-  // two concurrent requests from the same voter (a genuine double-tap
-  // firing overlapping requests) can't both pass a "no existing row"
-  // check and each insert - the database itself serializes them, unlike
-  // an application-level check-then-write.
-  await prisma.pollVote.upsert({
-    where: { tripId_voterKey: { tripId, voterKey } },
-    create: {
-      tripId,
-      voterKey,
-      name: vote.name,
-      lineUserId: vote.lineUserId,
-      anonId: resolvedAnonId,
-      startDate: vote.startDate,
-      endDate: vote.endDate,
-      wishlist: vote.wishlist,
-      vibes: vote.vibes,
-      submittedAt: new Date(vote.submittedAt),
-    },
-    update: {
-      name: vote.name,
-      startDate: vote.startDate,
-      endDate: vote.endDate,
-      wishlist: vote.wishlist,
-      vibes: vote.vibes,
-      submittedAt: new Date(vote.submittedAt),
-    },
+  const inserted = await prisma.pollVote.createMany({
+    data: [{ tripId, voterKey, ...entry }],
+    skipDuplicates: true,
   });
+  const created = inserted.count === 1;
 
-  return getPollVotes(tripId);
+  if (!created) {
+    await prisma.pollVote.update({
+      where: { tripId_voterKey: { tripId, voterKey } },
+      data: entry,
+    });
+  }
+
+  return { votes: await getPollVotes(tripId), created };
+}
+
+/** Whether `userId` already has an entry on this trip. */
+export async function hasPollVote(tripId: string, userId: string): Promise<boolean> {
+  const row = await prisma.pollVote.findUnique({
+    where: { tripId_voterKey: { tripId, voterKey: pollVoterKey(userId) } },
+    select: { id: true },
+  });
+  return row !== null;
 }
 
 // ---------------------------------------------------------------------
