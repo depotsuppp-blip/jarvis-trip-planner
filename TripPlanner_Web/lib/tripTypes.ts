@@ -90,16 +90,29 @@ export interface Itinerary {
 }
 
 // ---------------------------------------------------------------------
-// Swipe deck (Phase 2 "pick the places you'd love" step) - see
-// GET /api/places/deck, POST/GET /api/trip/swipe, and
-// components/trip/SwipeDeck.tsx.
+// Swipe deck (Phase 2 taste-profile step: swipe the same worldwide set of
+// places to show which kinds of place you love) - see GET /api/places/deck,
+// POST/GET /api/trip/swipe, and components/trip/SwipeDeck.tsx.
 // ---------------------------------------------------------------------
 
 /** Mirrors the SwipeAction enum in prisma/schema.prisma. */
 export type SwipeChoice = "LIKE" | "DISLIKE";
 
-/** Which of the deck's three searches surfaced a place - see lib/placeDeck.ts. */
-export type DeckPlaceCategory = "attraction" | "restaurant" | "cafe";
+/**
+ * The taste a deck place was dealt to measure ("do they like nature? shopping?")
+ * - one per seed search in DECK_CATEGORIES, see lib/placeDeck.ts. Our own
+ * label for why the card is in the deck, not Google's classification of the
+ * place (a mall can turn up under "markets").
+ */
+export type DeckPlaceCategory =
+  | "history"
+  | "shopping"
+  | "nature"
+  | "markets"
+  | "art"
+  | "food"
+  | "cafes"
+  | "nightlife";
 
 /**
  * One card in the swipe deck. `id` is Google's own place id - the only
@@ -112,6 +125,12 @@ export interface DeckPlace {
   id: string;
   name: string;
   category: DeckPlaceCategory;
+  /**
+   * The major city the card's seed search was run in (e.g. "Rome") - our own
+   * curated value rather than Google content. The deck spans the world, so
+   * this is where a card says where in it the place is.
+   */
+  city: string;
   /** Google's own label for the place's primary type (e.g. "Thai restaurant"). */
   categoryLabel: string;
   rating: number | null;

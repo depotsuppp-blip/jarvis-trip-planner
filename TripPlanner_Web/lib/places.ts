@@ -337,26 +337,23 @@ interface DeckPlacesResponse {
 }
 
 /**
- * One Text Search for the swipe deck. `includedType` (a Place Types (New)
- * value such as "cafe") only BIASES results toward that type - strict
- * filtering is deliberately off, since a strict "tourist_attraction"
- * filter would hide temples, museums and parks a traveler would count as
- * attractions. English labels are requested explicitly so the cards read
- * consistently regardless of the destination's local language.
+ * One Text Search for the swipe deck. `query` is a plain-language seed such
+ * as "quiet nature spots in Vancouver" (see DECK_CATEGORIES in
+ * lib/placeDeck.ts). No place type is passed: the theme and city in the text
+ * already say what to find, and a type would only bias the ranking - while a
+ * strict one would hide results a traveler counts under the theme (a
+ * waterfall is not a "park"). English labels are requested explicitly so the
+ * cards read consistently whatever language a city's own listings use.
  *
- * Text Search bills per request, not per result, so asking for a full
+ * Text Search bills per request, not per result, so asking for a bigger
  * page (pageSize up to 20) costs the same as asking for a few - a bigger
  * pool just gives lib/placeDeck.ts more to filter (closed, photo-less)
- * before dealing the final deck.
+ * before dealing the final deck, at the price of a larger response.
  */
-export async function searchPlacesForDeck(
-  query: string,
-  includedType: string,
-  pageSize: number
-): Promise<DeckSearchPlace[]> {
+export async function searchPlacesForDeck(query: string, pageSize: number): Promise<DeckSearchPlace[]> {
   const data = await postPlacesRequestRaw<DeckPlacesResponse>(
     PLACES_TEXT_SEARCH_URL,
-    { textQuery: query, includedType, pageSize, languageCode: "en" },
+    { textQuery: query, pageSize, languageCode: "en" },
     DECK_FIELD_MASK
   );
 
