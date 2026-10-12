@@ -1,7 +1,8 @@
 """
 HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
 
-    POST /chat   { "prompt": "...", "history": [{ "role": "user"|"jarvis", "content": "..." }] }
+    POST /chat   { "prompt": "...", "history": [{ "role": "user"|"jarvis", "content": "..." }],
+                   "user_id": "...", "app_url": "..." }
               -> { "reply": "..." }
     GET  /health -> { "ok": true, "provider": "...", "model": "..." }
 
@@ -9,6 +10,14 @@ Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
 the brain remembered from the last one (LLMBrain.set_history). `history`
 is earlier turns only, oldest first, NOT including `prompt`.
+
+`user_id` (the signed-in person, TripPlanner_Web's User.id) and `app_url`
+(the web app's own origin) are optional and describe the CALLER, not the
+question: they are made available to the tools for the length of the request
+(request_context.py) and are what lets "plan a trip to Chiang Mai" create the
+trip for that person on that instance and answer with its link. A request
+without them is still a web chat - links are allowed in the reply - it just
+cannot plan a trip for anyone in particular.
 
 Run:  python api_server.py      (127.0.0.1:8000, local only)
 
@@ -36,6 +45,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import request_context
 from llm_brain import LLMBrain
 
 HOST = "127.0.0.1"
@@ -55,6 +65,8 @@ class HistoryTurn(BaseModel):
 class ChatRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
     history: list[HistoryTurn] = Field(default_factory=list, max_length=MAX_HISTORY_TURNS)
+    user_id: str = Field(default="", max_length=128)
+    app_url: str = Field(default="", max_length=300)
 
 
 class ChatResponse(BaseModel):
@@ -101,9 +113,17 @@ def chat(body: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
 
     turns = [("user" if t.role == "user" else "assistant", t.content) for t in body.history]
+    caller = request_context.RequestContext(
+        channel=request_context.CHANNEL_WEB,
+        user_id=body.user_id.strip(),
+        app_url=body.app_url.strip(),
+    )
     with _lock:
         brain.set_history(turns)
-        reply = brain.ask(body.prompt).strip()
+        # The context is current only while this request is being answered, on
+        # this thread - see request_context.py.
+        with request_context.use(caller):
+            reply = brain.ask(body.prompt).strip()
         # Nothing is carried to the next request; the caller owns the transcript.
         brain.set_history([])
 

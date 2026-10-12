@@ -34,6 +34,14 @@ function toRole(role: string): "user" | "jarvis" {
  * failure never loses it: that case answers 502 and the message stays in
  * the history.
  *
+ * The brain is told who is asking (the session's user id) and which origin
+ * this app is served from: its trip tool plans a trip FOR that person
+ * (personalized from their Taste Profile) by calling back into this instance
+ * (POST /api/trip/create), and the link it returns is built on the same
+ * origin. A reply may therefore contain that link - the hub page makes it
+ * clickable. The link itself is never a secret: opening it needs the same
+ * sign-in as any trip page.
+ *
  * Responses: 200 { conversationId, userMessage, reply }, 400 bad body, 401
  * signed out, 404 unknown conversation, 429 rate-limited, 502 brain failed,
  * 500 database failed.
@@ -100,7 +108,7 @@ export async function POST(request: NextRequest) {
 
   let replyText: string;
   try {
-    replyText = (await askJarvis(message, history)).trim();
+    replyText = (await askJarvis(message, history, { userId, appUrl: request.nextUrl.origin })).trim();
     if (!replyText) throw new Error("The brain returned an empty reply.");
   } catch (error) {
     console.error(`POST /api/chat: the brain failed for conversation ${conversation.id}:`, error);

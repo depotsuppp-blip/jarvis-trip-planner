@@ -8,7 +8,9 @@ anything that just needs to build a link a user will open doesn't need
 to pull in the Planner Agent machinery too.
 """
 
+import ipaddress
 import os
+from urllib.parse import urlsplit
 
 try:
     from dotenv import load_dotenv
@@ -47,6 +49,60 @@ def get_app_base_url() -> str:
     """Where TripPlanner_Web is deployed - defaults to DEFAULT_APP_URL."""
     _ensure_env_loaded()
     return (os.getenv("TRIP_PLANNER_APP_URL") or DEFAULT_APP_URL).strip()
+
+
+def _origin_of(url: str) -> str:
+    """'scheme://host[:port]' of an http(s) URL, or '' for anything else (no host, credentials, a bad port...)."""
+    try:
+        parts = urlsplit((url or "").strip())
+        port = parts.port
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        return ""
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    return f"{parts.scheme}://{host}" + (f":{port}" if port else "")
+
+
+def _is_local_host(host: str) -> bool:
+    """A loopback name or a private-network address - where a dev server lives."""
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private
+
+
+def resolve_api_base_url(requested: str = "") -> str:
+    """
+    The origin Trip Planner API calls go to, and links to the person are built on.
+
+    A web chat request names its own origin (`requested` - the app_url the
+    hub sends, see api_server.py) because the instance that must plan the
+    trip is the one the person is looking at: it has the new route, and the
+    database their account lives in. With nothing usable it is
+    get_app_base_url(), the configured deployment.
+
+    Honoured only when it is a plausible place for THIS deployment - a
+    loopback or private-network host (a `next dev` server) or the same host as
+    the configured or default app URL. Anything else, including a malformed
+    value, is ignored in favour of the configured one, so a request cannot point
+    Jarvis's signed calls at some other server. The result never ends in "/".
+    """
+    configured = get_app_base_url().rstrip("/")
+    origin = _origin_of(requested)
+    if not origin:
+        return configured
+
+    host = urlsplit(origin).hostname or ""
+    known_hosts = {urlsplit(url).hostname for url in (configured, DEFAULT_APP_URL)}
+    if _is_local_host(host) or host in known_hosts:
+        return origin
+
+    print(f"[TripPlanner] Ignoring app_url {ascii(origin)}: not a loopback, private-network or configured host.")
+    return configured
 
 
 def _is_production() -> bool:

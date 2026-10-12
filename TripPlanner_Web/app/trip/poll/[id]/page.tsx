@@ -427,7 +427,9 @@ export default function TripPollPage({
     return (
       <PlanView
         itinerary={generatedPlan}
-        headcount={votes.length}
+        // A plan Jarvis made straight from the chat has no votes at all: it is
+        // one person's trip, not "0 travelers".
+        headcount={Math.max(votes.length, 1)}
         dateLabel={lockedDateLabel}
         tripId={id}
         isAdmin={isAdmin}

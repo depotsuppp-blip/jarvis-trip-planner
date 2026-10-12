@@ -82,13 +82,49 @@ will reuse. A 'solo_draft' continuation will need its own prompt design
 (it has to incorporate the places the user pasted in) and does not exist
 yet either - deliberately not stubbed out ahead of that need.
 
+WEB CHAT AND THE TRIP API
+---------------------------
+The Jarvis hub in TripPlanner_Web (api_server.py) is a text chat, and
+"plan a trip to Chiang Mai" there has to END in a link the person can open,
+which none of the flows above did (they push to LINE, or only log). When
+request_context says the request came from the web chat,
+generate_trip_plan_async therefore runs synchronously and RETURNS the link:
+
+    'solo_blank'   POST {app}/api/trip/create (HMAC-signed, body-bound - see
+                   _post_trip_create) plans the whole trip right now,
+                   personalized from the signed-in person's Taste Profile
+                   (TasteSwipe), stores it and answers with its page. The
+                   tool result carries that link, and the model repeats it.
+    'consensus'    the poll is created as before, but its public voting link
+                   comes back in the chat. The private ORGANISER link (it
+                   carries the admin token, which locks the plan) is still
+                   pushed to LINE and NEVER put in the chat: the chat is
+                   stored in the database, and the whole point of storing only
+                   a hash of the token (lib/adminToken.ts) is that the raw
+                   value exists nowhere but in that one private message.
+    'solo_draft'   the draft-board link comes back in the chat.
+
+{app} is the origin the hub sent (resolve_api_base_url), not a fixed
+deployment: the instance the person is looking at is the one that has the
+route and the database their account lives in.
+
+The voice assistant is unchanged in shape - it has no signed-in person and no
+screen, so it still starts a background thread and pushes to LINE - except that
+'solo_blank' now asks the same /api/trip/create for a real plan and sends its
+link, instead of logging a Gemini itinerary and promising a link "in the next
+phase". Without TRIP_API_SECRET_KEY that old Gemini path still runs.
+
 PRIVACY CONSTRAINT - READ BEFORE TOUCHING starting_location
 -------------------------------------------------------------
 starting_location is the user's home, hotel, or wherever they currently
 are. It is CRITICAL that this never becomes a tracked value:
 
-    * generate_trip_plan_async takes no user or session id, so there is
-      nothing to key a stored value against even by accident.
+    * generate_trip_plan_async takes no user or session id as an argument,
+      so there is nothing to key a stored value against even by accident.
+      The one place that CAN see who is asking is the web chat's request
+      context (see "WEB CHAT AND THE TRIP API" below), which only attributes
+      a trip to its creator - the web branch never receives
+      starting_location at all, and the model is no longer even offered it.
     * It lives ONLY as a local variable, passed from
       generate_trip_plan_async into _plan_trip_task as a plain
       argument. Past that point it is READ NOWHERE - see below - so it
@@ -249,10 +285,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Optional
 
 # A transitive dependency of both google-genai and anthropic already
@@ -295,7 +334,8 @@ try:
 except ImportError:  # pragma: no cover - environment-dependent
     load_dotenv = None  # type: ignore[assignment]
 
-from plugins.trip_planner_config import build_liff_link, get_app_base_url
+import request_context
+from plugins.trip_planner_config import build_liff_link, get_app_base_url, resolve_api_base_url
 
 
 class GeminiRateLimitError(Exception):
@@ -313,6 +353,20 @@ class FinalizationRateLimitError(Exception):
 
 
 _VALID_PLANNING_TYPES = frozenset({"solo_blank", "solo_draft", "consensus"})
+
+# How many days a trip is planned for when nobody said - three is a trip
+# rather than a day out, and short enough to generate well inside the web
+# app's 60 s budget - and the most the Trip Planner app will plan
+# (lib/tripDates.ts's MAX_TRIP_DAYS; it clamps again on its side).
+DEFAULT_PLAN_DAYS = 3
+MAX_PLAN_DAYS = 14
+
+# (connect, read) seconds for POST /api/trip/create. Unlike every other call
+# here, the app runs a whole generation before it answers (two LLM calls,
+# Places, Routes: ~15-30 s measured, capped at its 60 s maxDuration), so the
+# read timeout is generous - the web chat's own limit, lib/jarvisBrain.ts's
+# BRAIN_TIMEOUT_MS, has to cover this plus the model's turns around it.
+_CREATE_TRIP_TIMEOUT = (5.0, 100.0)
 
 # See "MODEL / SDK CHOICE, AND QUOTA" above before changing this.
 GEMINI_PLANNER_MODEL = "gemini-flash-lite-latest"
@@ -668,9 +722,23 @@ def _run_planner_agent(prompt: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def _run_consensus_poll(destination: str, days: int) -> None:
+@dataclass
+class _ConsensusPoll:
+    """What _open_consensus_poll managed to do, so a caller can tell the user the truth."""
+
+    trip_id: str
+    # The admin credential was stored on the web app. False means nobody can
+    # ever lock this poll - the poll row may not even exist.
+    admin_stored: bool
+    # Each LINE message actually went out (the public link to forward; the
+    # private organiser link).
+    public_sent: bool = False
+    admin_sent: bool = False
+
+
+def _open_consensus_poll(destination: str, days: int, base_url: str) -> _ConsensusPoll:
     """
-    'consensus'`s entire background job: create a poll, mint its admin
+    The whole job of a 'consensus' trip: create a poll, mint its admin
     token, and send two LINE messages - the public voting link (safe to
     forward into a friend group) and a private admin link that alone can
     later trigger "Lock & Generate Plan" on TripPlanner_Web (see
@@ -692,12 +760,19 @@ def _run_consensus_poll(destination: str, days: int) -> None:
     TYPE FORKS BEFORE ANY DATA GATHERING" in the module docstring for
     why the real itinerary waits for a future webhook-driven
     continuation instead of being generated now.
+
+    Runs on the voice assistant's background thread (_run_consensus_poll)
+    and, synchronously, for the web chat (_plan_trip_for_web), which wants the
+    result to say what reached LINE. Only the LINE pushes are guarded: a
+    link that cannot be built (see assert_link_not_localhost_in_production)
+    raises, as it always has.
     """
     trip_id = str(uuid.uuid4())
     poll_url = build_liff_link(f"/trip/poll/{trip_id}")
 
     admin_token = secrets.token_urlsafe(32)
-    admin_token_stored = _create_poll_admin_token(trip_id, admin_token, get_app_base_url(), days)
+    admin_token_stored = _create_poll_admin_token(trip_id, admin_token, base_url, days)
+    poll = _ConsensusPoll(trip_id=trip_id, admin_stored=admin_token_stored)
 
     try:
         from plugins import line_notifier
@@ -708,6 +783,7 @@ def _run_consensus_poll(destination: str, days: int) -> None:
         )
         result = line_notifier.send_line_notification(message)
         print(f"[TripPlanner] Consensus poll notification for {destination}: {result}")
+        poll.public_sent = not str(result).startswith("ERROR")
 
         if admin_token_stored:
             admin_url = build_liff_link(f"/trip/poll/{trip_id}?admin={admin_token}")
@@ -717,6 +793,7 @@ def _run_consensus_poll(destination: str, days: int) -> None:
             )
             admin_result = line_notifier.send_line_notification(admin_message)
             print(f"[TripPlanner] Consensus poll admin link for {destination}: {admin_result}")
+            poll.admin_sent = not str(admin_result).startswith("ERROR")
         else:
             # The admin credential was never stored server-side - sending
             # the link anyway would hand out something that LOOKS like
@@ -729,11 +806,17 @@ def _run_consensus_poll(destination: str, days: int) -> None:
                 f"[TripPlanner] Skipped sending an admin link for {destination}'s poll - "
                 "the admin token could not be stored server-side."
             )
-    except Exception as exc:  # noqa: BLE001 - the thread ends either way
+    except Exception as exc:  # noqa: BLE001 - the caller ends either way
         print(
             f"[TripPlanner] Notifying about the {destination} poll failed: "
             f"{type(exc).__name__}: {exc}"
         )
+    return poll
+
+
+def _run_consensus_poll(destination: str, days: int) -> None:
+    """'consensus'`s entire background job for the voice assistant - see _open_consensus_poll."""
+    _open_consensus_poll(destination, days, get_app_base_url())
 
 
 def _run_solo_draft(destination: str) -> None:
@@ -781,9 +864,12 @@ def _plan_trip_task(
                      message, done.
         solo_draft   _run_solo_draft only - a draft-board link, one LINE
                      message, done.
-        solo_blank   Steps 1-6 below: gather data, call the Planner
-                     Agent, notify. The only path that spends Maps or
-                     Gemini quota.
+        solo_blank   _run_solo_trip_via_api when the Trip Planner app is
+                     configured (the plan is made there; one LINE message
+                     with its link), otherwise Steps 1-6 below: gather
+                     data, call the Planner Agent, notify. The Gemini
+                     steps are the only path that spends Maps or Gemini
+                     quota.
 
     Runs after generate_trip_plan_async has already returned, so nothing
     here can reach the caller any more - the LINE push is the only
@@ -807,7 +893,13 @@ def _plan_trip_task(
         _run_solo_draft(destination)
         return
 
-    # planning_type == "solo_blank" from here on.
+    # planning_type == "solo_blank" from here on. With the Trip Planner app
+    # reachable (TRIP_API_SECRET_KEY set) the plan is made THERE and the user
+    # gets its link; the Gemini steps below only run when it is not configured.
+    if _trip_api_configured():
+        _run_solo_trip_via_api(destination, head_count, days)
+        return
+
     maps_key = (os.getenv("GOOGLE_MAPS_API_KEY") or "").strip()
 
     try:
@@ -898,6 +990,64 @@ def _plan_trip_task(
         )
 
 
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _extract_trip_id(text: str) -> str:
+    """
+    The trip id in what the model or user passed: the id itself, or a poll
+    link that contains it. People paste links into the chat ("is
+    https://.../trip/poll/<id> done?"), and the id is all that matters in
+    them - anything else in the link (an ?admin= token) is dropped, not kept.
+    Text with no UUID in it is returned stripped and unchanged.
+    """
+    text = (text or "").strip()
+    found = _UUID_RE.search(text)
+    return found.group(0).lower() if found else text
+
+
+def _clean_vibe(vibe: Any) -> str:
+    """'🛍️ Shopping' -> 'Shopping': the poll's vibe labels start with an emoji a spoken reply would mangle."""
+    return re.sub(r"[^\w\s/&-]", "", str(vibe)).strip()
+
+
+def _describe_poll_status(trip_id: str, poll_data: dict[str, Any]) -> str:
+    """
+    One sentence about a poll, from the payload GET /api/poll/<id> returns
+    (`summary.totalVotes`, `summary.topVibes`, `locked`) - what
+    check_poll_status_async hands the model to say out loud.
+    """
+    summary = poll_data.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+
+    try:
+        total = int(summary.get("totalVotes") or 0)
+    except (TypeError, ValueError):
+        total = 0
+
+    top = [
+        _clean_vibe(entry.get("vibe"))
+        for entry in (summary.get("topVibes") or [])
+        if isinstance(entry, dict) and entry.get("vibe")
+    ]
+    top = [vibe for vibe in top if vibe][:3]
+
+    if poll_data.get("locked") is True:
+        return (
+            f"The poll for trip {trip_id} is already locked and its plan has been "
+            "generated, so there is nothing left to finalize."
+        )
+    if total == 0:
+        return f"Nobody has voted on trip {trip_id} yet."
+
+    who = "1 person has" if total == 1 else f"{total} people have"
+    sentence = f"{who} voted on trip {trip_id} so far."
+    if top:
+        sentence += f" The top vibes are {', '.join(top)}."
+    return sentence
+
+
 def check_poll_status_async(trip_id: str) -> str:
     """
     Reports how a consensus poll is going, ahead of finalizing a plan.
@@ -905,7 +1055,7 @@ def check_poll_status_async(trip_id: str) -> str:
     This is Step 1 of the two-step consensus finalization rule in
     llm_brain.py's SYSTEM_PROMPT: the model must call this, speak the
     count, and get the user's explicit confirmation before ever calling
-    generate_trip_plan_async to actually generate a plan for a trip that
+    finalize_trip_plan_async to actually generate a plan for a trip that
     already has a poll running. Named with the _async suffix for
     consistency with generate_trip_plan_async, but there is no thread
     here - the model needs this answer synchronously to speak it and ask
@@ -913,21 +1063,26 @@ def check_poll_status_async(trip_id: str) -> str:
     llm_brain.py), so it returns its result directly rather than
     backgrounding anything.
 
-    Returns MOCK data on purpose - this tool answers a quick "how's the
-    poll doing" check ahead of a confirmation question, not a real
-    finalization. finalize_trip_plan_async below is the function that
-    actually reads GET /api/poll/<trip_id> and generates a plan from it;
-    this one stays a fast, fixed string so Step 2 of the two-step rule
-    never waits on a network call just to ask "should I proceed?".
+    Reads the poll for real: a signed GET /api/poll/<trip_id> on the web app
+    the request came from (the same call finalize_trip_plan_async makes).
+    This used to return a FIXED mock string ("4 users joined...") whatever
+    the trip, so the user was asked to confirm a vote count nobody had
+    counted. One short HTTP read (3 s connect, 10 s read) is the price of
+    the count being true; if it cannot be read, that is said plainly instead.
     """
-    trip_id = (trip_id or "").strip()
+    trip_id = _extract_trip_id(trip_id)
     if not trip_id:
         return "ERROR: I need a trip id to check the poll status."
 
-    return (
-        f"The poll for trip {trip_id} has 4 users joined. "
-        "Top vibes are Cafe Hopping and Photo Spots."
-    )
+    context = request_context.current()
+    base_url = resolve_api_base_url(context.app_url if context else "")
+    poll_data = _fetch_poll_data(trip_id, base_url)
+    if not isinstance(poll_data, dict):
+        return (
+            f"ERROR: I couldn't read the poll for trip {trip_id} from the Trip Planner app "
+            f"at {base_url} (the console says why). Tell the user plainly; do not invent a vote count."
+        )
+    return _describe_poll_status(trip_id, poll_data)
 
 
 # ---------------------------------------------------------------------
@@ -939,7 +1094,9 @@ def check_poll_status_async(trip_id: str) -> str:
 # ---------------------------------------------------------------------
 
 
-def _sign_request(method: str, path: str, secret: str) -> tuple[str, str]:
+def _sign_request(
+    method: str, path: str, secret: str, body: Optional[bytes] = None
+) -> tuple[str, str]:
     """
     (ts, sig) for an HMAC-authenticated call to TripPlanner_Web's Next.js
     API - must match the format the corresponding route's
@@ -947,9 +1104,17 @@ def _sign_request(method: str, path: str, secret: str) -> tuple[str, str]:
     HMAC-SHA256, hex. TRIP_API_SECRET_KEY here and API_SECRET_KEY on the
     Next.js side are two env var names for the one shared secret - both
     must hold the identical value or every signature will mismatch.
+
+    With `body` (the exact bytes about to be sent) the signed string also
+    ends in ".{sha256(body) as hex}" - lib/serverAuth.ts on the Next.js side.
+    Used by POST /api/trip/create, whose body carries the user the trip is
+    for: a captured signature must not be replayable with a different one.
+    The older routes sign no body and are called without it.
     """
     ts = str(int(time.time()))
     message = f"{ts}.{method}.{path}"
+    if body is not None:
+        message += f".{hashlib.sha256(body).hexdigest()}"
     sig = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
     return ts, sig
 
@@ -1060,6 +1225,294 @@ def _fetch_poll_data(trip_id: str, base_url: str) -> Optional[dict[str, Any]]:
     except ValueError as exc:
         print(f"[TripPlanner] finalize: poll response from {url} was not valid JSON: {exc}")
         return None
+
+
+# ---------------------------------------------------------------------
+# The Trip Planner web app as the planner - POST /api/trip/create
+# ---------------------------------------------------------------------
+
+
+class TripApiError(Exception):
+    """
+    The Trip Planner app could not plan the trip. str(exc) is a plain
+    reason, safe to hand to the model and the user (it never contains the
+    secret).
+    """
+
+
+def _log(message: str) -> None:
+    """
+    print() that cannot raise on the text it is given.
+
+    The log lines of the web-chat path carry what the USER typed (a
+    destination) and what the web app answered (an error that quotes it), and
+    either can be Thai. A Windows console on a legacy codepage - or stdout
+    redirected to a file - raises UnicodeEncodeError on that, and the
+    module's own notes record exactly that failure after a call had already
+    succeeded. Here it would fail a tool call over a log line, so anything the
+    stream cannot encode is written as a \\uXXXX escape instead.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(message.encode(encoding, errors="backslashreplace").decode(encoding))
+
+
+def _trip_api_configured() -> bool:
+    """True when this process can sign calls to the Trip Planner app at all."""
+    _ensure_env_loaded()
+    return requests is not None and bool((os.getenv("TRIP_API_SECRET_KEY") or "").strip())
+
+
+def _explain_create_failure(status: int, data: dict[str, Any], base_url: str) -> str:
+    """What a non-201 answer from POST /api/trip/create means, in a sentence."""
+    message = data.get("error") if isinstance(data.get("error"), str) else ""
+    message = message.strip().rstrip(".")
+
+    if status in (401, 503):
+        return (
+            f"{message or 'the Trip Planner app rejected the request'} "
+            "(TRIP_API_SECRET_KEY in Jarvis's .env must equal API_SECRET_KEY in TripPlanner_Web/.env.local)"
+        )
+    if status == 404 and not message:
+        # Next's own HTML 404 page: no JSON, no "error" field.
+        return (
+            f"the Trip Planner app at {base_url} has no trip-creation route, so it is an "
+            "older version (restart it, or deploy the latest)"
+        )
+    if message:
+        return message
+    return f"the Trip Planner app answered HTTP {status}"
+
+
+def _post_trip_create(
+    base_url: str, user_id: str, destination: str, days: int, head_count: int
+) -> dict[str, Any]:
+    """
+    POST {base_url}/api/trip/create - asks the Trip Planner app to plan ONE
+    trip to `destination` right now (the pipeline in
+    TripPlanner_Web/lib/tripGeneration.ts, personalized from `user_id`'s Taste
+    Profile when there is one) and store it. Blocks until the plan exists:
+    ~15-30 s, so only the web chat's synchronous path and background threads
+    call it.
+
+    Authenticated like the admin-token call, with one addition: the signature
+    also covers the request body (see _sign_request), because the body names
+    the user the trip is for. `user_id` "" plans for nobody in particular
+    (the voice assistant).
+
+    Returns the app's answer - {tripId, path, destination, days, stops,
+    personalized, taste} - and raises TripApiError for every failure: not
+    configured, unreachable, timed out, or any non-201 answer (the app's own
+    reason is passed on: no real places for that destination, rate-limited...).
+    """
+    _ensure_env_loaded()
+    if requests is None:
+        raise TripApiError("the requests package is not installed on this machine")
+    secret = (os.getenv("TRIP_API_SECRET_KEY") or "").strip()
+    if not secret:
+        raise TripApiError(
+            "TRIP_API_SECRET_KEY is not set in Jarvis's .env, so Jarvis cannot call the Trip Planner app "
+            "(it must equal API_SECRET_KEY in TripPlanner_Web/.env.local)"
+        )
+
+    path = "/api/trip/create"
+    payload: dict[str, Any] = {"destination": destination, "days": days, "headCount": head_count}
+    if user_id:
+        payload["userId"] = user_id
+    # The exact bytes that are signed are the exact bytes that are sent -
+    # json=payload would let requests serialize it a second time, differently.
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ts, sig = _sign_request("POST", path, secret, body)
+
+    try:
+        response = requests.post(
+            f"{base_url}{path}",
+            data=body,
+            headers={"Content-Type": "application/json", "X-Ts": ts, "X-Sig": sig},
+            timeout=_CREATE_TRIP_TIMEOUT,
+        )
+    except requests.exceptions.Timeout as exc:
+        _log(f"[TripPlanner] create-trip: timed out ({base_url}{path}): {exc}")
+        raise TripApiError("the Trip Planner app took too long to plan it") from exc
+    except requests.exceptions.RequestException as exc:
+        _log(f"[TripPlanner] create-trip: request failed ({base_url}{path}): {type(exc).__name__}: {exc}")
+        raise TripApiError(f"the Trip Planner app at {base_url} is not reachable (is it running?)") from exc
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+
+    if response.status_code != 201:
+        _log(
+            f"[TripPlanner] create-trip: HTTP {response.status_code} from {base_url}{path}: "
+            f"{str(data.get('error') or response.text[:200])[:200]}"
+        )
+        raise TripApiError(_explain_create_failure(response.status_code, data, base_url))
+
+    trip_id, page = data.get("tripId"), data.get("path")
+    if not isinstance(trip_id, str) or not isinstance(page, str) or not page.startswith("/trip/poll/"):
+        raise TripApiError("the Trip Planner app answered, but not with a trip link")
+    return data
+
+
+def _describe_created_trip(data: dict[str, Any], url: str, requested_days: int, has_user: bool) -> str:
+    """
+    The tool result for a plan the app made: what the model needs to answer
+    in a sentence or two - that it is ready, the link, and how personal it
+    is. The link is the point of the answer, so the instruction to repeat
+    it exactly comes with it.
+    """
+    destination = str(data.get("destination") or "that destination")
+    try:
+        days = int(data.get("days") or requested_days)
+    except (TypeError, ValueError):
+        days = requested_days
+    stops = data.get("stops") if isinstance(data.get("stops"), int) else 0
+
+    taste = data.get("taste") if isinstance(data.get("taste"), dict) else {}
+    loved = [str(label) for label in (taste.get("loved") or [])]
+    avoided = [str(label) for label in (taste.get("avoided") or [])]
+
+    if data.get("personalized") is True:
+        taste_note = "It was tuned to this person's saved taste profile"
+        if loved:
+            taste_note += f": they love {', '.join(loved)}"
+            taste_note += f" and pass on {', '.join(avoided)}" if avoided else ""
+        elif avoided:
+            taste_note += f": they pass on {', '.join(avoided)}"
+        taste_note += "."
+    elif has_user:
+        taste_note = (
+            "This person has no usable taste profile saved yet, so it is a general plan; "
+            "finishing the taste quiz in the Trip Planner app personalizes future ones."
+        )
+    else:
+        taste_note = "No signed-in account came with this request, so it is a general plan."
+
+    capped = ""
+    if days < requested_days:
+        capped = f" The planner's longest trip is {MAX_PLAN_DAYS} days, so that is how many it made."
+
+    return (
+        f"DONE: the {days}-day trip plan for {destination} is ready"
+        f"{f' ({stops} stops)' if stops else ''}. Link: {url}\n"
+        f"{taste_note}{capped}\n"
+        "Tell the user it is ready in one or two short sentences and include the link exactly as written "
+        "above - never shorten, rewrite or invent a link. No travel dates are set; say so only if they ask."
+    )
+
+
+def _plan_trip_for_web(
+    context: request_context.RequestContext,
+    destination: str,
+    planning_type: str,
+    head_count: int,
+    days: int,
+) -> str:
+    """
+    generate_trip_plan_async for a request from the web chat: synchronous,
+    and it returns the LINK - see "WEB CHAT AND THE TRIP API" in the module
+    docstring. Every failure becomes an "ERROR: ..." result the model reads
+    and relays; nothing here raises.
+    """
+    base_url = resolve_api_base_url(context.app_url)
+
+    if planning_type == "solo_draft":
+        # A draft board is only a link until the person pastes something into
+        # it (no row exists before that), exactly as in _run_solo_draft.
+        draft_url = f"{base_url}/trip/draft/{uuid.uuid4()}"
+        _log(f"[TripPlanner] Web draft board for {destination}: {draft_url}")
+        return (
+            f"DONE: a draft board for the {destination} trip is ready. Link: {draft_url}\n"
+            "Tell the user in one short sentence that they can paste the places they like there, and "
+            "include the link exactly as written above."
+        )
+
+    if planning_type == "consensus":
+        try:
+            poll = _open_consensus_poll(destination, days, base_url)
+        except Exception as exc:  # noqa: BLE001 - e.g. a localhost link refused in production
+            _log(f"[TripPlanner] Web poll for {destination} failed: {type(exc).__name__}: {exc}")
+            return (
+                f"ERROR: the poll for the {destination} trip could not be created ({type(exc).__name__}). "
+                "Tell the user plainly; do not claim a poll exists and do not invent a link."
+            )
+        if not poll.admin_stored:
+            return (
+                f"ERROR: the poll for the {destination} trip could not be created - the Trip Planner app "
+                f"at {base_url} did not accept it (the console says why; usually TRIP_API_SECRET_KEY and "
+                "API_SECRET_KEY differ, or the app is not running). Tell the user plainly; do not claim a "
+                "poll exists and do not invent a link."
+            )
+        poll_url = f"{base_url}/trip/poll/{poll.trip_id}"
+        # The raw admin token is in the private LINE message only - never in
+        # this result, because the model repeats results and the chat is stored.
+        if poll.admin_sent:
+            line_note = (
+                "The voting link to forward to the group and the private organizer link (the only one that can "
+                "lock the plan) were sent to LINE."
+            )
+        else:
+            line_note = (
+                "The private organizer link, which is the only way to lock the plan, could NOT be sent to "
+                "LINE (check the LINE settings), so tell the user this poll cannot be locked yet."
+            )
+        return (
+            f"DONE: a voting poll for the {destination} trip is ready. Link: {poll_url}\n"
+            f"{line_note}\n"
+            "Tell the user in one or two short sentences, and include the link exactly as written above."
+        )
+
+    # solo_blank: the app plans the whole trip now.
+    try:
+        data = _post_trip_create(base_url, context.user_id, destination, days, head_count)
+    except TripApiError as exc:
+        _log(f"[TripPlanner] Web trip to {destination} failed: {exc}")
+        return (
+            f"ERROR: the trip to {destination} could not be planned - {exc}. "
+            "Tell the user plainly what went wrong; do not claim a plan exists and do not invent a link."
+        )
+    url = f"{base_url}{data['path']}"
+    _log(f"[TripPlanner] Web trip to {destination} ready: {url}")
+    return _describe_created_trip(data, url, days, bool(context.user_id))
+
+
+def _run_solo_trip_via_api(destination: str, head_count: int, days: int) -> None:
+    """
+    'solo_blank' for the voice assistant when the Trip Planner app is
+    configured: the plan is made by the app (POST /api/trip/create) and one
+    LINE message carries its link. Runs on _plan_trip_task's background
+    thread; the user is not waiting, so a failure is reported by LINE too,
+    never silently. Plans for nobody in particular - a voice assistant has no
+    signed-in account whose Taste Profile could be used.
+    """
+    base_url = resolve_api_base_url("")
+    try:
+        data = _post_trip_create(base_url, "", destination, days, head_count)
+        link = build_liff_link(str(data["path"]))
+        message = (
+            f"แผนทริป {destination} จำนวน {data.get('days', days)} วัน ของคุณเสร็จแล้วครับ! "
+            f"ดูแผนได้ที่นี่: {link}"
+        )
+    except Exception as exc:  # noqa: BLE001 - TripApiError, or a link refused in production
+        _log(f"[TripPlanner] Solo trip to {destination} failed: {type(exc).__name__}: {exc}")
+        message = (
+            f"แผนทริป {destination} มีปัญหาระหว่างการวางแผนครับ ({exc}) "
+            "ลองสั่งให้วางแผนใหม่อีกครั้งได้เลยครับ"
+        )
+
+    try:
+        from plugins import line_notifier
+
+        result = line_notifier.send_line_notification(message)
+        _log(f"[TripPlanner] Solo trip notification for {destination}: {result}")
+    except Exception as exc:  # noqa: BLE001 - the thread ends either way
+        _log(
+            f"[TripPlanner] Notifying about the {destination} trip failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _build_finalization_prompt(poll_data: dict[str, Any]) -> str:
@@ -1244,7 +1697,7 @@ _finalizing_trip_ids: set[str] = set()
 _finalizing_trip_ids_lock = threading.Lock()
 
 
-def _finalize_trip_task(trip_id: str) -> None:
+def _finalize_trip_task(trip_id: str, base_url: str) -> None:
     """
     Runs entirely on its own thread - same "WHY THIS MUST NOT BLOCK"
     reasoning as _plan_trip_task above: an HTTP fetch plus one
@@ -1253,21 +1706,23 @@ def _finalize_trip_task(trip_id: str) -> None:
     function is called from the voice assistant's supervisor loop by
     way of finalize_trip_plan_async.
 
+    `base_url` is the web app to read the poll from, resolved on the
+    calling thread (a new thread has no request context of its own).
+
     Always releases trip_id from _finalizing_trip_ids before returning,
     however it exits - see finalize_trip_plan_async, which is what
     reserves it.
     """
     try:
-        _finalize_trip_task_body(trip_id)
+        _finalize_trip_task_body(trip_id, base_url)
     finally:
         with _finalizing_trip_ids_lock:
             _finalizing_trip_ids.discard(trip_id)
 
 
-def _finalize_trip_task_body(trip_id: str) -> None:
+def _finalize_trip_task_body(trip_id: str, base_url: str) -> None:
     """The actual finalization work - see _finalize_trip_task, which wraps this to guarantee release."""
     _ensure_env_loaded()
-    base_url = get_app_base_url()
 
     print(f"[TripPlanner] Finalizing trip {trip_id}: reading the poll from {base_url}...")
 
@@ -1377,9 +1832,14 @@ def finalize_trip_plan_async(trip_id: str) -> str:
     llm_brain.py's SYSTEM_PROMPT - after check_poll_status_async has
     already reported the vote count and the user has confirmed.
     """
-    trip_id = (trip_id or "").strip()
+    trip_id = _extract_trip_id(trip_id)
     if not trip_id:
         return "ERROR: I need a trip id to finalize a plan."
+
+    # Resolved here, on the calling thread: it is the one that knows which web
+    # app the request came from (check_poll_status_async read the same one).
+    context = request_context.current()
+    base_url = resolve_api_base_url(context.app_url if context else "")
 
     with _finalizing_trip_ids_lock:
         if trip_id in _finalizing_trip_ids:
@@ -1391,7 +1851,7 @@ def finalize_trip_plan_async(trip_id: str) -> str:
 
     thread = threading.Thread(
         target=_finalize_trip_task,
-        args=(trip_id,),
+        args=(trip_id, base_url),
         name=f"trip-finalize-{trip_id}",
         daemon=True,
     )
@@ -1405,28 +1865,37 @@ def finalize_trip_plan_async(trip_id: str) -> str:
 
 
 def generate_trip_plan_async(
-    starting_location: str,
-    destination: str,
+    starting_location: str = "",
+    destination: str = "",
     planning_type: str = "solo_blank",
     head_count: int = 1,
-    days: int = 1,
+    days: int = DEFAULT_PLAN_DAYS,
 ) -> str:
     """
-    Assigns the Planner Agent to build a trip and returns immediately.
+    Plans a trip. Only the destination is needed.
 
-    MUST NOT wait for the plan to finish - see "WHY THIS MUST NOT BLOCK"
-    above. The only work done on the calling thread is argument cleanup
-    and Thread.start(); every network call and the Gemini call happen in
-    _plan_trip_task, on a thread this function never joins.
+    From the web chat (request_context says so) this runs SYNCHRONOUSLY and
+    returns the link to the finished plan, poll or draft board - see "WEB
+    CHAT AND THE TRIP API" in the module docstring. The person is watching a
+    chat, a link is the answer, and the work is one call to the Trip Planner
+    app (~15-30 s for a plan).
 
-    starting_location is read here, handed to the thread as a plain
-    argument, and never touched again by this function - see the
-    module's privacy constraint.
+    From the voice assistant it MUST NOT wait for the plan to finish - see
+    "WHY THIS MUST NOT BLOCK" above. The only work done on the calling
+    thread is argument cleanup and Thread.start(); every network call and
+    the Gemini call happen in _plan_trip_task, on a thread this function
+    never joins.
+
+    starting_location is optional and, on the web path, never read. On the
+    voice path it is read here, handed to the thread as a plain argument,
+    and never touched again by this function - see the module's privacy
+    constraint. It used to be required, and the model was told to ask for it,
+    though nothing ever used it beyond the acknowledgement sentence.
     """
     starting_location = (starting_location or "").strip()
-    destination = (destination or "").strip()
-    if not starting_location or not destination:
-        return "ERROR: I need both a starting location and a destination to plan a trip."
+    destination = " ".join((destination or "").split())
+    if not destination:
+        return "ERROR: I need a destination to plan a trip."
 
     planning_type = (planning_type or "solo_blank").strip().lower()
     if planning_type not in _VALID_PLANNING_TYPES:
@@ -1440,7 +1909,11 @@ def generate_trip_plan_async(
     try:
         days = max(1, int(days))
     except (TypeError, ValueError):
-        days = 1
+        days = DEFAULT_PLAN_DAYS
+
+    context = request_context.current()
+    if context is not None and context.is_web:
+        return _plan_trip_for_web(context, destination, planning_type, head_count, days)
 
     thread = threading.Thread(
         target=_plan_trip_task,
@@ -1454,10 +1927,10 @@ def generate_trip_plan_async(
         f"[TripPlanner] Assigned the Planner Agent for a {days}-day trip to "
         f"{destination} ({planning_type}, {head_count} pax)."
     )
+    route = f"from {starting_location} to {destination}" if starting_location else f"to {destination}"
     return (
-        f"I've assigned the Planner Agent to organize your trip from "
-        f"{starting_location} to {destination}. I will notify you on LINE "
-        "when the plan is ready."
+        f"I've assigned the Planner Agent to organize your trip {route}. "
+        "I will notify you on LINE when the plan is ready."
     )
 
 

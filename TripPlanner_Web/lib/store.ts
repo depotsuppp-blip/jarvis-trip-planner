@@ -9,6 +9,7 @@
  */
 
 import { prisma } from "./prisma";
+import type { TasteRow } from "./tasteSummary";
 
 // ---------------------------------------------------------------------
 // Consensus poll votes - one trip id maps to a list of friends' entries
@@ -111,6 +112,37 @@ export async function hasPollVote(tripId: string, userId: string): Promise<boole
   return row !== null;
 }
 
+/**
+ * The accounts that voted on this trip - the User.id behind every vote whose
+ * voterKey is "user:<id>" (see pollVoterKey). A vote cast before signing in was
+ * required carries a "line:", "anon:" or "once:" key and belongs to no account,
+ * so it has no taste profile to look up and is simply not listed. Used to find
+ * whose Taste Profiles (getTasteSwipesForUsers) a group's plan is built from.
+ */
+export async function getPollVoterUserIds(tripId: string): Promise<string[]> {
+  const prefix = pollVoterKey("");
+  const rows = await prisma.pollVote.findMany({ where: { tripId }, select: { voterKey: true } });
+  return rows.filter((row) => row.voterKey.startsWith(prefix)).map((row) => row.voterKey.slice(prefix.length));
+}
+
+// ---------------------------------------------------------------------
+// Taste Profile - the finished swipe quiz, read when a plan is generated
+// ---------------------------------------------------------------------
+
+/**
+ * Every saved taste-quiz answer for these accounts (TasteSwipe rows - written
+ * by POST /api/taste-profile when someone finishes the deck). Only the fields
+ * lib/tasteSummary.ts's summarizeTaste reads: the place id is never needed here.
+ * An account that never finished the quiz simply contributes no rows.
+ */
+export async function getTasteSwipesForUsers(userIds: string[]): Promise<TasteRow[]> {
+  if (userIds.length === 0) return [];
+  return prisma.tasteSwipe.findMany({
+    where: { userId: { in: userIds } },
+    select: { userId: true, category: true, action: true },
+  });
+}
+
 // ---------------------------------------------------------------------
 // Solo draft board - one trip id maps to a single evolving text blob
 // ---------------------------------------------------------------------
@@ -154,6 +186,34 @@ export async function lockPoll(tripId: string): Promise<void> {
     create: { tripId, locked: true, lockedAt: new Date(), generating: false },
     update: { locked: true, lockedAt: new Date(), generating: false },
   });
+}
+
+/**
+ * Stores a plan that was generated straight away for one person (POST
+ * /api/trip/create - Jarvis's "plan a trip to X"), as a trip that is already
+ * locked: its itinerary in TripDraft, a locked Poll row carrying the requested
+ * length, and - when a signed-in person asked for it - their TripParticipant
+ * row, the only record of who made the trip.
+ *
+ * One transaction, and only after the plan exists: a failed generation leaves
+ * nothing behind. The Poll row has NO admin token (adminTokenHash stays ""), so
+ * nobody can lock it again or swap its stops through the admin routes - it needs
+ * neither, and verifyAdminToken treats "" as "nobody can authorize this trip".
+ * tripId must be new; reusing one throws on the unique key rather than
+ * overwriting somebody's plan.
+ */
+export async function createLockedTrip(args: {
+  tripId: string;
+  itineraryJson: string;
+  durationDays: number;
+  userId?: string;
+}): Promise<void> {
+  const { tripId, itineraryJson, durationDays, userId } = args;
+  await prisma.$transaction([
+    prisma.tripDraft.create({ data: { tripId, text: itineraryJson } }),
+    prisma.poll.create({ data: { tripId, locked: true, lockedAt: new Date(), durationDays } }),
+    ...(userId ? [prisma.tripParticipant.create({ data: { userId, tripId } })] : []),
+  ]);
 }
 
 // ---------------------------------------------------------------------

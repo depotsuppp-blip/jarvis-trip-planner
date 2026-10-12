@@ -1,42 +1,35 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
 import { verifyAdminToken } from "@/lib/adminToken";
-import { FINALIZE_MODEL, FINALIZE_MAX_TOKENS } from "@/lib/llm";
-import {
-  computeTotalEstimatedCost,
-  formatItineraryForStorage,
-  parseStoredItinerary,
-  type Itinerary,
-  type ItineraryStop,
-} from "@/lib/itinerary";
-import { PlacesApiError, searchPlacesForSlot, searchPlacesText, type LatLng, type PlaceResult } from "@/lib/places";
+import { formatItineraryForStorage, parseStoredItinerary } from "@/lib/itinerary";
+import { PlacesApiError } from "@/lib/places";
 import { checkRateLimit } from "@/lib/rateLimit";
-import { computeDayRoute, computeDepartureTimeForDay, type TravelLeg } from "@/lib/routes";
-import { clampShortDescription, composeStopText, namesAgree } from "@/lib/stopCopy";
 import {
   claimPollForGeneration,
   getDraft,
   getPollDurationDays,
+  getPollVoterUserIds,
   getPollVotes,
   lockPoll,
   releasePollClaim,
   saveDraft,
 } from "@/lib/store";
-import { summarizePollVotes, type PollSummary } from "@/lib/tripSummary";
-import { computeBestTripWindow, resolveTripDays, type TripDateWindow } from "@/lib/tripDates";
-import { fetchWeatherSummary } from "@/lib/weather";
+import { loadTastePromptInput } from "@/lib/tasteForTrip";
+import { generateItinerary } from "@/lib/tripGeneration";
+import { summarizePollVotes } from "@/lib/tripSummary";
+import { computeBestTripWindow, resolveTripDays } from "@/lib/tripDates";
 
 // Two Haiku calls, N parallel Places calls, plus one Routes API call per
 // LEG (Stage 2.5 - see lib/routes.ts's per-leg dynamic travel mode),
 // plus one Weather API call, all in parallel within their stage. Measured
-// end to end against real successful Chiang Mai runs (see this route's
-// own [trigger-jarvis] stage logs): stage 1 (skeleton) 3.5-4.1s, stage
-// 1.5 (Places, all in parallel) 0.5-0.7s, stage 2 (final write)
-// 10.1-14.2s, stage 2.5 (Routes + weather, all in parallel) well under a
-// second regardless of trip length - stage 2's Haiku call, not Stage 2.5,
-// is what actually dominates. https://vercel.com/docs/functions/configuring-functions/duration.
+// end to end against real successful Chiang Mai runs (see the
+// [trigger-jarvis] stage logs lib/tripGeneration.ts writes): stage 1
+// (skeleton) 3.5-4.1s, stage 1.5 (Places, all in parallel) 0.5-0.7s, stage 2
+// (final write) 10.1-14.2s, stage 2.5 (Routes + weather, all in parallel)
+// well under a second regardless of trip length - stage 2's Haiku call, not
+// Stage 2.5, is what actually dominates. Reading the voters' Taste Profiles
+// is one indexed query before stage 1.
+// https://vercel.com/docs/functions/configuring-functions/duration.
 export const maxDuration = 60;
 
 // Locking a poll spends real LLM quota and (once LINE push-back exists -
@@ -46,530 +39,29 @@ export const maxDuration = 60;
 const TRIGGER_RATE_LIMIT = 3;
 const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
 
-// ---------------------------------------------------------------------
-// Stage 2's LLM-facing output shape - structurally similar to the
-// persisted Itinerary (lib/itinerary.ts), but stops carry placeIndex
-// (which of that slot's grounded candidates Claude used) instead of
-// travelFromPrevious/location - those are attached afterward, in code,
-// by enrichItineraryWithTravelTimes (Stage 2.5), never narrated by the
-// model.
-//
-// A stop is a NAME and ONE brief caption, never a paragraph: the plan view
-// shows the name in bold with the caption under it. A JSON schema can't
-// hold the model to a word count (and a zod .max() would fail the whole
-// generation the first time Haiku overshot it), so the limit is stated
-// three times instead - in these field descriptions, in buildFinalPrompt,
-// and in code (lib/stopCopy.ts's clampShortDescription, applied to
-// whatever comes back). The fields are ordered so the model commits to the
-// venue (placeIndex) before it writes about it.
-// ---------------------------------------------------------------------
-
-const ItineraryStopLLMSchema = z.object({
-  slotType: z.enum(["activity", "meal"]),
-  // 0-based index into the slot's candidate list (see formatSlotForPrompt)
-  // indicating exactly which real venue this stop is. -1 means "no real
-  // venue was available for this slot" (formatSlotForPrompt's NO REAL
-  // VENUES FOUND case) - any value outside the slot's actual candidate
-  // range is treated the same way by enrichItineraryWithTravelTimes, never
-  // trusted blindly.
-  placeIndex: z.number().int(),
-  // The chosen candidate's name as listed. Used as a cross-check only: the
-  // name that is stored is the Places candidate's own (see
-  // enrichItineraryWithTravelTimes), so a misspelled or invented one here
-  // can't reach the plan.
-  placeName: z
-    .string()
-    .describe("The chosen candidate's name copied exactly as listed, nothing else. Empty string when placeIndex is -1."),
-  shortDescription: z
-    .string()
-    .describe(
-      "ONE brief sentence of at most 15 words (aim for 8 to 12): what to do or why it is worth the stop. " +
-        "No second sentence, no list, no semicolon, no trailing period, and never the place name itself."
-    ),
-  // A realistic per-person cost in `currency` below, grounded in the
-  // candidate's real Places priceLevel (see formatSlotForPrompt) - null
-  // for a stop with no real venue to estimate from.
-  estimatedCostPerPerson: z.number().nullable(),
-});
-
-const ItineraryDayLLMSchema = z.object({
-  day: z.number(),
-  summary: z
-    .string()
-    .describe("A label of at most 6 words naming the day's theme, such as 'Old City and night markets'. Not a sentence."),
-  stops: z.array(ItineraryStopLLMSchema),
-});
-
-const ItineraryLLMSchema = z.object({
-  destination: z.string(),
-  days: z.array(ItineraryDayLLMSchema),
-  notes: z
-    .string()
-    .describe("Empty, or at most two short sentences (30 words in all) of practical advice such as dress code or booking."),
-  // The ISO 4217-ish currency code the model determined for the
-  // destination (e.g. "THB") - every stop's estimatedCostPerPerson is
-  // denominated in this same currency.
-  currency: z.string(),
-});
-
-type ItineraryLLM = z.infer<typeof ItineraryLLMSchema>;
-
-// ---------------------------------------------------------------------
-// Stage 1: activity skeleton - what KIND of place each part of each day
-// should be, and roughly where. No venue names at this stage - those
-// come from real Places data in stage 2, never from the model's own
-// recall.
-// ---------------------------------------------------------------------
-
-const ActivitySlotSchema = z.object({
-  slotType: z.enum(["activity", "meal"]),
-  // A search category, e.g. "cafe", "temple", "night market", "Thai
-  // restaurant", "viewpoint" - ignored by groundSkeleton when
-  // specificPlaceName is set (see below); otherwise never a specific
-  // venue name.
-  category: z.string(),
-  // Neighborhood/area to search near, e.g. "Nimman", "Old City". Ignored
-  // when specificPlaceName is set - a named search doesn't need an area.
-  area: z.string(),
-  // The exact venue name, when - and ONLY when - this slot exists to
-  // satisfy a specific place the group named in their wishlist (e.g.
-  // "คัตสึยะ" -> "Katsuya", romanized/translated into however it would
-  // appear in a map search) - see buildSkeletonPrompt's STRICT RULE.
-  // "" for every ordinary slot, where category+area are what's used
-  // instead. groundSkeleton searches by this name directly rather than
-  // by category+area when it's non-empty, and Stage 2's prompt (see
-  // formatSlotForPrompt) flags the slot so the model doesn't quietly
-  // substitute a different venue of the same general type.
-  specificPlaceName: z.string(),
-});
-
-const DaySkeletonSchema = z.object({
-  day: z.number(),
-  theme: z.string(),
-  slots: z.array(ActivitySlotSchema),
-});
-
-const ItinerarySkeletonSchema = z.object({
-  destination: z.string(),
-  days: z.array(DaySkeletonSchema),
-});
-
-type ItinerarySkeleton = z.infer<typeof ItinerarySkeletonSchema>;
-
-/**
- * Mirrors plugins/trip_planner.py's _build_finalization_prompt in intent
- * - reads the same pre-aggregated PollSummary shape
- * (lib/tripSummary.ts's summarizePollVotes) rather than re-tallying raw
- * votes. Unlike a "respond with ONLY a JSON object" prompt, this doesn't
- * need to ask for JSON at all - output_config.format below constrains
- * the response shape at the API level.
- *
- * Dates diverge from that Python prompt, though: this passes the actual
- * tripDays-day window computeBestTripWindow picked (the specific days
- * most voters overlap on), not the group's full combined date range, and
- * instructs the model to return exactly that many days. tripDays is the
- * organizer's actually-requested trip length (see lib/tripDates.ts's
- * resolveTripDays) - a 1-day request must produce a 1-day itinerary, not
- * a hardcoded 5.
- */
-function buildSkeletonPrompt(summary: PollSummary, tripWindow: TripDateWindow, tripDays: number): string {
-  const vibesText =
-    summary.topVibes.length > 0
-      ? summary.topVibes.map((v) => `${v.vibe} (${v.count} votes)`).join(", ")
-      : "No vibes selected yet.";
-  const wishlistText =
-    summary.wishlist.length > 0
-      ? summary.wishlist.join("; ")
-      : "No specific places suggested.";
-  const votersText = summary.voters.length > 0 ? summary.voters.join(", ") : "the group";
-  const nightsText = tripDays > 1 ? `${tripDays - 1} nights` : "no overnight stay";
-
-  return (
-    "Act as an Expert Travel Planner. Plan the STRUCTURE of a trip itinerary based on this consensus " +
-    "data from a group trip poll - a full, realistic, well-paced day, not a bare-minimum outline. You " +
-    "will fill in real venue names in a later step - for now, decide only what KIND of place each part " +
-    "of the day should be (or, for an exact wishlist request, WHICH exact place - see the STRICT RULE " +
-    "below), and roughly where. Infer a specific real destination city from the group's requested " +
-    "places and vibes. Resolve conflicting wishes by prioritizing the most popular vibes. Do not " +
-    "reference how the group gets to the destination or where they are coming from - start the " +
-    "itinerary from arrival.\n\n" +
-    `Group size: ${summary.totalVotes} people (${votersText}).\n` +
-    `Top vibes, most to least popular: ${vibesText}.\n` +
-    `Specific places requested by the group: ${wishlistText}.\n\n` +
-    `This trip is FIXED at exactly ${tripDays} day${tripDays === 1 ? "" : "s"} / ${nightsText}, ` +
-    `from ${tripWindow.startDate} to ${tripWindow.endDate} inclusive - the specific window that the ` +
-    `most voters (${tripWindow.voterCount} of ${summary.totalVotes}) can make, not the group's full ` +
-    "combined date range. You MUST return EXACTLY " +
-    `${tripDays} day object${tripDays === 1 ? "" : "s"} in the "days" array, numbered 1 through ` +
-    `${tripDays} in calendar order matching that window - never more, never fewer. The itinerary you ` +
-    `produce, end to end, MUST cover exactly ${tripDays} day${tripDays === 1 ? "" : "s"} - not fewer, ` +
-    "not more - regardless of how the group's individual votes were worded.\n\n" +
-    "For each day, structure it explicitly across Morning, Afternoon, and Evening, with AT LEAST 4 to " +
-    "6 stops total across the day (activities and meals combined) - a sparse day with only 1-3 stops " +
-    "is NOT acceptable. Fill logical gaps yourself: if there's a lull between two stops (for example " +
-    "after an active outing and before dinner), proactively insert a nearby cafe, gallery, park, or " +
-    "rest stop rather than leaving a long unplanned gap - a well-paced day has no dead time. For each " +
-    "slot, give: slotType (\"activity\" or \"meal\"), a short search category such as \"cafe\", " +
-    "\"temple\", \"night market\", \"Thai restaurant\", \"viewpoint\", or \"museum\" (NOT a specific " +
-    "venue name), and the neighborhood or area to look near.\n\n" +
-    "STRICT RULE - exact requests: if the group's wishlist above names a SPECIFIC place rather than a " +
-    "general category (a proper noun someone would search by name, e.g. \"คัตสึยะ\" or \"Central " +
-    "World\"), you MUST create a slot for that exact place and set specificPlaceName to the venue's " +
-    "real name, romanized/translated into however it would appear in a map search (e.g. \"คัตสึยะ\" -> " +
-    "\"Katsuya\") - do NOT generalize it into a category like \"Japanese restaurant\" instead. For " +
-    "every other, ordinary slot, leave specificPlaceName as an empty string and rely on category+area " +
-    "as usual - do not invent or guess a specific venue name for those."
-  );
-}
-
-async function generateSkeleton(
-  summary: PollSummary,
-  tripWindow: TripDateWindow,
-  tripDays: number
-): Promise<ItinerarySkeleton> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is not configured.");
-  }
-
-  const client = new Anthropic({ apiKey });
-  const response = await client.messages.parse({
-    model: FINALIZE_MODEL,
-    max_tokens: FINALIZE_MAX_TOKENS,
-    output_config: { format: zodOutputFormat(ItinerarySkeletonSchema) },
-    messages: [{ role: "user", content: buildSkeletonPrompt(summary, tripWindow, tripDays) }],
-  });
-
-  if (!response.parsed_output) {
-    throw new Error("Claude did not return a valid itinerary skeleton.");
-  }
-
-  // Prompt-level enforcement (above) is the primary mechanism, but Haiku
-  // can still miscount - a code-level safety net is cheap insurance. An
-  // over-long skeleton is truncated to the requested window rather than
-  // failing the whole generation; an under-long one is left as-is and
-  // just logged, since fabricating extra days' content isn't safe to do
-  // without another grounded LLM pass.
-  const skeleton = response.parsed_output;
-  if (skeleton.days.length !== tripDays) {
-    console.error(
-      `[trigger-jarvis] skeleton returned ${skeleton.days.length} days, expected ${tripDays} ` +
-        `(window ${tripWindow.startDate} to ${tripWindow.endDate}).`
-    );
-    if (skeleton.days.length > tripDays) {
-      return { ...skeleton, days: skeleton.days.slice(0, tripDays) };
-    }
-  }
-  return skeleton;
-}
-
-// ---------------------------------------------------------------------
-// Stage 1.5: ground every slot in real Places data, in parallel.
-// ---------------------------------------------------------------------
-
-interface GroundedSlot {
-  day: number;
-  slotType: "activity" | "meal";
-  category: string;
-  area: string;
-  // Carried through from ActivitySlotSchema so formatSlotForPrompt (Stage
-  // 2) can flag this slot as a specific wishlist request - see that
-  // schema field's docstring.
-  specificPlaceName: string;
-  places: PlaceResult[];
-}
-
-/**
- * A slot with specificPlaceName set is searched BY THAT NAME directly
- * (Text Search for "<name>, <destination>"), never by category+area -
- * this is what actually makes the STRICT RULE in buildSkeletonPrompt
- * bite: a wishlist venue gets grounded in real Places data under its own
- * name instead of being genericized into "Japanese restaurant" the way
- * an ordinary category slot is.
- */
-async function groundSkeleton(skeleton: ItinerarySkeleton): Promise<GroundedSlot[]> {
-  const flatSlots = skeleton.days.flatMap((day) =>
-    day.slots.map((slot) => ({ day: day.day, ...slot }))
-  );
-
-  // Promise.all, not sequential - N independent HTTP calls, and a slot's
-  // result doesn't depend on any other slot's. A PlacesApiError (the API
-  // itself is broken - not configured, not enabled, billing off, ...)
-  // rejects the whole batch immediately, which is correct: that failure
-  // mode affects every slot identically, so there is no partial result
-  // worth salvaging, and the caller needs one clear, specific message
-  // instead of N generic ones.
-  return Promise.all(
-    flatSlots.map(async (slot) => ({
-      ...slot,
-      places: slot.specificPlaceName
-        ? await searchPlacesText(`${slot.specificPlaceName}, ${skeleton.destination}`)
-        : await searchPlacesForSlot(slot.category, slot.area, skeleton.destination),
-    }))
-  );
-}
-
-/**
- * The first real, geocoded venue found anywhere in the grounded slots -
- * used as a stand-in "destination location" for the weather lookup
- * (Stage 2.5), since this app never geocodes the destination string
- * itself. Good enough for a same-city trip's average forecast; not meant
- * to be the mathematically precise city center.
- */
-function findRepresentativeLocation(groundedSlots: GroundedSlot[]): LatLng | null {
-  for (const slot of groundedSlots) {
-    const location = slot.places[0]?.location;
-    if (location) return location;
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------
-// Stage 2: write the final itinerary, choosing only from real results.
-// ---------------------------------------------------------------------
-
-function formatSlotForPrompt(slot: GroundedSlot, slotPosition: number): string {
-  const requestedNote = slot.specificPlaceName
-    ? ` [USER-REQUESTED: "${slot.specificPlaceName}" - the group asked for this exact place by name]`
-    : "";
-  if (slot.places.length === 0) {
-    return (
-      `  - Stop ${slotPosition} [${slot.slotType}]${requestedNote} ${slot.category} near ${slot.area}: ` +
-      "NO REAL VENUES FOUND. Say so plainly in this stop's shortDescription rather than inventing " +
-      "one, set placeIndex to -1, placeName to an empty string, and estimatedCostPerPerson to null."
-    );
-  }
-  const candidates = slot.places
-    .slice(0, 3)
-    .map((p, i) => {
-      const ratingText = p.rating !== null ? `, rating ${p.rating}` : "";
-      const priceText = p.priceLevel
-        ? `, price level ${p.priceLevel.replace("PRICE_LEVEL_", "").toLowerCase()}`
-        : "";
-      return `${i}=${p.name} (${p.address}${ratingText}${priceText})`;
-    })
-    .join("; ");
-  return `  - Stop ${slotPosition} [${slot.slotType}]${requestedNote} ${slot.category} near ${slot.area}, candidates: ${candidates}`;
-}
-
-/**
- * Mirrors buildSkeletonPrompt's data-shape reasoning: asks for exactly
- * one stop per slot, IN ORDER, since Stage 2.5 (enrichItineraryWithTravelTimes)
- * matches Claude's returned stops array back to groundedSlots by that
- * same array position, not by any name matching.
- *
- * Brevity is stated as a hard rule for EVERY field the model writes, not
- * just the caption: Stage 2 used to return a free sentence-or-more per stop
- * plus a paragraph per day, and the plan view had to render all of it. Now
- * a stop is a name and one caption of at most 15 words, a day's summary is
- * a six-word label, and notes are two short sentences at most - see
- * ItineraryStopLLMSchema for why the code backs this up as well.
- */
-function buildFinalPrompt(skeleton: ItinerarySkeleton, groundedSlots: GroundedSlot[]): string {
-  const daysText = skeleton.days
-    .map((day) => {
-      const daySlots = groundedSlots.filter((s) => s.day === day.day);
-      const slotsText = daySlots.map((slot, i) => formatSlotForPrompt(slot, i)).join("\n");
-      return `Day ${day.day} (${day.theme}):\n${slotsText}`;
-    })
-    .join("\n\n");
-
-  return (
-    `Write the final trip itinerary for ${skeleton.destination}, following this planned structure, ` +
-    "using the REAL Google Places search results listed for each stop below. Only use venues from " +
-    "the provided candidates - never invent a name not present in this data. For each day, return " +
-    "exactly one stop object per Stop listed, IN THE SAME ORDER, with these fields:\n" +
-    "- slotType: copy from the Stop.\n" +
-    "- placeIndex: the candidate number (0, 1, or 2) you chose.\n" +
-    "- placeName: that candidate's name copied EXACTLY as listed - the name only, no address, rating " +
-    "or extra words.\n" +
-    "- shortDescription: ONE brief sentence of at most 15 words (aim for 8 to 12) saying what to do " +
-    "there or why it is worth the stop. It sits directly under the place name, so never repeat the " +
-    "name in it. A second sentence, a list, a semicolon, a paragraph or a trailing period is a " +
-    "mistake. Good: \"Walk the quiet forest tunnels and ponds\", \"Try the rich, creamy coconut khao " +
-    "soi\", \"Browse local crafts and street snacks\".\n" +
-    "- estimatedCostPerPerson: a realistic estimated cost per person for that activity or meal, as a " +
-    "plain number, using the venue's price level above as a guide where one is shown.\n" +
-    "If a Stop says NO REAL VENUES FOUND, set placeIndex to -1, placeName to an empty string, " +
-    "shortDescription to a plain statement of at most 10 words that no real venue was found for it " +
-    "(never invent a fallback), and estimatedCostPerPerson to null. For a Stop marked USER-REQUESTED, " +
-    "use that candidate even if its category label doesn't perfectly match, since the group explicitly " +
-    "asked for it by name.\n\n" +
-    "Brevity is a hard rule for EVERYTHING you write: no field may contain a paragraph. Each day's " +
-    "summary is a label of at most 6 words naming that day's theme (for example \"Old City and night " +
-    "markets\"), not a sentence. notes is empty, or at most two short sentences (30 words in all) of " +
-    "practical advice such as dress code or booking.\n\n" +
-    `Also return currency: the ISO 4217 currency code actually used day-to-day in ${skeleton.destination} ` +
-    "(e.g. \"THB\", \"USD\", \"JPY\") - every estimatedCostPerPerson value above must be a realistic " +
-    "amount in this same currency, not USD by default.\n\n" +
-    `${daysText}`
-  );
-}
-
-async function generateFinalItinerary(
-  skeleton: ItinerarySkeleton,
-  groundedSlots: GroundedSlot[]
-): Promise<ItineraryLLM> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is not configured.");
-  }
-
-  const client = new Anthropic({ apiKey });
-  const response = await client.messages.parse({
-    model: FINALIZE_MODEL,
-    max_tokens: FINALIZE_MAX_TOKENS,
-    output_config: { format: zodOutputFormat(ItineraryLLMSchema) },
-    messages: [{ role: "user", content: buildFinalPrompt(skeleton, groundedSlots) }],
-  });
-
-  if (!response.parsed_output) {
-    throw new Error("Claude did not return a valid itinerary.");
-  }
-  return response.parsed_output;
-}
-
-// ---------------------------------------------------------------------
-// Stage 2.5: ground every stop-to-stop transition in a real Google
-// Routes API travel-time/distance estimate (dynamic per-leg mode - see
-// lib/routes.ts), and attach a Stage 2.6 weather summary for the trip's
-// window. Both run entirely in code, after Stage 2 - never routed
-// through another LLM call.
-// ---------------------------------------------------------------------
-
-type ItineraryStopLLM = z.infer<typeof ItineraryStopLLMSchema>;
-
-/**
- * Resolves one LLM-returned stop's placeIndex back to the real Places
- * candidate it chose, or null if there isn't one - an out-of-range or -1
- * placeIndex, or a slot Stage 1.5 found zero candidates for. Never trusts
- * placeIndex blindly: Claude's structured output is schema-validated, not
- * content-validated, so an out-of-bounds integer is treated the same as
- * "no venue" rather than throwing. The stop's coordinates (which may still
- * be null - a candidate Google returned with no location) AND its stored
- * name come from this candidate, never from the model's own wording.
- */
-function resolveStopPlace(stop: ItineraryStopLLM, slot: GroundedSlot | undefined): PlaceResult | null {
-  if (!slot) return null;
-  if (stop.placeIndex < 0 || stop.placeIndex >= slot.places.length) return null;
-  return slot.places[stop.placeIndex];
-}
-
-/**
- * Attaches Stage 2.5 travel data and per-stop cost to every day, calling
- * Routes API for every day in parallel (Promise.all, not sequential) -
- * each day is an independent request, and there's no reason one day's
- * routing should wait on another's round trip.
- *
- * Within a day, only stops with a resolvable location (see
- * resolveStopLocation) are sent to Routes API, preserving their
- * original stop-array positions - a stop with no coordinates (no real
- * venue found for that slot, or Google had no location for the chosen
- * one) simply can't anchor a leg on either side of it, so it always gets
- * travelFromPrevious: null, and the NEXT geocoded stop's travel time (if
- * any) is computed from the last geocoded stop before it, skipping the
- * gap - the closest honest estimate available rather than omitting that
- * leg too. A single leg's own routing failure (see lib/routes.ts's
- * computeDayRoute) degrades that one leg to travelFromPrevious: null,
- * never the whole day - it must never fail the itinerary this route
- * already spent real Anthropic and Places quota generating.
- */
-async function enrichItineraryWithTravelTimes(
-  itinerary: ItineraryLLM,
-  groundedSlots: GroundedSlot[],
-  tripWindow: TripDateWindow
-): Promise<Itinerary> {
-  const days = await Promise.all(
-    itinerary.days.map(async (day) => {
-      const daySlots = groundedSlots.filter((s) => s.day === day.day);
-      const places = day.stops.map((stop, i) => resolveStopPlace(stop, daySlots[i]));
-      const locations = places.map((place) => place?.location ?? null);
-
-      const geocodedIndices = locations
-        .map((loc, i) => (loc ? i : -1))
-        .filter((i) => i >= 0);
-      const geocodedCoords = geocodedIndices.map((i) => locations[i] as LatLng);
-
-      const legs =
-        geocodedCoords.length >= 2
-          ? await computeDayRoute(
-              geocodedCoords,
-              computeDepartureTimeForDay(tripWindow.startDate, day.day)
-            )
-          : null;
-
-      // legs[k] is the transition INTO geocodedIndices[k + 1] - map it
-      // back onto that stop's original position; every other stop
-      // (ungeocoded, or the day's first geocoded stop) stays null.
-      const travelByStopIndex = new Map<number, TravelLeg>();
-      if (legs) {
-        for (let k = 0; k < legs.length; k++) {
-          const leg = legs[k];
-          if (leg) {
-            travelByStopIndex.set(geocodedIndices[k + 1], leg);
-          }
-        }
-      }
-
-      const stops: ItineraryStop[] = day.stops.map((stop, i) => {
-        // The stored name is the chosen candidate's own; the model's
-        // placeName only cross-checks that its placeIndex and its words
-        // agree (a mismatch is logged, never shown). With no candidate
-        // behind the stop there is no name at all.
-        const place = places[i];
-        const placeName = place?.name ?? "";
-        const shortDescription = clampShortDescription(stop.shortDescription, placeName);
-        if (place && stop.placeName && !namesAgree(stop.placeName, place.name)) {
-          console.warn(
-            `[trigger-jarvis] day ${day.day} stop ${i + 1}: the model wrote "${stop.placeName}" but ` +
-              `placeIndex ${stop.placeIndex} is "${place.name}" - keeping the candidate's name.`
-          );
-        }
-
-        return {
-          slotType: stop.slotType,
-          text: composeStopText(placeName, shortDescription),
-          placeName: placeName || undefined,
-          shortDescription: shortDescription || undefined,
-          travelFromPrevious: travelByStopIndex.get(i) ?? null,
-          location: locations[i],
-          estimatedCostPerPerson: stop.estimatedCostPerPerson,
-        };
-      });
-
-      return { day: day.day, summary: day.summary, stops };
-    })
-  );
-
-  const built: Itinerary = {
-    destination: itinerary.destination,
-    days,
-    notes: itinerary.notes,
-    startDate: tripWindow.startDate,
-    endDate: tripWindow.endDate,
-    currency: itinerary.currency,
-  };
-  built.totalTripEstimatedCost = computeTotalEstimatedCost(built);
-  return built;
-}
-
 /**
  * POST /api/trigger-jarvis - "Lock & Generate Plan" on the poll page.
  *
  * Self-contained: reads this trip's votes from Neon via Prisma, then
- * runs a grounded pipeline - a Haiku call to plan the day structure
- * (categories + areas, no venue names; Stage 1), real Google Places
- * Text Search calls to find actual venues for every slot (Stage 1.5), a
- * second Haiku call to write the final itinerary choosing only from
- * that real data and estimating a per-stop cost (Stage 2), and finally,
+ * runs a grounded pipeline (lib/tripGeneration.ts) - a Haiku call to plan
+ * the day structure (categories + areas, no venue names; Stage 1), real
+ * Google Places Text Search calls to find actual venues for every slot
+ * (Stage 1.5), a second Haiku call to write the final itinerary choosing only
+ * from that real data and estimating a per-stop cost (Stage 2), and finally,
  * in parallel: a real Google Routes API call per stop-to-stop leg with a
- * dynamically chosen travel mode (Stage 2.5, see
- * enrichItineraryWithTravelTimes and lib/routes.ts - never another LLM
- * call, this is real data attached as-is) and a real-world forecast
+ * dynamically chosen travel mode (Stage 2.5, see lib/routes.ts - never another
+ * LLM call, this is real data attached as-is) and a real-world forecast
  * lookup for the trip's window (Stage 2.6, see lib/weather.ts) - and
  * returns the finished itinerary in the response body. No dependency on
  * Jarvis's local Python backend, which never accepts inbound
  * connections.
+ *
+ * PERSONALIZATION: the accounts that voted may have finished the taste quiz
+ * (TasteSwipe). Their answers are added together (lib/tasteSummary.ts) and
+ * carried into the Stage 1 and Stage 2 prompts, so the group's plan leans
+ * towards what they said they love and away from what they pass on. Voters
+ * without a finished quiz simply add nothing, and a poll where nobody has one
+ * is generated exactly as before.
  *
  * NOT YET DONE: pushing the result back into the LINE group chat the way
  * plugins/trip_planner.py's _finalize_trip_task does via line_notifier -
@@ -689,30 +181,22 @@ export async function POST(request: NextRequest) {
           `(${tripDays}d, ${tripWindow.voterCount}/${votes.length} voters overlap)`
       );
 
-      let stageStart = Date.now();
-      const skeleton = await generateSkeleton(summary, tripWindow, tripDays);
-      console.log(`[trigger-jarvis] ${tripId}: Stage 1 (skeleton) ${Date.now() - stageStart}ms`);
-
-      stageStart = Date.now();
-      const groundedSlots = await groundSkeleton(skeleton);
-      console.log(`[trigger-jarvis] ${tripId}: Stage 1.5 (Places) ${Date.now() - stageStart}ms`);
-
-      stageStart = Date.now();
-      const draftItinerary = await generateFinalItinerary(skeleton, groundedSlots);
-      console.log(`[trigger-jarvis] ${tripId}: Stage 2 (final write) ${Date.now() - stageStart}ms`);
-
-      stageStart = Date.now();
-      const representativeLocation = findRepresentativeLocation(groundedSlots);
-      const [itinerary, weather] = await Promise.all([
-        enrichItineraryWithTravelTimes(draftItinerary, groundedSlots, tripWindow),
-        representativeLocation
-          ? fetchWeatherSummary(representativeLocation, tripWindow.startDate, tripWindow.endDate)
-          : Promise.resolve(null),
-      ]);
-      if (weather) {
-        itinerary.weather = weather;
+      // The accounts behind the votes may have finished the taste quiz; a vote
+      // cast before signing in was required belongs to no account and has no
+      // profile. Null (and an unchanged plan) when none of them has one.
+      const taste = await loadTastePromptInput(() => getPollVoterUserIds(tripId), votes.length, tripId);
+      if (taste) {
+        console.log(
+          `[trigger-jarvis] ${tripId}: taste profile from ${taste.taste.people}/${votes.length} voters - ` +
+            `loves ${taste.taste.loved.map((t) => t.category).join(", ") || "-"}; ` +
+            `passes on ${taste.taste.avoided.map((t) => t.category).join(", ") || "-"}`
+        );
       }
-      console.log(`[trigger-jarvis] ${tripId}: Stage 2.5 (Routes + weather) ${Date.now() - stageStart}ms`);
+
+      const itinerary = await generateItinerary(
+        { kind: "poll", summary, tripWindow, tripDays, taste },
+        { tag: "trigger-jarvis", id: tripId }
+      );
 
       await saveDraft(tripId, formatItineraryForStorage(itinerary));
       await lockPoll(tripId);

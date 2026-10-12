@@ -67,6 +67,14 @@ Five things were added to this module beyond plain tool calling:
       questions and answers to something Jarvis just asked never reach
       it - see LLMBrain._front_door. JARVIS_FRONT_DOOR=0 turns it off.
 
+  LINK GUARD  a trip link or trip id in a reply must come from a tool that
+      ran during the same request (or from the user's own message), never
+      from the earlier conversation: a model that has seen last week's trip
+      link will sometimes hand it out for a new trip. link_guard.py finds
+      the references; LLMBrain.ask gives the model one chance to fix a bad
+      reply and otherwise says it has no link - the guarantee behind the
+      prompt rule, because a prompt is only a request.
+
 -------------------------------------------------------------------
 PROVIDERS
 -------------------------------------------------------------------
@@ -123,12 +131,15 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import link_guard
 import llm_budget
 import plugin_loader
+import request_context
 import task_dispatcher
 import vision_engine
 from tool_spec import ToolSpec
@@ -256,6 +267,7 @@ How this deployment reads your output:
 - intent_type says what the input is about and route_to says who answers it, so they are separate decisions. "TRIP_PLANNING" is only for input about a trip: planning one, its group poll, voting, or finalizing the plan. Every other input is "CHAT", including a request that needs a tool, which is "CHAT" with route_to "ORCHESTRATOR".
 - The assistant behind you has tools that you do not. It logs and reads Subtrack expenses and records, runs n8n workflows, looks at the user's screen, sends LINE messages, starts and stops apps and servers, plans trips and trip polls, and reports what it can do and what is still running. A request that needs one of those, or live information about the user's own systems, is never yours to answer: route it to "ORCHESTRATOR" with response null. Never say or imply that you have done, started, or checked anything.
 - If the input answers a question the assistant just asked, or accepts or declines something it offered, route it to "ORCHESTRATOR".
+- Never write a trip link or a trip id, and never say a trip was created or is ready: you cannot make one, and a link from earlier in the conversation belongs to an earlier trip. Anything about planning, creating or finding a trip, a poll or a link is route_to "ORCHESTRATOR" with response null.
 
 When you answer, the response is converted to speech and played through a speaker, so:
 
@@ -316,8 +328,8 @@ rather than "~14%".
 - If a question is ambiguous, ask one short clarifying question rather \
 than guessing at length.
 - TOOL PARAMETER GATHERING: When you must ask the user for missing \
-details to fulfill a tool (e.g., asking for a starting location), your \
-response MUST contain ONLY that specific question. You are strictly \
+details to fulfill a tool (e.g., asking which trip a poll belongs to), \
+your response MUST contain ONLY that specific question. You are strictly \
 forbidden from appending conversational closers (e.g., "What else?", \
 "Is there anything else?"). End your sentence immediately after the \
 question mark.
@@ -385,6 +397,29 @@ genuinely need is missing.
 - If the user declines a confirmation prompt, acknowledge it briefly and \
 do not try the same action again.
 
+Planning a trip: when the user asks for a trip to a place - "plan a trip \
+to Chiang Mai" - call generate_trip_plan_async straight away. The \
+destination is all it needs. Do not ask where they are travelling from, \
+when they are going, or about budget first; if they gave no length use 3 \
+days, if they gave no head count use 1, and say which you assumed after \
+the tool returns. Choose planning_type from what they said: a trip with \
+friends, family or colleagues who should vote is 'consensus'; a trip where \
+they already have places in mind to add is 'solo_draft'; anything else is \
+'solo_blank', which plans the whole trip for them. When the tool returns a \
+link, the link is the answer: give it to the user exactly as the tool \
+wrote it. If the tool reports an error, say what went wrong in one \
+sentence and never claim a plan exists or make up a link.
+
+A trip link is something a tool hands you, never something you remember. \
+Write a trip link or a trip id only if a tool returned it during this \
+very request, or the user typed it in their latest message. A link \
+earlier in the conversation belongs to an earlier trip, even when the \
+destination sounds similar, so never repeat, adapt or reuse one for a new \
+request. If you have not called the tool, or it has not returned a link, \
+you do not have a link: say so in one sentence instead of giving one, and \
+do not describe a trip as created, planned or ready unless the tool's \
+result says DONE.
+
 Finalizing a group or consensus trip - one that already has a poll \
 running, as opposed to setting one up for the first time - is a \
 two-step process. You MUST NOT jump straight to generating the plan:
@@ -397,7 +432,7 @@ explicitly ask whether to proceed with generating the plan now. End \
 there - this is a confirmation question, so the same no-closers rule \
 above applies.
 3. Only call finalize_trip_plan_async after the user confirms - never \
-generate_trip_plan_async, which starts a brand new poll rather than \
+generate_trip_plan_async, which starts a brand new trip rather than \
 finalizing this one. If the user declines, treat it like any other \
 declined confirmation above: acknowledge briefly and stop, without \
 generating anything.
@@ -421,6 +456,41 @@ say so rather than answering only the software half. If you are unsure \
 of a specific figure, emission factor, or clause number, say so plainly \
 instead of inventing one.\
 """
+
+# Appended to SYSTEM_PROMPT when a question comes from the web chat rather than
+# a microphone (request_context says which - see LLMBrain._call_provider).
+# SYSTEM_PROMPT is written for speakers, and one of its rules would defeat a
+# chat whose answer is often a link: never speak URLs. The rest of it (plain
+# text, short) fits a chat as well as a call, so only that rule is lifted.
+WEB_CHAT_ADDENDUM = """
+
+This conversation is a text chat in the Trip Planner web app, not a voice \
+call: the user reads your reply on a screen instead of hearing it. That \
+changes one rule above. A link that a tool returns is the whole point of \
+the answer, so write it into your reply exactly as the tool gave it - on \
+its own line after a short sentence is best - and never shorten, rewrite, \
+or invent a link, or reuse one from earlier in the conversation. \
+Everything else stands: plain text with no markdown, and short."""
+
+# What the brain does when a reply holds a trip link or id that no tool returned
+# during this request (link_guard.py says which): it is not sent. The model gets
+# one chance to fix it - the likeliest cause is a plain request to plan a trip
+# answered from memory instead of by the tool - and if the second reply is no
+# better the user gets the honest sentence below. Neither is ever stored in the
+# conversation history.
+LINK_CORRECTION = (
+    "[Not sent] Your last reply held a trip link or trip id that no tool returned "
+    "during this request: {references}. A link from earlier in the conversation "
+    "belongs to an earlier trip, so it must not be repeated for a new request. If "
+    "the user wants a trip planned or created, call generate_trip_plan_async now "
+    "and use only the link it returns. If no tool can give you a link, answer "
+    "without any link and say plainly that you do not have one."
+)
+LINK_FALLBACK = (
+    "I can't give you a trip link for that one: I only share a link that I created "
+    "or looked up during this same request, and I don't have one right now. Please "
+    "ask again, or open the trip from the earlier message in this chat."
+)
 
 
 # ---------------------------------------------------------------------
@@ -602,7 +672,30 @@ _TOOL_WORDS: tuple[str, ...] = (
     "screen", "screenshot", "database", "workflow", "subtrack", "docker",
     "server", "servers", "backend", "frontend", "container", "containers",
     "spent", "spend", "paid", "bought", "subscription", "invoice", "expense",
+    "trip", "trips", "itinerary", "poll",
 )
+
+# A request about a trip - "plan a trip to Chiang Mai" - is a tool call to make
+# (generate_trip_plan_async), not a design question to reason about. But "plan"
+# is one of _DEEP_MARKERS, which would send it to the reasoning tier: slower,
+# dearer, and given to asking clarifying questions instead of calling the tool.
+# So a trip request is recognised first and stays on the standard tier, and
+# _looks_like_tool_command keeps it away from the front door, which has no
+# tools and could only answer it conversationally.
+#
+# The English words are matched as whole words, like every list above. Thai has
+# no spaces between words, so the Thai ones are substrings of the raw text.
+_TRIP_WORDS: tuple[str, ...] = ("trip", "trips", "itinerary", "itineraries", "poll")
+_TRIP_SUBSTRINGS: tuple[str, ...] = ("ทริป", "เที่ยว", "แผนเดินทาง")
+
+
+def _mentions_trip(text: str) -> bool:
+    """True when the utterance is about a trip: planning one, its poll, its plan."""
+    lowered = " " + re.sub(r"[^\w\s]", " ", text.lower()).strip() + " "
+    if any(f" {word} " in lowered for word in _TRIP_WORDS):
+        return True
+    raw = text.lower()
+    return any(fragment in raw for fragment in _TRIP_SUBSTRINGS)
 
 
 def _classify_intent(text: str) -> tuple[str, str]:
@@ -622,6 +715,10 @@ def _classify_intent(text: str) -> tuple[str, str]:
     for opener in _ALWAYS_FAST:
         if lowered.lstrip().startswith(opener):
             return INTENT_STANDARD, "a short transactional command"
+
+    # Before the deep markers: "plan a trip to Chiang Mai" contains "plan".
+    if _mentions_trip(text):
+        return INTENT_STANDARD, "a trip request"
 
     for marker in _DEEP_MARKERS:
         if f" {marker} " in lowered:
@@ -737,7 +834,10 @@ def _looks_like_tool_command(text: str) -> bool:
     lowered = " " + re.sub(r"[^\w\s]", " ", text.lower()).strip() + " "
     if any(lowered.lstrip().startswith(opener) for opener in _ALWAYS_FAST):
         return True
-    return any(word in _TOOL_WORDS for word in lowered.split())
+    if any(word in _TOOL_WORDS for word in lowered.split()):
+        return True
+    # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
+    return _mentions_trip(text)
 
 
 # -- tool implementations ---------------------------------------------
@@ -886,11 +986,10 @@ def _tool_generate_trip_plan_async(
     destination: str = "",
     planning_type: str = "solo_blank",
     head_count: int = 1,
-    days: int = 1,
+    days: int = 3,  # plugins.trip_planner.DEFAULT_PLAN_DAYS
 ) -> str:
     """
-    Kicks off trip planning in the background, for the standalone Trip
-    Planner app.
+    Plans a trip with the standalone Trip Planner app.
 
     Same shape as the other implementation-module tools: the work lives
     in plugins/trip_planner.py and is imported lazily, so a missing or
@@ -899,15 +998,19 @@ def _tool_generate_trip_plan_async(
 
     Unlike the tools around it, this one is registered background=False
     (see the ToolSpec below) even though the real planning work takes
-    many seconds - plugins.trip_planner already backgrounds itself with
-    its own thread and returns a tailored acknowledgement immediately,
-    so routing it through task_dispatcher as well would background an
-    already-backgrounded call and replace that acknowledgement with the
-    dispatcher's generic "STARTED IN THE BACKGROUND" text.
+    many seconds. For the voice assistant, plugins.trip_planner already
+    backgrounds itself with its own thread and returns a tailored
+    acknowledgement immediately, so routing it through task_dispatcher
+    as well would background an already-backgrounded call and replace
+    that acknowledgement with the dispatcher's generic "STARTED IN THE
+    BACKGROUND" text. For the web chat it does the opposite on purpose:
+    it WAITS and returns the link to the finished plan, because a chat
+    reply that says "I'll message you on LINE" is not an answer.
 
-    starting_location is forwarded as-is and touched nowhere else in
-    this function - see the privacy constraint documented at the top of
-    plugins/trip_planner.py before changing that.
+    starting_location is optional (the model is no longer told to ask for
+    it) and forwarded as-is, touched nowhere else in this function - see
+    the privacy constraint documented at the top of plugins/trip_planner.py
+    before changing that.
     """
     try:
         from plugins import trip_planner
@@ -1364,68 +1467,73 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="generate_trip_plan_async",
         description=(
-            "Use this to plan trips. IMPORTANT:\n"
-            "- If the user does not specify their starting location, you "
-            "MUST ask them where they are traveling from before calling "
-            "this tool. Do NOT assume their location.\n"
-            "- If the user wants a group trip, use 'consensus'.\n"
-            "- If the user wants a solo trip, you MUST ask if they want "
-            "you to plan it from scratch (blank canvas) or if they "
-            "already have some specific places in mind. Ask EXACTLY ONE "
-            "question to clarify this before calling the tool.\n"
-            "- Set planning_type to 'solo_blank' if they want you to "
-            "decide everything.\n"
-            "- Set planning_type to 'solo_draft' if they have specific "
-            "places in mind."
+            "Use this to plan a trip. Call it as soon as the user asks for "
+            "a trip to a place - the destination is the only thing you "
+            "need. Do NOT first ask where they are travelling from, when "
+            "they are going, or what their budget is. If they did not say "
+            "how many days use 3, if they did not say how many people use "
+            "1, and tell them what you assumed once the tool has returned.\n"
+            "planning_type decides what happens:\n"
+            "- 'solo_blank' (the default): plans the whole trip for them "
+            "right now, personalized from their saved taste profile, and "
+            "returns the link to the finished plan. Use it for 'plan a trip "
+            "to Chiang Mai' and for any request that mentions neither a "
+            "group nor places they already have in mind.\n"
+            "- 'consensus': ONLY when the user says the trip is with a "
+            "group (friends, family, colleagues) who should vote on dates "
+            "and vibes first. Creates a voting poll and returns its link.\n"
+            "- 'solo_draft': ONLY when the user says they already have "
+            "specific places in mind and want to add them themselves. "
+            "Creates a draft board and returns its link.\n"
+            "When the tool returns a link, give the user that exact link. "
+            "If it returns an error, say what went wrong and do not claim "
+            "a plan exists."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "starting_location": {
-                    "type": "string",
-                    "description": (
-                        "Where the trip starts from, e.g. 'Bangkok' or the "
-                        "user's home address if they gave one. Ask the user "
-                        "for this if they did not say it - never guess it."
-                    ),
-                },
                 "destination": {
                     "type": "string",
-                    "description": "Where the trip is to, e.g. 'Chiang Mai'.",
+                    "description": (
+                        "Where the trip is to, e.g. 'Chiang Mai' or "
+                        "'Kyoto, Japan'. Just the place, as the user said it."
+                    ),
                 },
                 "planning_type": {
                     "type": "string",
                     "enum": ["solo_blank", "solo_draft", "consensus"],
                     "description": (
-                        "'consensus' for a group trip that needs a poll first. "
-                        "'solo_blank' for a solo trip where the user wants you "
-                        "to decide everything from scratch. 'solo_draft' for a "
-                        "solo trip where the user already has specific places "
-                        "in mind they want to add themselves."
+                        "'solo_blank' (default) plans the whole trip now. "
+                        "'consensus' for a group trip that needs a poll "
+                        "first. 'solo_draft' for a solo trip where the user "
+                        "already has specific places in mind they want to "
+                        "add themselves."
                     ),
                 },
                 "head_count": {
                     "type": "integer",
-                    "description": "How many people are going, including the user.",
+                    "description": "How many people are going, including the user. Use 1 if they did not say.",
                 },
                 "days": {
                     "type": "integer",
-                    "description": "How many days the trip is planned for.",
+                    "description": "How many days the trip is for, 1 to 14. Use 3 if they did not say.",
                 },
             },
-            "required": ["starting_location", "destination", "planning_type", "head_count", "days"],
+            "required": ["destination"],
         },
         handler=_tool_generate_trip_plan_async,
         requires_confirmation=False,
-        # Deliberately NOT backgrounded through task_dispatcher: the
-        # handler backgrounds itself (its own thread, see
-        # plugins/trip_planner.py) and returns its own tailored
-        # acknowledgement in well under a second. That is exactly the
-        # string this tool needs the model to speak, so it must run
-        # inline rather than be replaced by task_dispatcher's generic
-        # "started" text.
+        # Deliberately NOT backgrounded through task_dispatcher. For the
+        # voice assistant the handler backgrounds itself (its own thread,
+        # see plugins/trip_planner.py) and returns its own tailored
+        # acknowledgement in well under a second - exactly the string this
+        # tool needs the model to speak, which task_dispatcher's generic
+        # "started" text would replace. For the web chat the handler WAITS
+        # (~15-30 s) and returns the link to the finished plan, which is
+        # the answer itself; backgrounding it would reply "I'm on it" and
+        # lose the link.
         background=False,
-        label="trip plan from {starting_location} to {destination}",
+        label="trip plan to {destination}",
     ),
     ToolSpec(
         name="check_poll_status_async",
@@ -2626,7 +2734,11 @@ class LLMBrain:
             )
 
         text = str(result)
-        print(f"[Brain] Tool result: {call.name} -> {text[:160]}")
+        # A tool result can quote what the user typed (a Thai destination): a
+        # console that cannot encode it must not fail the turn over a log line.
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        shown = text[:160].encode(encoding, errors="backslashreplace").decode(encoding)
+        print(f"[Brain] Tool result: {call.name} -> {shown}")
         return ToolResult(call=call, content=text)
 
     # -- failover ------------------------------------------------------
@@ -2775,6 +2887,17 @@ class LLMBrain:
             )
             return None
 
+        # The router has no tools, so it can never have a link to give - only
+        # one it remembers from earlier in the conversation (see link_guard.py).
+        # Anything it says about a trip is the supervisor's to answer.
+        remembered = link_guard.unverified_trip_references(reply, user_text)
+        if remembered:
+            print(
+                f"[Brain] Front door answer held {len(remembered)} trip link/id no tool "
+                "returned; handing to the supervisor."
+            )
+            return None
+
         print(f"[Brain] Front door: answered directly ({model or self._provider.model}).")
         return reply
 
@@ -2838,6 +2961,12 @@ class LLMBrain:
         working: list[Turn] = list(self._history)
         working.append(Turn(kind="user", text=user_text.strip()))
 
+        # What this reply may quote a trip link or id from: what the user just
+        # typed, plus whatever the tools return below. Never the earlier
+        # conversation - that is where a stale link comes from (link_guard.py).
+        evidence: list[str] = [user_text]
+        corrected = False
+
         for step in range(1, self._max_steps + 1):
             try:
                 turn = self._call_provider(working, tools, model, effort)
@@ -2848,6 +2977,29 @@ class LLMBrain:
                 reply = turn.text.strip()
                 if not reply:
                     return "I didn't get an answer back. Try asking again."
+
+                # A trip link or id that no tool returned during this request
+                # is a guess, however sure of itself. The model gets one
+                # chance to fix it (usually by calling the tool it skipped);
+                # after that the user gets the honest sentence, never the
+                # link. The bad reply is not kept in the transcript either way.
+                unverified = link_guard.unverified_trip_references(reply, "\n".join(evidence))
+                if unverified:
+                    print(
+                        f"[Brain] Reply held {len(unverified)} trip link/id no tool returned "
+                        f"this request: {ascii(', '.join(unverified[:3]))}"
+                    )
+                    if not corrected and step < self._max_steps:
+                        corrected = True
+                        working.append(turn)
+                        working.append(
+                            Turn(
+                                kind="user",
+                                text=LINK_CORRECTION.format(references=", ".join(unverified[:3])),
+                            )
+                        )
+                        continue
+                    reply = LINK_FALLBACK
 
                 # The transcript keeps the question and the answer, not
                 # the tool scaffolding - so a backgrounded action would
@@ -2873,9 +3025,9 @@ class LLMBrain:
                 f"{len(turn.calls)} tool call(s) requested."
             )
             working.append(turn)
-            working.append(
-                Turn(kind="tool_results", results=[self._execute(c) for c in turn.calls])
-            )
+            results = [self._execute(c) for c in turn.calls]
+            evidence.extend(result.content for result in results)
+            working.append(Turn(kind="tool_results", results=results))
 
         print(f"[Brain] Supervisor hit the {self._max_steps}-step ceiling.")
         return (
@@ -2901,7 +3053,15 @@ class LLMBrain:
         """
         assert self._provider is not None
         tools = self._active_tools() if tools is None else tools
-        prompt = self._system_prompt if system is None else system
+        if system is None:
+            prompt = self._system_prompt
+            # A chat is read, not heard: lift the one voice rule that would
+            # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
+            caller = request_context.current()
+            if caller is not None and caller.is_web:
+                prompt += WEB_CHAT_ADDENDUM
+        else:
+            prompt = system
 
         try:
             return self._provider.complete(prompt, working, tools, model, effort)

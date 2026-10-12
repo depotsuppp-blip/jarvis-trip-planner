@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import Link from "next/link";
 import { useSession } from "next-auth/react";
 import { ArrowUp, Mic, X } from "lucide-react";
@@ -42,6 +42,38 @@ const MOCK_THINK_MS = 2200;
 const MOCK_SPEAK_MS = 3000;
 
 const GREETING: Message = { id: "greeting", role: "jarvis", text: "Good evening. What are we planning?" };
+
+// A reply can carry a link - the trip Jarvis has just planned. The reply is plain
+// text, so web addresses are found with a pattern and drawn as real links;
+// nothing else in it is ever treated as markup. Only http(s) matches, so a
+// "javascript:" address can never become a link.
+const LINK_PATTERN = /https?:\/\/[^\s<>"'`]+/g;
+// Sentence punctuation stuck to the end of an address belongs to the sentence.
+const TRAILING_PUNCTUATION = /[.,;:!?)\]}]+$/;
+
+function MessageText({ text }: { text: string }): ReactNode {
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  for (const match of text.matchAll(LINK_PATTERN)) {
+    const url = match[0].replace(TRAILING_PUNCTUATION, "");
+    if (!url) continue;
+    parts.push(text.slice(cursor, match.index));
+    parts.push(
+      <a
+        key={match.index}
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="font-medium text-slate-900 underline underline-offset-2 [overflow-wrap:anywhere] outline-none hover:text-rose-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600"
+      >
+        {url}
+      </a>
+    );
+    cursor = match.index + url.length;
+  }
+  parts.push(text.slice(cursor));
+  return <>{parts}</>;
+}
 
 const REPLIES = [
   "Done. I've noted that for your next trip.",
@@ -255,7 +287,9 @@ export default function JarvisPage() {
               ) : (
                 <div className="max-w-[85%] border-l border-slate-200 pl-4">
                   <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-slate-500">Jarvis</p>
-                  <p className="mt-1 text-[15px] leading-6 text-slate-700">{m.text}</p>
+                  <p className="mt-1 whitespace-pre-line text-[15px] leading-6 text-slate-700">
+                    <MessageText text={m.text} />
+                  </p>
                 </div>
               )}
             </li>
