@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 import { List, Map as MapIcon } from "lucide-react";
 import { DayTabs, dayTabId } from "@/components/trip/DayTabs";
 import { MapPanel } from "@/components/trip/MapPanel";
@@ -43,20 +43,20 @@ function ViewSwitch({ view, onChange }: { view: MobileView; onChange: (view: Mob
 /**
  * The locked plan, shown by app/trip/poll/[id]/page.tsx once a trip has an
  * itinerary. A sticky one-row summary bar over a split screen: the
- * itinerary on the left, one day at a time behind a row of day tabs, and a
- * sticky route map filling the right half. Below `lg` the two share the
- * screen through a List / Map switch instead.
+ * itinerary on the left, on a light grey panel, one day at a time behind a
+ * row of day tabs, and a sticky Google map filling the right half, flush to
+ * the edge. Below `lg` the two share the screen through a List / Map switch
+ * instead.
  *
  * This is where the state that ties the halves together lives: which day is
  * selected (the tabs choose it, the list and the map both follow it) and
- * which stop is lit (the list reports it, the map lights that stop's pin).
- * A stop is lit while it is pointed at or focused, and stays lit once its
- * number has been pressed - the "selected" stop, which is how the link
- * between list and map works on a phone, where they are separate views and
- * there is no pointer to hover with. Days with no stops are left out of the
- * grouping entirely, so there is no empty tab or card for them. When the
- * real map arrives it takes the same `activeGroup` and `activeStop` and
- * nothing else here changes.
+ * which stop is lit. A stop is lit while it is pointed at or focused - in the
+ * list or as a pin on the map - and stays lit once its number (or its pin)
+ * has been pressed: the "selected" stop, which is how the link between list
+ * and map works on a phone, where they are separate views and there is no
+ * pointer to hover with. Pressing a pin also scrolls that stop's row into
+ * view. Days with no stops are left out of the grouping entirely, so there
+ * is no empty tab or card for them.
  *
  * The bar's height is the CSS variable `--bar-h` set on the root: it differs
  * with the bar's layout (two rows below `lg`, one above), and the tab strip
@@ -89,6 +89,7 @@ export function PlanView({
   const [hoveredStop, setHoveredStop] = useState<number | null>(null);
   const [selectedStop, setSelectedStop] = useState<number | null>(null);
   const [mobileView, setMobileView] = useState<MobileView>("list");
+  const listRef = useRef<HTMLDivElement | null>(null);
 
   // The chosen day, or the first one with stops when nothing (or a day that
   // has since gone away) is chosen.
@@ -102,8 +103,22 @@ export function PlanView({
     setSelectedStop(null);
   }
 
+  // A pin pressed on the map: select that stop, and bring its row into view
+  // (centred, so the sticky bar and tabs are never what it lands under). On a
+  // phone's Map view the list is not displayed and this scrolls nothing.
+  function handleMapSelect(stopNumber: number | null) {
+    setSelectedStop(stopNumber);
+    if (stopNumber === null) return;
+
+    const row = listRef.current?.querySelector<HTMLElement>(`[data-stop-number="${stopNumber}"]`);
+    row?.scrollIntoView({
+      block: "center",
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    });
+  }
+
   return (
-    <div className="min-h-svh bg-white text-slate-900 [--bar-h:4.25rem] [--tabs-h:2.8125rem] lg:[--bar-h:3.5rem]">
+    <div className="min-h-svh bg-slate-50 text-slate-900 [--bar-h:4.25rem] [--tabs-h:2.8125rem] lg:[--bar-h:3.5rem]">
       <TripBar
         destination={itinerary.destination}
         dateLabel={dateLabel}
@@ -117,11 +132,11 @@ export function PlanView({
 
       {/* Selected text takes the accent too (the bar does the same for itself) - a browser default belongs to no design. */}
       <div className="selection:bg-rose-600 selection:text-white lg:grid lg:grid-cols-2">
-        {/* On a phone's Map view the day tabs stay (so the route can still be changed day by day); only the list beneath them goes. */}
-        <main className="min-w-0">
+        {/* The itinerary sits on a light grey panel (the white bar above and the map beside it are what make it a panel). On a phone's Map view the day tabs stay (so the route can still be changed day by day); only the list beneath them goes. */}
+        <main className="min-w-0 bg-slate-50">
           {activeGroup ? (
             <>
-              <div className="sticky top-[var(--bar-h)] z-20 bg-white">
+              <div className="sticky top-[var(--bar-h)] z-20 bg-slate-50">
                 <div className="mx-auto max-w-xl px-4 sm:px-6 lg:px-8">
                   <DayTabs
                     groups={groups}
@@ -133,6 +148,7 @@ export function PlanView({
               </div>
 
               <div
+                ref={listRef}
                 className={`mx-auto max-w-xl px-4 pb-24 pt-8 sm:px-6 lg:px-8 ${mobileView === "map" ? "max-lg:hidden" : ""}`}
               >
                 <TimelineList
@@ -171,7 +187,14 @@ export function PlanView({
             mobileView === "list" ? "max-lg:hidden" : ""
           }`}
         >
-          <MapPanel group={activeGroup} activeStop={activeStop} selectedStop={selectedStop} />
+          <MapPanel
+            group={activeGroup}
+            groups={groups}
+            activeStop={activeStop}
+            selectedStop={selectedStop}
+            onHoverStop={setHoveredStop}
+            onSelectStop={handleMapSelect}
+          />
         </aside>
       </div>
     </div>

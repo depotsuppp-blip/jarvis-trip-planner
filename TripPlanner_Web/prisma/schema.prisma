@@ -22,6 +22,15 @@ model User {
   emailVerified DateTime?
   image         String?
 
+  /// False until this person finishes the one-time taste quiz (the
+  /// worldwide swipe deck, GET /api/places/deck). POST /api/taste-profile
+  /// sets it true, in the same transaction that saves the finished deck's
+  /// answers to TasteSwipe below, and GET /api/taste-profile reads it so the
+  /// poll and swipe pages don't send them back to the quiz. Per person, not
+  /// per trip. It only says "don't ask again" - the taste itself is computed
+  /// from this user's TasteSwipe rows.
+  hasCompletedTasteProfile Boolean @default(false)
+
   accounts Account[]
   sessions Session[]
   conversations Conversation[]
@@ -30,6 +39,7 @@ model User {
   // docstrings below for why tripId isn't a hard foreign key.
   tripParticipations     TripParticipant[]
   swipeActions           UserSwipeAction[]
+  tasteSwipes            TasteSwipe[]
   sentFriendRequests     Friendship[]      @relation("FriendshipRequester")
   receivedFriendRequests Friendship[]      @relation("FriendshipAddressee")
 }
@@ -135,11 +145,21 @@ enum SwipeAction {
 //
 // tripId is a bare correlator string, not a `@relation` to TripDraft -
 // see TripParticipant's docstring above for why.
+//
+// `category` is the taste the swiped card was dealt to measure - a
+// DeckPlaceCategory id from lib/tripTypes.ts ("history", "nature",
+// "shopping", ...), so a LIKE says which kind of place was liked, not just
+// which place. A plain string (not an enum) so the curated list in
+// DECK_CATEGORIES can gain a taste without a migration; POST
+// /api/trip/swipe checks it against that list before writing. Null for a
+// swipe saved before this column existed, or by a client that doesn't send
+// it. Like the place id, it is our own value, not Google content.
 model UserSwipeAction {
   id            String      @id @default(cuid())
   userId        String
   tripId        String
   googlePlaceId String
+  category      String?
   action        SwipeAction
   createdAt     DateTime    @default(now())
 
@@ -147,6 +167,43 @@ model UserSwipeAction {
 
   @@unique([userId, tripId, googlePlaceId])
   @@index([tripId])
+}
+
+// One row per (user, place) answered in the one-time taste quiz - the
+// worldwide swipe deck (DECK_CATEGORIES in lib/placeDeck.ts, served by GET
+// /api/places/deck). Unlike UserSwipeAction above this belongs to the
+// PERSON, not to a trip: the deck is the same set of places everywhere, so
+// an answer says something about the user's taste and nothing about any
+// trip, and there is deliberately no tripId. A person's profile is computed
+// from these rows (per `category`, how many answers were LIKE); re-taking the
+// quiz replaces a row via @@unique instead of adding a duplicate - the same
+// "resubmission replaces the prior row" convention as UserSwipeAction and
+// PollVote.
+//
+// `category` is the taste the card was dealt to measure: a DeckPlaceCategory
+// id from lib/tripTypes.ts ("history", "nature", "shopping", ...). A plain
+// string, not an enum, so the curated list in DECK_CATEGORIES can gain a
+// taste without a migration - the API validates it against that list before
+// writing. Only the Google place id is stored: Google's Places policies
+// forbid keeping any other Places content (name, photo, rating, ...).
+//
+// Written once per finished quiz by POST /api/taste-profile, which saves the
+// whole deck's answers here and sets User.hasCompletedTasteProfile in one
+// transaction. The quiz still also saves each answer card by card to
+// UserSwipeAction (with its `category`) through POST /api/trip/swipe - that
+// is what lets a refresh resume where someone left off, and it is per trip
+// because the page is still reached per trip. This table is the profile.
+model TasteSwipe {
+  id            String      @id @default(cuid())
+  userId        String
+  googlePlaceId String
+  category      String
+  action        SwipeAction
+  createdAt     DateTime    @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, googlePlaceId])
 }
 
 // One row per voter per trip. A resubmission (double-tap, or genuinely

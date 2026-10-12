@@ -19,9 +19,11 @@ const TRAVEL_MODE_DISPLAY: Record<TravelMode, { Icon: typeof Car; label: string;
 // A stop's own facts (meal, cost) are small tracked caps in Muted grey; the
 // travel leg between stops is plain sentence case ("~14 min walk") so the two
 // never read as one line - a cost is about the stop above it, a leg is the
-// way to the stop below.
+// way to the stop below. Both sit on the panel's light grey, where Muted
+// still clears 4.5:1 and the leg (one step darker, as it is the thing a
+// traveler plans around) clears 7:1.
 const metaClass = "text-[11px] font-medium uppercase tracking-[0.08em] tabular-nums text-slate-500";
-const legClass = "text-xs tabular-nums text-slate-500";
+const legClass = "text-xs tabular-nums text-slate-600";
 
 function getCurrentPosition(): Promise<GeolocationPosition> {
   return new Promise((resolve, reject) => {
@@ -37,11 +39,17 @@ function getCurrentPosition(): Promise<GeolocationPosition> {
  * One day of the itinerary: its "Day N" heading (plus the day's short title
  * when the plan has one), a single meta line, and the stops as a numbered
  * timeline. The stop numbers are the numbers on the map's pins
- * (components/trip/MapPanel.tsx). A stop's number is a button: pointing at a
- * stop, or focusing its number, lights that pin for as long as it lasts
- * (`onHoverStop`), and pressing the number selects the stop (`onSelectStop`)
- * so its pin stays lit - which is also how someone on a phone, or on the
- * keyboard, finds a stop on the map. Pressing it again, or Escape, clears it.
+ * (components/trip/MapPanel.tsx): the same solid accent disc with a white
+ * number. A stop's number is a button: pointing at a stop, or focusing its
+ * number, lights that pin for as long as it lasts (`onHoverStop`), and
+ * pressing the number selects the stop (`onSelectStop`) so its pin stays
+ * lit - which is also how someone on a phone, or on the keyboard, finds a
+ * stop on the map. Pressing it again, or Escape, clears it.
+ *
+ * The timeline sits on the plan view's light grey panel. A stop that is lit
+ * lifts onto a white surface (a fading layer, not a swapped background) with
+ * a halo round its number; a pressed one keeps a stronger halo and an accent
+ * edge.
  *
  * A stop is its venue's name in bold with ONE brief caption under it
  * (`placeName` / `shortDescription`, at most 15 words - see lib/stopCopy.ts).
@@ -175,11 +183,11 @@ export function TimelineList({
         key={group.day}
         className="transition-opacity duration-150 ease-out starting:opacity-0 motion-reduce:transition-none"
       >
-        <h2 className="text-balance text-[22px] font-semibold leading-tight tracking-[-0.02em] text-slate-900">
+        <h2 className="text-balance text-[28px] font-bold leading-tight tracking-[-0.025em] text-slate-900">
           Day {group.day}
-          {group.title && <span className="font-normal text-slate-500">: {group.title}</span>}
+          {group.title && <span className="font-semibold text-slate-500">: {group.title}</span>}
         </h2>
-        <p className="mt-1.5 text-[13px] tabular-nums text-slate-500">{meta}</p>
+        <p className="mt-2 text-sm tabular-nums text-slate-600">{meta}</p>
 
         {swapError && (
           <p role="alert" className="mt-4 text-sm text-red-700">
@@ -208,31 +216,35 @@ export function TimelineList({
                 ? `~${formatCost(stop.estimatedCostPerPerson, currency ?? "")}`
                 : null;
 
+            // One state per stop, so the styles below never have to rank two flags
+            // against each other: pressed beats pointed-at beats resting.
+            const lit = selectedStop === number ? "selected" : activeStop === number ? "active" : "none";
+
             return (
               <li
                 key={index}
                 data-day={group.day}
                 data-stop-index={index}
-                data-active={activeStop === number}
-                data-selected={selectedStop === number}
+                data-stop-number={number}
+                data-lit={lit}
                 onPointerEnter={() => onHoverStop(number)}
                 onPointerLeave={() => onHoverStop(null)}
                 onFocus={() => onHoverStop(number)}
                 onBlur={() => onHoverStop(null)}
-                className="group/stop grid grid-cols-[1.5rem_1fr] gap-x-3"
+                className="group/stop"
               >
                 {/* The connector leading into this stop: the spine, with the travel mode sitting on it and the time beside it. */}
                 {!isFirst && (
-                  <>
+                  <div className="grid grid-cols-[1.75rem_1fr] gap-x-3">
                     <div aria-hidden="true" className="relative">
-                      <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-slate-200" />
+                      <span className="absolute inset-y-0 left-1/2 w-0.5 -translate-x-1/2 bg-rose-200" />
                       {stop.travelFromPrevious && (
-                        <span className="absolute left-1/2 top-1/2 flex size-6 -translate-x-1/2 -translate-y-1/2 items-center justify-center bg-white">
-                          <ModeIcon className="size-3.5 text-slate-400" />
+                        <span className="absolute left-1/2 top-1/2 flex size-6 -translate-x-1/2 -translate-y-1/2 items-center justify-center bg-slate-50">
+                          <ModeIcon className="size-3.5 text-slate-500" />
                         </span>
                       )}
                     </div>
-                    <div className={`flex items-center ${stop.travelFromPrevious ? "min-h-9" : "min-h-6"}`}>
+                    <div className={`flex items-center ${stop.travelFromPrevious ? "min-h-10" : "min-h-6"}`}>
                       {stop.travelFromPrevious && (
                         <p
                           className={legClass}
@@ -242,93 +254,98 @@ export function TimelineList({
                         </p>
                       )}
                     </div>
-                  </>
+                  </div>
                 )}
 
-                <div className="relative">
-                  {/* The number is the control: 40px to press (it takes 24px of room). Pointing at it lights the fill; pressing it adds a ring that stays (the keyboard focus ring looks the same, and goes when focus does). The fill is its own layer that fades in (opacity only), over the border, under the number. */}
-                  <button
-                    type="button"
-                    aria-pressed={selectedStop === number}
-                    aria-label={`Show stop ${number} on the map`}
-                    onClick={() => onSelectStop(selectedStop === number ? null : number)}
-                    className="group/node relative z-10 -m-2 flex size-10 items-center justify-center rounded-full outline-none transition-[scale] duration-150 ease-out active:scale-[0.95]"
-                  >
-                    <span className="relative flex size-6 items-center justify-center rounded-full border border-slate-900 bg-white group-focus-visible/node:outline-2 group-focus-visible/node:outline-offset-2 group-focus-visible/node:outline-rose-600 group-data-[selected=true]/stop:outline-2 group-data-[selected=true]/stop:outline-offset-2 group-data-[selected=true]/stop:outline-rose-600">
-                      <span className="absolute -inset-px rounded-full bg-rose-600 opacity-0 transition-opacity duration-150 ease-out group-data-[active=true]/stop:opacity-100" />
-                      <span className="relative text-[11px] font-medium tabular-nums text-slate-900 transition-colors duration-150 ease-out group-data-[active=true]/stop:text-white">
+                <div className="relative grid grid-cols-[1.75rem_1fr] gap-x-3">
+                  {/* The lit surface: a white sheet that fades in behind the node and the text when this stop is pointed at, focused or pressed (opacity only), wider than the content so the text keeps its place and the sheet has room to breathe. First in the row, so everything else paints over it. */}
+                  <span
+                    aria-hidden="true"
+                    className="pointer-events-none absolute -inset-x-3 -inset-y-2 rounded-xl bg-white opacity-0 shadow-[0_1px_2px_rgb(15_23_43/0.06),0_4px_14px_rgb(15_23_43/0.07)] ring-1 ring-slate-200 transition-opacity duration-150 ease-out group-data-[lit=active]/stop:opacity-100 group-data-[lit=selected]/stop:opacity-100 group-data-[lit=selected]/stop:ring-rose-600/40"
+                  />
+
+                  <div className="relative">
+                    {/* The number is the control: 40px to press (it takes 28px of room). It is the map pin's twin - a solid accent disc, white number. Pointing at it grows a soft halo; pressing it keeps a stronger one (the keyboard focus ring is a crisp outline, and goes when focus does). */}
+                    <button
+                      type="button"
+                      aria-pressed={selectedStop === number}
+                      aria-label={`Show stop ${number} on the map`}
+                      onClick={() => onSelectStop(selectedStop === number ? null : number)}
+                      className="group/node relative z-10 -m-1.5 flex size-10 items-center justify-center rounded-full outline-none transition-[scale] duration-150 ease-out active:scale-[0.95]"
+                    >
+                      <span className="flex size-7 items-center justify-center rounded-full bg-rose-600 text-xs font-bold tabular-nums text-white transition-[scale,box-shadow] duration-150 ease-out group-data-[lit=active]/stop:scale-110 group-data-[lit=active]/stop:shadow-[0_0_0_6px_rgb(236_0_63/0.18)] group-data-[lit=selected]/stop:scale-110 group-data-[lit=selected]/stop:shadow-[0_0_0_6px_rgb(236_0_63/0.36)] group-focus-visible/node:outline-2 group-focus-visible/node:outline-offset-4 group-focus-visible/node:outline-rose-600">
                         {number}
                       </span>
-                    </span>
-                  </button>
-                  {!isLast && (
-                    <span
-                      aria-hidden="true"
-                      className="absolute bottom-0 left-1/2 top-6 w-px -translate-x-1/2 bg-slate-200"
-                    />
-                  )}
-                </div>
-
-                <div className="min-w-0">
-                  <div className="flex items-start justify-between gap-3">
-                    {stop.placeName || stop.shortDescription ? (
-                      <div className="min-w-0">
-                        {stop.placeName && (
-                          <p className="text-pretty text-[15px] font-semibold leading-6 text-slate-900">
-                            {stop.placeName}
-                          </p>
-                        )}
-                        {stop.shortDescription && (
-                          <p
-                            className={`text-pretty ${
-                              stop.placeName
-                                ? "text-sm leading-5 text-slate-600"
-                                : // No venue behind this stop: a plain statement in Muted, so it reads as a flagged state, not as content.
-                                  "text-[15px] leading-6 text-slate-500"
-                            }`}
-                          >
-                            {stop.shortDescription}
-                          </p>
-                        )}
-                      </div>
-                    ) : (
-                      <p className="text-pretty text-[15px] leading-6 text-slate-700">{stop.text}</p>
-                    )}
-
-                    {canSwap && (
-                      <button
-                        type="button"
-                        onClick={() => handleFindAlternative(group.day, index)}
-                        disabled={isSwapping}
-                        title="Find a real-time alternative for this stop"
-                        className="-mr-2 -mt-2 flex size-10 shrink-0 items-center justify-center rounded-md border border-transparent text-slate-500 outline-none transition-[border-color,color,scale] duration-150 ease-out hover:border-slate-900 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600 active:scale-[0.97] disabled:opacity-60"
-                      >
-                        <RefreshCw
-                          className={`size-3.5 ${isSwapping ? "animate-spin text-rose-600" : ""}`}
-                          aria-hidden="true"
-                        />
-                        <span className="sr-only">Find alternative</span>
-                      </button>
+                    </button>
+                    {!isLast && (
+                      <span
+                        aria-hidden="true"
+                        className="absolute bottom-0 left-1/2 top-7 w-0.5 -translate-x-1/2 bg-rose-200"
+                      />
                     )}
                   </div>
 
-                  {(isMeal || costLabel) && (
-                    <p className={`mt-1.5 flex items-center gap-1.5 ${metaClass}`}>
-                      {isMeal && (
-                        <>
-                          <UtensilsCrossed className="size-3.5 text-slate-400" aria-hidden="true" />
-                          Meal
-                        </>
+                  <div className="relative min-w-0">
+                    <div className="flex items-start justify-between gap-3">
+                      {stop.placeName || stop.shortDescription ? (
+                        <div className="min-w-0">
+                          {stop.placeName && (
+                            <p className="text-pretty text-[17px] font-bold leading-6 tracking-[-0.01em] text-slate-900">
+                              {stop.placeName}
+                            </p>
+                          )}
+                          {stop.shortDescription && (
+                            <p
+                              className={`text-pretty ${
+                                stop.placeName
+                                  ? "mt-0.5 text-sm leading-5 text-slate-600"
+                                  : // No venue behind this stop: a plain statement in Muted, so it reads as a flagged state, not as content.
+                                    "text-[15px] leading-6 text-slate-500"
+                              }`}
+                            >
+                              {stop.shortDescription}
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-pretty text-[15px] leading-6 text-slate-700">{stop.text}</p>
                       )}
-                      {isMeal && costLabel && <span aria-hidden="true">·</span>}
-                      {costLabel && (
-                        <span title="Estimated cost per person">
-                          <span className="sr-only">Estimated cost per person: </span>
-                          {costLabel}
-                        </span>
+
+                      {canSwap && (
+                        <button
+                          type="button"
+                          onClick={() => handleFindAlternative(group.day, index)}
+                          disabled={isSwapping}
+                          title="Find a real-time alternative for this stop"
+                          className="-mr-2 -mt-2 flex size-10 shrink-0 items-center justify-center rounded-md border border-transparent text-slate-500 outline-none transition-[border-color,background-color,color,scale] duration-150 ease-out hover:border-slate-200 hover:bg-white hover:text-rose-600 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600 active:scale-[0.97] disabled:opacity-60"
+                        >
+                          <RefreshCw
+                            className={`size-3.5 ${isSwapping ? "animate-spin text-rose-600" : ""}`}
+                            aria-hidden="true"
+                          />
+                          <span className="sr-only">Find alternative</span>
+                        </button>
                       )}
-                    </p>
-                  )}
+                    </div>
+
+                    {(isMeal || costLabel) && (
+                      <p className={`mt-1.5 flex items-center gap-1.5 ${metaClass}`}>
+                        {isMeal && (
+                          <>
+                            <UtensilsCrossed className="size-3.5 text-slate-500" aria-hidden="true" />
+                            Meal
+                          </>
+                        )}
+                        {isMeal && costLabel && <span aria-hidden="true">·</span>}
+                        {costLabel && (
+                          <span title="Estimated cost per person">
+                            <span className="sr-only">Estimated cost per person: </span>
+                            {costLabel}
+                          </span>
+                        )}
+                      </p>
+                    )}
+                  </div>
                 </div>
               </li>
             );

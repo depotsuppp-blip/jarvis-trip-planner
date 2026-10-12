@@ -26,7 +26,7 @@ function BarItem({
 }) {
   return (
     <li className={`flex shrink-0 items-center gap-1.5 ${hideOnPhone ? "max-sm:hidden" : ""}`}>
-      <Icon className="size-4 text-slate-400" aria-hidden="true" />
+      <Icon className="size-4 text-slate-500" aria-hidden="true" />
       <span className="sr-only">{label}: </span>
       {children}
     </li>
@@ -71,10 +71,10 @@ export function TripBar({
       <div className="flex h-full flex-wrap content-center items-center gap-x-6 gap-y-1 px-4 lg:flex-nowrap lg:px-6">
         <div className="flex min-w-0 flex-1 flex-col justify-center lg:flex-none">
           <div className="flex min-w-0 items-center gap-3">
-            <h1 className="truncate text-[15px] font-semibold tracking-tight text-slate-900 lg:max-w-72">
+            <h1 className="truncate text-base font-bold tracking-tight text-slate-900 lg:max-w-72">
               {destination}
             </h1>
-            <span className="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-slate-600">
+            <span className="inline-flex shrink-0 items-center gap-1.5 text-xs font-semibold text-slate-700">
               <span aria-hidden="true" className="size-1.5 rounded-full bg-slate-900" />
               Locked
             </span>
@@ -85,7 +85,7 @@ export function TripBar({
           </p>
         </div>
 
-        <ul className="order-last flex w-full items-center gap-x-5 overflow-x-auto whitespace-nowrap text-[13px] tabular-nums text-slate-700 [scrollbar-width:none] lg:order-none lg:w-auto lg:flex-1 lg:overflow-visible [&::-webkit-scrollbar]:hidden">
+        <ul className="order-last flex w-full items-center gap-x-5 overflow-x-auto whitespace-nowrap text-[13px] font-medium tabular-nums text-slate-800 [scrollbar-width:none] lg:order-none lg:w-auto lg:flex-1 lg:overflow-visible [&::-webkit-scrollbar]:hidden">
           <BarItem icon={CalendarRange} label="Dates">
             {dateLabel}
           </BarItem>

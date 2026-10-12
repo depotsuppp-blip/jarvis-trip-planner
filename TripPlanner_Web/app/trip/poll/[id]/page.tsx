@@ -7,6 +7,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { StickyActionButton } from "@/components/StickyActionButton";
 import { LoginScreen } from "@/components/auth/LoginScreen";
 import { PlanView } from "@/components/trip/PlanView";
+import { hasCompletedTasteQuiz } from "@/lib/tasteProfile";
 import { computeDateRangeLabel, formatShortDate } from "@/lib/tripSummary";
 import type { Itinerary, PollVote } from "@/lib/tripTypes";
 import { voterDisplayName } from "@/lib/voter";
@@ -328,8 +329,9 @@ export default function TripPollPage({
       // step, where they say which places they like - the other half of
       // what the plan is built from. `created` comes from the server and
       // is false for a resubmission, so someone coming back to change
-      // their dates stays right here.
-      if (data.created === true) {
+      // their dates stays right here. So does someone who has already
+      // finished the taste quiz: it is once per person, not once per trip.
+      if (data.created === true && !(await hasCompletedTasteQuiz())) {
         openingSwipe = true;
         setIsOpeningSwipe(true);
         router.push(`/trip/swipe/${encodeURIComponent(id)}`);

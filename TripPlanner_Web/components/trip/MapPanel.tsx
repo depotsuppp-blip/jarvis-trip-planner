@@ -1,181 +1,140 @@
 "use client";
 
-import { useId, useLayoutEffect, useMemo, useRef } from "react";
+import dynamic from "next/dynamic";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { MapPinOff } from "lucide-react";
+import { MapLoading, MapMessage } from "@/components/trip/MapStates";
 import type { DayGroup } from "@/lib/itineraryDays";
-import { sketchRoute, type RouteSketch } from "@/lib/routeSketch";
+import { locateStops } from "@/lib/mapStops";
 
-// One authored moment, played when a day is chosen: the route draws itself,
-// then its pins settle in one after another. Strong ease-out, all of it well
-// under half a second, skipped entirely under reduced motion.
-const DRAW_MS = 320;
-const PIN_MS = 200;
-const PIN_STAGGER_MS = 40;
-const EASE_OUT = "cubic-bezier(0.23, 1, 0.32, 1)";
+// Both are read as `process.env.NEXT_PUBLIC_...` written out in full, which is
+// the only form Next.js inlines into the browser bundle at build time.
+const API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY?.trim() ?? "";
+// Advanced markers (the numbered pins) cannot load without a map id. Google's
+// DEMO_MAP_ID is for testing; a real one (free, made in the Cloud Console) is
+// what a deployed site should carry, and is also where the basemap's style
+// is chosen.
+const MAP_ID = process.env.NEXT_PUBLIC_GOOGLE_MAP_ID?.trim() || "DEMO_MAP_ID";
 
-// The largest square that fits the pane (container query units), less a margin.
-const STAGE_SIZE = "w-[min(86cqw,86cqh)] h-[min(86cqw,86cqh)]";
+const isDev = process.env.NODE_ENV !== "production";
 
-/**
- * One day's route on its square stage. Remounted for every day (the parent
- * keys it by day), so the entrance effect below runs once per chosen day and
- * a plain re-render - a stop being hovered - never replays it.
- */
-function RouteStage({
-  group,
-  sketch,
-  activeStop,
-  selectedStop,
-}: {
-  group: DayGroup;
-  sketch: RouteSketch;
-  activeStop: number | null;
-  selectedStop: number | null;
-}) {
-  const lineRef = useRef<SVGPolylineElement | null>(null);
-  const pinRefs = useRef<(HTMLSpanElement | null)[]>([]);
-
-  useLayoutEffect(() => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-
-    // pathLength="1" on the line makes a dash of 1 exactly its full length.
-    lineRef.current?.animate(
-      [
-        { strokeDasharray: "1", strokeDashoffset: "1" },
-        { strokeDasharray: "1", strokeDashoffset: "0" },
-      ],
-      { duration: DRAW_MS, easing: EASE_OUT }
-    );
-    pinRefs.current.forEach((pin, i) => {
-      pin?.animate(
-        [
-          { opacity: 0, scale: "0.9" },
-          { opacity: 1, scale: "1" },
-        ],
-        { duration: PIN_MS, delay: i * PIN_STAGGER_MS, easing: EASE_OUT, fill: "backwards" }
-      );
-    });
-  }, []);
-
-  if (sketch.pins.length === 0) {
-    return (
-      <p className="max-w-56 text-center text-sm text-slate-500">
-        No map coordinates are stored for this day&apos;s stops.
-      </p>
-    );
-  }
-
-  return (
-    <div
-      role="img"
-      aria-label={`Route sketch for day ${group.day}: ${sketch.pins.length} of ${group.stops.length} stops placed`}
-      className={`relative ${STAGE_SIZE}`}
-    >
-      <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" className="absolute inset-0 size-full">
-        {sketch.pins.length > 1 && (
-          <polyline
-            ref={lineRef}
-            points={sketch.line}
-            pathLength={1}
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={0.4}
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="text-slate-900"
-          />
-        )}
-      </svg>
-
-      {sketch.pins.map((pin, i) => (
-        <span
-          key={pin.number}
-          ref={(node) => {
-            pinRefs.current[i] = node;
-          }}
-          aria-hidden="true"
-          data-active={activeStop === pin.number}
-          data-selected={selectedStop === pin.number}
-          style={{ left: `${pin.x}%`, top: `${pin.y}%` }}
-          className="group/pin absolute flex size-6 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-slate-900 bg-white transition-[scale] duration-150 ease-out data-[active=true]:z-10 data-[active=true]:scale-110 data-[selected=true]:outline-2 data-[selected=true]:outline-offset-2 data-[selected=true]:outline-rose-600"
-        >
-          {/* Same lit layer as the timeline's numbered node: fades in, sits under the number; a pressed (selected) stop also keeps a ring. */}
-          <span className="absolute -inset-px rounded-full bg-rose-600 opacity-0 transition-opacity duration-150 ease-out group-data-[active=true]/pin:opacity-100" />
-          <span className="relative text-[11px] font-medium tabular-nums text-slate-900 transition-colors duration-150 ease-out group-data-[active=true]/pin:text-white">
-            {pin.number}
-          </span>
-        </span>
-      ))}
-    </div>
-  );
-}
+// The map and its library stay out of the bundle of every page that is not
+// showing a plan, and of the plan itself until its map pane is on screen.
+const RouteMap = dynamic(() => import("@/components/trip/RouteMap"), {
+  ssr: false,
+  loading: () => <MapLoading />,
+});
 
 /**
- * The map pane: a hairline-gridded canvas holding the selected day's route
- * sketch. There is no basemap yet - the sketch plots the coordinates the plan
- * already stores, and the pane says so - but the contract a real map must
- * keep is already here: pins carry the timeline's stop numbers, and the
- * pane follows the selected day and the stop being pointed at.
+ * The map pane: Google Maps showing the selected day's stops as numbered pins
+ * (the same numbers as the timeline's) joined by a route line, following the
+ * selected day and the stop being pointed at or pressed. Pointing at a pin
+ * lights its row in the list, and pressing it selects the stop there.
  *
  * Sizing is the parent's: it fills whatever box it is given (the sticky
- * half of the screen on desktop, the whole screen under the bar on a phone)
- * and measures it as a size container so the stage can be the largest square
- * that fits.
+ * half of the screen on desktop, the whole screen under the bar on a phone).
+ * Below `lg` that box is hidden behind the List | Map switch, so the pane
+ * watches its own size and only creates the map once it has been seen -
+ * Google bills a map when it loads, and most phone visitors never open it.
  *
- * "Google Maps" is the text attribution Google's rules ask for wherever
- * Places data (here, the stops' coordinates) is shown without a Google map.
+ * Without a browser key, or in a plan whose stops carry no coordinates, the
+ * pane says so instead; the plan itself reads fine without it.
  */
 export function MapPanel({
   group,
+  groups,
   activeStop,
   selectedStop,
+  onHoverStop,
+  onSelectStop,
 }: {
   group: DayGroup | null;
+  /** Every day in the plan: where to look when the chosen day has no placeable stop. */
+  groups: DayGroup[];
   activeStop: number | null;
   selectedStop: number | null;
+  onHoverStop: (stopNumber: number | null) => void;
+  onSelectStop: (stopNumber: number | null) => void;
 }) {
-  const gridId = useId();
-  const sketch = useMemo(() => (group ? sketchRoute(group.stops) : null), [group]);
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  const [visible, setVisible] = useState(false);
+  const [everVisible, setEverVisible] = useState(false);
 
-  // Said plainly: the sketch is not a map, and a stop it could not place is
-  // not silently missing from it.
-  const caption =
-    sketch && sketch.pins.length > 0
-      ? [
-          "Route sketch · not to scale",
-          sketch.missing > 0
-            ? `${sketch.missing} ${sketch.missing === 1 ? "stop has" : "stops have"} no coordinates`
-            : null,
-        ]
-          .filter(Boolean)
-          .join(" · ")
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!pane) return;
+
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      const isVisible = width > 0 && height > 0;
+      setVisible(isVisible);
+      if (isVisible) setEverVisible(true);
+    });
+    observer.observe(pane);
+    return () => observer.disconnect();
+  }, []);
+
+  const day = useMemo(() => (group ? locateStops(group.stops) : null), [group]);
+  const planPoints = useMemo(
+    () => groups.flatMap((planGroup) => locateStops(planGroup.stops).stops.map((stop) => stop.position)),
+    [groups]
+  );
+
+  let body: ReactNode = null;
+  if (!API_KEY) {
+    body = (
+      <MapMessage title="Map unavailable">
+        {isDev ? (
+          <>
+            Set <span className="font-mono text-xs">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</span> in{" "}
+            <span className="font-mono text-xs">.env.local</span> and restart the dev server.
+          </>
+        ) : (
+          "The stops are still in the list."
+        )}
+      </MapMessage>
+    );
+  } else if (planPoints.length === 0) {
+    body = (
+      <MapMessage title="No map locations">
+        No coordinates are stored for this plan&apos;s stops, so there is nothing to place on a map.
+      </MapMessage>
+    );
+  } else if (everVisible && day && group) {
+    body = (
+      <RouteMap
+        apiKey={API_KEY}
+        mapId={MAP_ID}
+        day={group.day}
+        stops={day.stops}
+        fallbackPoints={planPoints}
+        visible={visible}
+        activeStop={activeStop}
+        selectedStop={selectedStop}
+        onHoverStop={onHoverStop}
+        onSelectStop={onSelectStop}
+      />
+    );
+  }
+
+  // Said plainly: a stop the map could not place is not silently missing from it.
+  const notice =
+    day && planPoints.length > 0 && day.missing > 0
+      ? day.stops.length === 0
+        ? "None of this day's stops have a map location"
+        : `${day.missing} ${day.missing === 1 ? "stop has" : "stops have"} no map location`
       : null;
 
   return (
-    <div className="relative size-full overflow-hidden bg-white [container-type:size]">
-      <svg aria-hidden="true" className="absolute inset-0 size-full text-slate-900/[0.07]">
-        <defs>
-          <pattern id={gridId} width="32" height="32" patternUnits="userSpaceOnUse">
-            <path d="M32 0H0V32" fill="none" stroke="currentColor" strokeWidth="1" />
-          </pattern>
-        </defs>
-        <rect width="100%" height="100%" fill={`url(#${gridId})`} />
-      </svg>
+    <div ref={paneRef} className="relative size-full overflow-hidden bg-slate-100">
+      {body}
 
-      <div className="absolute inset-0 flex items-center justify-center">
-        {group && sketch && (
-          <div
-            key={group.day}
-            className="flex size-full items-center justify-center transition-opacity duration-200 ease-out starting:opacity-0 motion-reduce:transition-none"
-          >
-            <RouteStage group={group} sketch={sketch} activeStop={activeStop} selectedStop={selectedStop} />
-          </div>
-        )}
-      </div>
-
-      <div className="pointer-events-none absolute inset-x-4 bottom-4 flex items-end justify-between gap-4 text-xs text-slate-500 lg:inset-x-6 lg:bottom-5">
-        <p>{caption}</p>
-        <p className="shrink-0">Google Maps</p>
-      </div>
+      {notice && (
+        <p className="pointer-events-none absolute left-3 top-3 flex items-center gap-1.5 rounded-md bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 shadow-sm ring-1 ring-slate-200 lg:left-4 lg:top-4">
+          <MapPinOff className="size-3.5 text-slate-500" aria-hidden="true" />
+          {notice}
+        </p>
+      )}
     </div>
   );
 }

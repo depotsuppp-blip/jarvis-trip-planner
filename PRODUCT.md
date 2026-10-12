@@ -13,12 +13,12 @@ Travelers on the open web: people who sign in with Google or email to plan a tri
 Roles inside a trip:
 
 - **Organizer:** starts the trip, holds the private admin link, and locks the plan.
-- **Participant:** joins from a shared link, votes on dates, adds wishlist places and vibes, swipes on suggested places, and reads the plan.
+- **Participant:** joins from a shared link, votes on dates, adds wishlist places and vibes, answers a one-time taste quiz (a swipe deck of 24 places from around the world; once per person, not once per trip), and reads the plan.
 - **Solo traveler:** plans alone on a draft board, or lets the planner decide everything.
 
 ## Product Purpose
 
-Turns "we should go somewhere" into a locked itinerary the whole group had a hand in, without a long chat thread: dates are agreed by vote, taste is gathered from votes and swipes on real places, and an AI-written plan is built from all of it. The product's own name for success is "No One Left Behind": no participant's preferences get dropped.
+Turns "we should go somewhere" into a locked itinerary the whole group had a hand in, without a long chat thread: dates are agreed by vote, taste is gathered from votes and from a one-time swipe quiz on real places around the world, and an AI-written plan is built from all of it. The product's own name for success is "No One Left Behind": no participant's preferences get dropped.
 
 ## Positioning
 
@@ -40,16 +40,17 @@ Four claims the user confirmed another trip planner could not truthfully make:
 
 Built today:
 
-- **Consensus poll** (`/trip/poll/[id]`): each signed-in participant adds a date range, wishlist places and vibe tags, named after their account (no name to type; one entry per account, which a later submit replaces); everyone's entries are listed; the organizer locks the poll and generates the plan. A participant's first vote on a trip sends them on to the swipe deck. An organizer who opens their admin link without signing in can lock but must sign in to vote.
-- **Generated itinerary:** destination inferred from the group's input; per-day stops with real venues, travel time between stops, per-person cost estimates and weather (the map is still a placeholder). The organizer can swap a stop for a live nearby alternative.
+- **Consensus poll** (`/trip/poll/[id]`): each signed-in participant adds a date range, wishlist places and vibe tags, named after their account (no name to type; one entry per account, which a later submit replaces); everyone's entries are listed; the organizer locks the poll and generates the plan. A participant's first vote on a trip sends them on to the swipe deck, unless they have already finished the taste quiz. An organizer who opens their admin link without signing in can lock but must sign in to vote.
+- **Generated itinerary:** destination inferred from the group's input; per-day stops with real venues, travel time between stops, per-person cost estimates and weather. Beside the plan sits a real Google map: each day's stops as numbered pins joined by a route line, matching the numbers in the list (it needs a Maps JavaScript API browser key; without one the pane says so and the plan reads on its own). The organizer can swap a stop for a live nearby alternative.
 - **Dashboard** (`/trip/dashboard/[id]`): participants, top vibes and a wishlist summary.
-- **Swipe deck** (`/trip/swipe/[id]?destination=`): Like or Pass on about 20 Google Places suggestions; answers are saved per signed-in user and trip. Plan generation does not use them yet.
+- **Swipe deck / taste quiz** (`/trip/swipe/[id]`; its cards come from `GET /api/places/deck`): a one-time onboarding quiz that learns a person's general taste (nature or shopping? history or nightlife?), not where to go on one trip, so it asks nothing about a destination. The deck is 24 cards: eight curated themes (for example historical landmarks in Rome, quiet nature spots in Vancouver, night markets in Taipei; the list is `DECK_CATEGORIES` in `lib/placeDeck.ts`), three real places per theme, dealt in a fixed order and fetched fresh on every visit. Like or Pass on each card; signed-in only. Finishing the deck saves the answers as the person's Taste Profile (`TasteSwipe`, one row per place) and marks the quiz done (`hasCompletedTasteProfile`); after that the poll no longer sends them to it, and opening it sends them straight back to the trip. Plan generation does not use the answers yet.
+  - Not finished: each card is also saved as it is answered, per trip (`UserSwipeAction`, with its theme as `category`) so a refresh resumes, which means someone who has not finished and opens the quiz from a second trip's link answers the same cards again; there is no way to retake the quiz once it is done; and nothing reads the Taste Profile back yet.
 - **Sign-in:** Google or email magic link; required for poll, dashboard and swipe (the organizer's admin link bypasses it for poll and dashboard).
 - **Solo draft board** (`/trip/draft/[id]`): free-text board; its "Generate Itinerary" button is still a placeholder.
 
-In the data model but with no UI yet: trip participants and friendships ("Past Trip Mates").
+In the data model but with no UI yet: trip participants and friendships ("Past Trip Mates"). The taste quiz's per-person record, one row per answered place (`TasteSwipe`: the place id, our own theme label and Like or Pass), and the user's one-time "already finished" flag (`hasCompletedTasteProfile`) are written when the quiz is finished (`POST /api/taste-profile`); nothing reads the record back yet, and it holds no Google content beyond the place id.
 
-Terminology: poll, draft board, organizer, lock & generate, vibes, wishlist, swipe deck, "No One Left Behind".
+Terminology: poll, draft board, organizer, lock & generate, vibes, wishlist, swipe deck (the taste quiz), Taste Profile (what the quiz learns about one person), "No One Left Behind".
 
 Constraints:
 
@@ -70,7 +71,7 @@ No user research, testimonials, usage data, screenshots or press exist in the re
 
 ## Product Principles
 
-1. **No one's preferences get dropped.** Every participant's votes and swipes should visibly shape the outcome.
+1. **No one's preferences get dropped.** Every participant's votes and taste-quiz answers should visibly shape the outcome.
 2. **Joining costs almost nothing.** A link and, at most, a sign-in; never an install.
 3. **Plans are real, or they say so.** Name only places, times, costs and weather that came from real data; show "unavailable" rather than guess.
 4. **Group and solo are equals.** Neither path is an afterthought.

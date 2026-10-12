@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getSessionUserId } from "@/lib/auth";
+import { isDeckCategory } from "@/lib/placeDeck";
 import { prisma } from "@/lib/prisma";
 import { checkRateLimit } from "@/lib/rateLimit";
+import type { DeckPlaceCategory } from "@/lib/tripTypes";
 
 // A person can't realistically swipe faster than a couple of cards a
 // second; this just stops a runaway client loop from hammering the
@@ -21,12 +23,21 @@ const SwipeBodySchema = z.object({
   tripId: z.string().trim().regex(TRIP_ID_RE),
   googlePlaceId: z.string().trim().regex(PLACE_ID_RE),
   action: z.enum(["LIKE", "DISLIKE"]),
+  // Optional so a client from before categories existed still saves; when it
+  // is sent it must be one of the deck's taste ids (never stored unchecked).
+  category: z.custom<DeckPlaceCategory>(isDeckCategory).optional(),
 });
 
 /**
- * POST /api/trip/swipe { tripId, googlePlaceId, action: "LIKE" | "DISLIKE" }
- * - records the signed-in user's verdict on one place from the swipe deck
- * (components/trip/SwipeDeck.tsx; "Pass" is DISLIKE) in UserSwipeAction.
+ * POST /api/trip/swipe { tripId, googlePlaceId, action: "LIKE" | "DISLIKE",
+ * category? } - records the signed-in user's verdict on one place from the
+ * swipe deck (components/trip/SwipeDeck.tsx; "Pass" is DISLIKE) in
+ * UserSwipeAction, together with the taste (`category`, a DECK_CATEGORIES id
+ * such as "history") the card was dealt to measure - that is what lets a LIKE
+ * say which kind of place was liked. The category is the client's word for
+ * which card it was (the server deals a fresh deck per request and keeps
+ * none), so it is only checked to be a known id, and it can only ever describe
+ * the caller's own taste.
  *
  * The user is always the session's, never anything in the body, so nobody
  * can record a swipe as someone else. A later swipe on the same (user,
@@ -35,7 +46,8 @@ const SwipeBodySchema = z.object({
  * same atomic "resubmission replaces" convention as addPollVote in
  * lib/store.ts, so a double-tap or a changed mind can't race into a
  * duplicate. createdAt is bumped on a replace so it always reads as "when
- * this verdict was given" (the model has no separate updatedAt).
+ * this verdict was given" (the model has no separate updatedAt). A replace
+ * that sends no category keeps the one already stored.
  *
  * Only the place id is stored, deliberately: Google's Places policies
  * allow keeping ids indefinitely but forbid storing the rest of a place's
@@ -53,11 +65,14 @@ export async function POST(request: NextRequest) {
   const parsed = SwipeBodySchema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
     return NextResponse.json(
-      { error: "tripId, googlePlaceId and action (LIKE or DISLIKE) are required." },
+      {
+        error:
+          "tripId, googlePlaceId and action (LIKE or DISLIKE) are required, and category, if given, must be a known place category.",
+      },
       { status: 400 }
     );
   }
-  const { tripId, googlePlaceId, action } = parsed.data;
+  const { tripId, googlePlaceId, action, category } = parsed.data;
 
   const rateLimit = checkRateLimit(`swipe:${userId}`, SWIPE_RATE_LIMIT, SWIPE_RATE_WINDOW_MS);
   if (!rateLimit.allowed) {
@@ -68,13 +83,15 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    // An undefined category is left out by Prisma: a create stores null and a
+    // replace keeps whatever category the row already has.
     await prisma.userSwipeAction.upsert({
       where: { userId_tripId_googlePlaceId: { userId, tripId, googlePlaceId } },
-      create: { userId, tripId, googlePlaceId, action },
-      update: { action, createdAt: new Date() },
+      create: { userId, tripId, googlePlaceId, action, category },
+      update: { action, category, createdAt: new Date() },
     });
 
-    return NextResponse.json({ ok: true, tripId, googlePlaceId, action });
+    return NextResponse.json({ ok: true, tripId, googlePlaceId, action, category: category ?? null });
   } catch (error) {
     console.error(`POST /api/trip/swipe failed for trip ${tripId}:`, error);
     return NextResponse.json(

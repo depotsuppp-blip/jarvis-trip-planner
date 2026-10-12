@@ -115,6 +115,22 @@ export type DeckPlaceCategory =
   | "nightlife";
 
 /**
+ * What each taste is called on screen: the card's location line and the finish
+ * card's tally. A Record over the union, so adding a taste to
+ * DeckPlaceCategory is a compile error until it has a label here.
+ */
+export const DECK_CATEGORY_LABELS: Record<DeckPlaceCategory, string> = {
+  history: "History",
+  shopping: "Shopping",
+  nature: "Nature",
+  markets: "Night markets",
+  art: "Art",
+  food: "Food",
+  cafes: "Cafes",
+  nightlife: "Nightlife",
+};
+
+/**
  * One card in the swipe deck. `id` is Google's own place id - the only
  * Places value this app is allowed to store (Google's Places policies
  * exempt place ids from their caching ban), and exactly what
@@ -146,6 +162,17 @@ export interface DeckPlace {
    * shown - see the Place Photos (New) docs. null with photoUrl.
    */
   photoAttribution: { name: string; uri: string | null } | null;
+}
+
+/**
+ * One answer in the taste quiz, as POST /api/taste-profile takes it: which
+ * place (Google's id), which taste the card was dealt to measure, and the
+ * verdict. The whole set is sent once, when the last card has been answered.
+ */
+export interface TasteAnswer {
+  googlePlaceId: string;
+  category: DeckPlaceCategory;
+  action: SwipeChoice;
 }
 
 // Rounded, never 0 - "~0 min" would read as broken rather than "very

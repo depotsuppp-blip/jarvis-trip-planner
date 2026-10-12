@@ -18,8 +18,9 @@ export function dayTabId(idPrefix: string, day: number) {
  * selected tab is in the tab order - the panel it controls is
  * `${idPrefix}-panel` (rendered by components/trip/TimelineList.tsx).
  *
- * The selected tab carries its own rose underline, so the list reads
- * correctly with no script. When the selection changes by pointer or touch,
+ * The selected tab carries its own 3px accent underline, so the list reads
+ * correctly with no script; a tab that is only pointed at previews it in a
+ * neutral grey. When the selection changes by pointer or touch,
  * that underline slides from the old tab to the new one (a FLIP: measured
  * before the change, played from the old position to the new), as a
  * transform on the compositor. A keyboard change swaps instantly - someone
@@ -132,14 +133,19 @@ export function DayTabs({
               tabIndex={selected ? 0 : -1}
               // detail === 0 is a click made by the keyboard (Enter or Space).
               onClick={(event: MouseEvent<HTMLButtonElement>) => select(group.day, event.detail === 0)}
-              className="relative flex h-11 shrink-0 items-center px-2 text-sm font-medium text-slate-500 outline-none transition-[color,scale] duration-150 ease-out hover:text-slate-900 focus-visible:text-slate-900 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-rose-600 aria-selected:text-slate-900 active:scale-[0.97]"
+              className="group/tab relative flex h-11 shrink-0 items-center px-2 text-sm font-semibold text-slate-500 outline-none transition-[color,scale] duration-150 ease-out hover:text-slate-900 focus-visible:text-slate-900 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-rose-600 aria-selected:text-slate-900 active:scale-[0.97]"
             >
               Day {group.day}
-              {selected && (
+              {selected ? (
                 <span
                   ref={indicatorRef}
                   aria-hidden="true"
-                  className="absolute inset-x-2 bottom-0 h-0.5 origin-left bg-rose-600"
+                  className="absolute inset-x-2 bottom-0 h-[3px] origin-left rounded-t-full bg-rose-600"
+                />
+              ) : (
+                <span
+                  aria-hidden="true"
+                  className="absolute inset-x-2 bottom-0 h-[3px] rounded-t-full bg-slate-300 opacity-0 transition-opacity duration-150 ease-out group-hover/tab:opacity-100"
                 />
               )}
             </button>

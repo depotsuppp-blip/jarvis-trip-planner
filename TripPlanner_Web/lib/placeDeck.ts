@@ -78,6 +78,15 @@ export const DECK_CATEGORIES: DeckCategorySpec[] = [
   { category: "nightlife", theme: "lively bars and nightlife", city: "Barcelona", fallbackLabel: "Bar" },
 ];
 
+/**
+ * True when `value` is one of the taste ids in DECK_CATEGORIES. What
+ * POST /api/trip/swipe checks a client's `category` against before it is
+ * written, so a stored category is always one the deck can deal.
+ */
+export function isDeckCategory(value: unknown): value is DeckPlaceCategory {
+  return DECK_CATEGORIES.some((spec) => spec.category === value);
+}
+
 /** The Text Search query for one seed, e.g. "quiet nature spots in Vancouver". */
 export function buildSeedQuery(spec: DeckCategorySpec): string {
   return `${spec.theme} in ${spec.city}`;
