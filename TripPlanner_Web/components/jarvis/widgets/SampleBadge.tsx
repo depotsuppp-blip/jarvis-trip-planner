@@ -1,7 +1,7 @@
 /**
  * "Sample": the mark on anything the hub made up to show how it will look - a
- * widget previewed from the test bench, the simulated voice turn. It sits where a
- * person would otherwise read invented content as real.
+ * widget previewed from the test bench. It sits where a person would otherwise
+ * read invented content as real.
  */
 export function SampleBadge() {
   return (

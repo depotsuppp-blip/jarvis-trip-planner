@@ -1,20 +1,28 @@
 import type { ServerMessageLike } from "./messageContent";
 
 /**
- * The hub's only door to the server: four calls on `/api/chat`, each answering
+ * The hub's only door to the server: five calls on `/api/chat`, each answering
  * `{ ok: true, data }` or `{ ok: false, kind, message }` and never throwing, so
  * the state layer (`chatController.ts`) reads results instead of catching.
  *
  *   GET  /api/chat                          the latest session's messages
  *   GET  /api/chat?conversationId=<id>      one session's messages
  *   GET  /api/chat/sessions                 the signed-in person's sessions, newest first
- *   POST /api/chat { message, conversationId?, newConversation? }   one turn
+ *   POST /api/chat { message, conversationId?, newConversation? }   one typed turn
+ *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?)   one spoken turn
  *
  * `message` / `content` come back as stored: the controller parses a reply into
  * text and widgets (`messageContent.ts`), this file only moves bytes.
  */
 
-export type ApiFailureKind = "signed-out" | "not-found" | "rate-limited" | "brain" | "server" | "network";
+export type ApiFailureKind =
+  | "signed-out"
+  | "not-found"
+  | "rate-limited"
+  | "no-speech"
+  | "brain"
+  | "server"
+  | "network";
 
 export interface ApiFailure {
   ok: false;
@@ -41,6 +49,13 @@ export interface TurnData {
   reply: ServerMessageLike;
 }
 
+/** A spoken turn: the same answer as a typed one, plus the words that were heard. */
+export interface VoiceTurnData extends TurnData {
+  transcript: string;
+  /** "openai" when speech-to-text really ran; "mock" when the brain has no key for it and `transcript` is a stand-in. */
+  engine: string;
+}
+
 export interface TurnRequest {
   message: string;
   /** Continue this session. */
@@ -58,6 +73,7 @@ function kindFor(status: number): ApiFailureKind {
   if (status === 401) return "signed-out";
   if (status === 404) return "not-found";
   if (status === 429) return "rate-limited";
+  if (status === 422) return "no-speech";
   if (status === 502) return "brain";
   return "server";
 }
@@ -108,4 +124,21 @@ export const chatApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(turn),
     }),
+
+  // The recording goes as multipart, and no Content-Type is set so the browser adds the boundary.
+  // No client timeout, for the same reason as `send`: transcription and then the brain's whole turn.
+  sendVoice: (audio: Blob, turn: Omit<TurnRequest, "message">) => {
+    const form = new FormData();
+    form.append("audio", audio, `voice.${extensionFor(audio.type)}`);
+    if (turn.conversationId) form.append("conversationId", turn.conversationId);
+    else if (turn.newConversation) form.append("newConversation", "true");
+    return request<VoiceTurnData>("/api/chat/voice", { method: "POST", body: form });
+  },
 };
+
+/** A file extension for a recording's content type, so the upload is named for what it is. */
+function extensionFor(type: string): string {
+  if (type.includes("mp4")) return "mp4";
+  if (type.includes("ogg")) return "ogg";
+  return "webm";
+}

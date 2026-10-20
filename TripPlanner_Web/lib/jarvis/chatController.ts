@@ -1,12 +1,5 @@
 import { chatApi, type ApiFailure } from "./chatApi";
-import {
-  demoReply,
-  initialAgents,
-  MOCK_VOICE_QUESTION,
-  MOCK_VOICE_REPLIES,
-  parseDemoCommand,
-  type DemoTool,
-} from "./demo";
+import { demoReply, initialAgents, parseDemoCommand, type DemoTool } from "./demo";
 import { toChatMessage } from "./messageContent";
 import { createStore } from "./store";
 import {
@@ -19,12 +12,19 @@ import {
   type OrbState,
   type SessionSummary,
 } from "./types";
+import {
+  startRecording,
+  VoiceRecorderError,
+  type ActiveRecording,
+  type RecordedAudio,
+  type VoiceRecorderFailure,
+} from "./voiceRecorder";
 
 /**
  * Everything the hub DOES, with no React in it: load and switch sessions, send
- * a turn, play the simulated voice turn, keep the orb's mode and the agents'
- * status. Components read two stores (`chat`, `orb`) through selectors and call
- * `actions`; they hold no chat logic and no timers of their own.
+ * a typed turn, record and send a spoken one, keep the orb's mode and the
+ * agents' status. Components read two stores (`chat`, `orb`) through selectors
+ * and call `actions`; they hold no chat logic and no timers of their own.
  *
  * Two stores, not one, on purpose: the orb mode changes a few times a turn and
  * the messages change whenever anything is said. Kept apart, a new message
@@ -38,14 +38,32 @@ import {
  * finishes after the person has opened another session is not appended to it).
  */
 
-// The simulated voice turn and the widget previews: how long each stage lasts.
-const MOCK_LISTEN_MS = 2600;
-const MOCK_THINK_MS = 2200;
-const MOCK_SPEAK_MS = 3000;
+// How long the widget previews "think" for.
 const DEMO_THINK_MS = 900;
+
+// A spoken turn: a recording ends by itself at the maximum (and is sent), and one
+// shorter than the minimum is a mis-tap, not a message.
+const MAX_RECORDING_MS = 60_000;
+const MIN_RECORDING_MS = 600;
+// What the Voice row says when nothing is happening (demo.ts's initialAgents starts it the same way).
+const VOICE_IDLE_DETAIL = "Tap Talk to speak";
 
 // The server titles a session with the start of its first message (app/api/chat/route.ts).
 const TITLE_CHARS = 60;
+
+const MICROPHONE_PROBLEM: Record<VoiceRecorderFailure, { message: string; detail: string }> = {
+  unsupported: {
+    message: "This browser can't record audio here. Voice needs a recent browser, on https:// or localhost.",
+    detail: "Browser can't record",
+  },
+  denied: {
+    message: "Microphone access is blocked. Allow it for this site in your browser's address bar, then tap Talk again.",
+    detail: "Microphone blocked",
+  },
+  "no-device": { message: "No microphone was found. Plug one in, then tap Talk again.", detail: "No microphone found" },
+  busy: { message: "The microphone is busy - another app may be using it.", detail: "Microphone busy" },
+  failed: { message: "Couldn't start the microphone. Please try again.", detail: "Couldn't start" },
+};
 
 export interface ChatActions {
   /** One typed turn. A message that is exactly a demo command (`/status`) is answered on this page instead. */
@@ -56,8 +74,14 @@ export interface ChatActions {
   refreshSessions(): Promise<void>;
   /** Loads the open session again after it failed to load. */
   retryConversation(): Promise<void>;
-  /** The Talk button: starts the simulated voice turn, or ends the one in progress. */
+  /**
+   * The Talk button, a toggle: idle -> asks for the microphone and starts recording;
+   * recording -> stops and sends what was said; waiting for the answer -> gives the turn up.
+   */
   toggleVoice(): void;
+  /** Stops recording and sends it (what Talk does while recording). */
+  finishVoice(): Promise<void>;
+  /** Throws a recording away unsent, or gives up on a turn that is waiting for its answer. */
   endVoice(): void;
   /** Test bench: jump the orb straight to a mode. */
   forceOrb(mode: OrbMode): void;
@@ -97,7 +121,10 @@ export class ChatController {
   private nextId = 1;
   private turn = 0;
   private epoch = 0;
-  private replyIndex = 0;
+  /** The recording in progress, if any. */
+  private recorder: ActiveRecording | null = null;
+  /** True while the browser is asking for the microphone, before any audio flows. */
+  private starting = false;
   private disposed = false;
   private bootstrapping: Promise<void> = Promise.resolve();
 
@@ -109,6 +136,7 @@ export class ChatController {
     refreshSessions: () => this.refreshSessions(),
     retryConversation: () => this.retryConversation(),
     toggleVoice: () => this.toggleVoice(),
+    finishVoice: () => this.finishVoice(),
     endVoice: () => this.cancelTurn(),
     forceOrb: (mode) => this.forceOrb(mode),
     previewWidget: (tool) => this.previewWidget(tool),
@@ -124,6 +152,7 @@ export class ChatController {
 
   dispose(): void {
     this.disposed = true;
+    this.abandonRecording();
     this.clearTimers();
     this.turn++;
     this.epoch++;
@@ -281,51 +310,162 @@ export class ChatController {
     this.settle(mine);
   }
 
-  private reportFailure(failure: ApiFailure, epoch: number): void {
+  /** `agent` is the one the failure is charged to: the brain for a typed turn, Voice for a spoken one. */
+  private reportFailure(failure: ApiFailure, epoch: number, agent: "brain" | "voice" = "brain"): void {
     const offline = failure.kind === "brain" || failure.kind === "network";
-    this.setAgent("brain", offline ? "offline" : "idle", offline ? failure.message : undefined);
+    this.setAgent(agent, offline ? "offline" : "idle", offline ? failure.message : undefined);
     if (failure.kind === "signed-out") this.chat.setState({ access: "signed-out" });
     if (epoch !== this.epoch) return;
-    this.append({ role: "jarvis", content: { text: failure.message, widgets: [] }, origin: "server", tone: "error" });
+    this.notify(failure.message);
   }
 
-  // --------------------------------------------------------- simulated voice
+  // -------------------------------------------------------------------- voice
 
   toggleVoice(): void {
-    if (isFocalMode(this.orb.getState().mode)) {
+    const { mode } = this.orb.getState();
+    if (mode === "listening") {
+      void this.finishVoice();
+    } else if (mode === "thinking") {
       this.cancelTurn();
+    } else {
+      void this.startVoice();
+    }
+  }
+
+  /** Asks for the microphone and, once audio flows, listens until told (or MAX_RECORDING_MS) to stop. */
+  private async startVoice(): Promise<void> {
+    if (this.starting || this.recorder) return;
+
+    this.clearTimers();
+    const mine = ++this.turn;
+    this.starting = true;
+    // Pressed from the click on, so the button answers while the browser's permission prompt is up.
+    this.orb.setState({ voice: true });
+
+    let recording: ActiveRecording;
+    try {
+      recording = await startRecording({
+        // The microphone went away mid-sentence: send what there is.
+        onEnded: () => {
+          if (this.turn === mine) void this.finishVoice();
+        },
+      });
+    } catch (error) {
+      this.starting = false;
+      if (this.disposed || this.turn !== mine) return;
+      const problem = MICROPHONE_PROBLEM[error instanceof VoiceRecorderError ? error.kind : "failed"];
+      const missing = error instanceof VoiceRecorderError && ["unsupported", "denied", "no-device"].includes(error.kind);
+      this.setAgent("voice", missing ? "unavailable" : "offline", problem.detail);
+      this.notify(problem.message);
+      this.orb.setState({ mode: "idle", voice: false });
       return;
     }
 
-    this.clearTimers();
-    this.turn++;
-    this.orb.setState({ voice: true, mode: "listening" });
-    this.later(MOCK_LISTEN_MS, () => {
-      this.append({ role: "user", content: { text: MOCK_VOICE_QUESTION, widgets: [] }, origin: "demo" });
-      this.runMockResponse();
-    });
+    this.starting = false;
+    if (this.disposed || this.turn !== mine) {
+      // The person ended the turn, or opened another session, while the browser was asking.
+      recording.discard();
+      return;
+    }
+
+    this.recorder = recording;
+    this.orb.setState({ mode: "listening", voice: true });
+    this.setAgent("voice", "working", "Recording");
+    this.later(MAX_RECORDING_MS, () => void this.finishVoice());
   }
 
-  // thinking -> speaking -> idle.
-  private runMockResponse(): void {
-    this.orb.setState({ mode: "thinking" });
-    this.later(MOCK_THINK_MS, () => {
-      const text = MOCK_VOICE_REPLIES[this.replyIndex++ % MOCK_VOICE_REPLIES.length];
-      this.append({ role: "jarvis", content: { text, widgets: [] }, origin: "demo" });
-      this.orb.setState({ mode: "speaking" });
-      this.later(MOCK_SPEAK_MS, () => this.orb.setState({ mode: "idle", voice: false }));
-    });
+  /** Stops recording and sends it: transcribed and answered on the server, then shown like a typed turn. */
+  async finishVoice(): Promise<void> {
+    const recording = this.recorder;
+    if (!recording) {
+      // Nothing is recording (the test bench forced the orb into this mode): just go home.
+      this.cancelTurn();
+      return;
+    }
+    this.recorder = null;
+    this.clearTimers();
+    const mine = ++this.turn;
+    this.orb.setState({ mode: "thinking", voice: true });
+    this.setAgent("voice", "working", "Transcribing");
+
+    let audio: RecordedAudio;
+    try {
+      audio = await recording.stop();
+    } catch {
+      if (this.turn === mine) {
+        this.setAgent("voice", "offline", "Recording failed");
+        this.notify("Couldn't finish that recording. Please try again.");
+        this.settle(mine);
+      }
+      return;
+    }
+    if (this.disposed || this.turn !== mine) return;
+
+    if (audio.blob.size === 0 || audio.durationMs < MIN_RECORDING_MS) {
+      this.setAgent("voice", "idle", "Last recording was too short");
+      this.notify("That recording was too short. Tap Talk, say it, then tap Send.");
+      this.settle(mine);
+      return;
+    }
+
+    await this.bootstrapping;
+    if (this.disposed) return;
+
+    const epoch = this.epoch;
+    const { activeSessionId } = this.chat.getState();
+    const result = await chatApi.sendVoice(
+      audio.blob,
+      activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }
+    );
+    if (this.disposed) return;
+
+    if (result.ok) {
+      // "mock" means the brain has no speech-to-text key: what it "heard" is a stand-in sentence, and the page says so.
+      const mock = result.data.engine === "mock";
+      this.setAgent("voice", "ready", mock ? "Mock transcription - no speech-to-text key" : "Heard you");
+      this.setAgent("brain", "ready");
+      const heard = toChatMessage(result.data.userMessage);
+      const reply = toChatMessage(result.data.reply);
+      const { conversationId } = result.data;
+      if (epoch === this.epoch) {
+        this.chat.setState((state) => ({
+          access: "signed-in",
+          activeSessionId: conversationId,
+          messages: [...state.messages, heard, reply],
+          sessions: {
+            status: "ready",
+            items: touchSession(
+              state.sessions.items,
+              conversationId,
+              result.data.transcript.slice(0, TITLE_CHARS),
+              reply.createdAt
+            ),
+          },
+        }));
+      } else {
+        // The person opened another session meanwhile: the turn is saved there, this page just refreshes the list.
+        void this.refreshSessions();
+      }
+    } else {
+      this.reportFailure(result, epoch, "voice");
+    }
+
+    this.settle(mine);
   }
 
   // -------------------------------------------------------------- test bench
 
   forceOrb(mode: OrbMode): void {
+    this.abandonRecording();
+    this.resetVoiceAgent();
     this.clearTimers();
     this.turn++;
     this.orb.setState({ mode, voice: mode !== "idle" });
   }
 
   previewWidget(tool: DemoTool): void {
+    this.abandonRecording();
+    this.resetVoiceAgent();
     this.clearTimers();
     const mine = ++this.turn;
     this.orb.setState({ mode: "thinking", voice: false });
@@ -337,11 +477,31 @@ export class ChatController {
 
   // ------------------------------------------------------------------ helpers
 
-  /** Stops whatever the orb is part-way through and sends it home. */
+  /** Stops whatever the orb is part-way through and sends it home. A recording in progress is thrown away. */
   private cancelTurn(): void {
+    this.abandonRecording();
     this.clearTimers();
     this.turn++;
     this.orb.setState({ mode: "idle", voice: false });
+    this.resetVoiceAgent();
+  }
+
+  /** A cancelled recording or upload must not leave the sidebar saying Voice is working. */
+  private resetVoiceAgent(): void {
+    if (this.chat.getState().agents.find((agent) => agent.id === "voice")?.state === "working") {
+      this.setAgent("voice", "idle", VOICE_IDLE_DETAIL);
+    }
+  }
+
+  /** Ends a recording unsent and lets the microphone go. */
+  private abandonRecording(): void {
+    this.recorder?.discard();
+    this.recorder = null;
+  }
+
+  /** A line from Jarvis that is about the page, not a reply: a problem the person can act on. */
+  private notify(text: string): void {
+    this.append({ role: "jarvis", content: { text, widgets: [] }, origin: "server", tone: "error" });
   }
 
   /** Back to idle - but only if nobody pressed End or began another turn meanwhile. */

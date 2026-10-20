@@ -5,7 +5,12 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                    "user_id": "...", "app_url": "..." }
               -> { "reply": "..." }   (a plain sentence, or - when a tool showed the
                                        person a widget - a JSON string, see rich_reply.py)
-    GET  /health -> { "ok": true, "provider": "...", "model": "..." }
+    POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
+                   history (a JSON list shaped like /chat's), user_id, app_url
+              -> { "transcript": "...", "reply": "...", "engine": "openai"|"mock" }
+                 Speech-to-text (stt.py) first, then the transcript is asked exactly as a
+                 typed /chat prompt would be. 422 when nothing was heard.
+    GET  /health -> { "ok": true, "provider": "...", "model": "...", "stt": "openai"|"mock" }
 
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
@@ -40,14 +45,16 @@ Things that differ from the voice assistant, deliberately:
 from __future__ import annotations
 
 import threading
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 import request_context
 import rich_reply
+import stt
 from llm_brain import LLMBrain
 
 HOST = "127.0.0.1"
@@ -57,6 +64,8 @@ PORT = 8000
 ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 MAX_PROMPT_CHARS = 4000
 MAX_HISTORY_TURNS = 100
+# A minute of speech is well under 1 MB in any browser's codec; this is headroom, not a target.
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
 
 
 class HistoryTurn(BaseModel):
@@ -73,6 +82,16 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+class VoiceResponse(BaseModel):
+    transcript: str
+    reply: str
+    # Who did the listening: "openai" (real) or "mock" (no key, nothing was actually heard).
+    engine: str
+
+
+_history_turns = TypeAdapter(Annotated[list[HistoryTurn], Field(max_length=MAX_HISTORY_TURNS)])
 
 
 def _decline(question: str) -> bool:
@@ -103,7 +122,35 @@ def _get_brain() -> LLMBrain:
 @app.get("/health")
 def health() -> dict:
     brain = _get_brain()
-    return {"ok": brain.available, "provider": brain.provider_name, "model": brain.model}
+    return {
+        "ok": brain.available,
+        "provider": brain.provider_name,
+        "model": brain.model,
+        "stt": stt.ENGINE_OPENAI if stt.is_configured() else stt.ENGINE_MOCK,
+    }
+
+
+def _answer(brain: LLMBrain, prompt: str, history: list[HistoryTurn], user_id: str, app_url: str) -> str:
+    """One turn through the brain, as /chat and /voice both ask it. May return ''."""
+    # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
+    turns = [
+        ("user", t.content) if t.role == "user" else ("assistant", rich_reply.history_text(t.content))
+        for t in history
+    ]
+    caller = request_context.RequestContext(
+        channel=request_context.CHANNEL_WEB,
+        user_id=user_id.strip(),
+        app_url=app_url.strip(),
+    )
+    with _lock:
+        brain.set_history(turns)
+        # The context is current only while this request is being answered, on
+        # this thread - see request_context.py.
+        with request_context.use(caller):
+            reply = brain.ask(prompt).strip()
+        # Nothing is carried to the next request; the caller owns the transcript.
+        brain.set_history([])
+    return reply
 
 
 # A plain `def`, not async: ask() blocks for seconds on the network, and
@@ -114,28 +161,56 @@ def chat(body: ChatRequest) -> ChatResponse:
     if not brain.available:
         raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
 
-    # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
-    turns = [
-        ("user", t.content) if t.role == "user" else ("assistant", rich_reply.history_text(t.content))
-        for t in body.history
-    ]
-    caller = request_context.RequestContext(
-        channel=request_context.CHANNEL_WEB,
-        user_id=body.user_id.strip(),
-        app_url=body.app_url.strip(),
-    )
-    with _lock:
-        brain.set_history(turns)
-        # The context is current only while this request is being answered, on
-        # this thread - see request_context.py.
-        with request_context.use(caller):
-            reply = brain.ask(body.prompt).strip()
-        # Nothing is carried to the next request; the caller owns the transcript.
-        brain.set_history([])
-
+    reply = _answer(brain, body.prompt, body.history, body.user_id, body.app_url)
     if not reply:
         raise HTTPException(status_code=502, detail="The brain returned an empty reply.")
     return ChatResponse(reply=reply)
+
+
+# Sync for the same reason as /chat: transcription and the brain both block on the network.
+# Speech-to-text runs OUTSIDE the brain's lock, so a slow upload to the STT provider never
+# holds up another person's typed message.
+@app.post("/voice", response_model=VoiceResponse)
+def voice(
+    audio: UploadFile = File(),
+    history: str = Form("[]"),
+    user_id: str = Form("", max_length=128),
+    app_url: str = Form("", max_length=300),
+) -> VoiceResponse | JSONResponse:
+    brain = _get_brain()
+    # Checked first: no point paying for a transcription nobody can answer.
+    if not brain.available:
+        raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
+
+    data = audio.file.read(MAX_AUDIO_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="The recording was empty.")
+    if len(data) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="The recording is too long.")
+
+    try:
+        turns = _history_turns.validate_json(history)
+    except ValidationError:
+        raise HTTPException(status_code=400, detail="history must be a JSON list of {role, content} turns.")
+
+    print(f"[API] Voice: {len(data):,} bytes of {audio.content_type or 'unknown-type'} audio.")
+    try:
+        heard = stt.transcribe(data, audio.content_type)
+    except stt.SttError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    transcript = heard.text.strip()[:MAX_PROMPT_CHARS]
+    if not transcript:
+        raise HTTPException(status_code=422, detail="I couldn't hear anything in that recording.")
+
+    reply = _answer(brain, transcript, turns, user_id, app_url)
+    if not reply:
+        # The words WERE heard: the caller gets them back so the person's message is not lost.
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "The brain returned an empty reply.", "transcript": transcript, "engine": heard.engine},
+        )
+    return VoiceResponse(transcript=transcript, reply=reply, engine=heard.engine)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getSessionUserId } from "@/lib/auth";
+import {
+  CHAT_RATE_LIMIT,
+  CHAT_RATE_WINDOW_MS,
+  createConversation,
+  findConversation,
+  loadHistory,
+  messageFields,
+  saveReply,
+  saveUserMessage,
+} from "@/lib/chatTurns";
 import { askJarvis, JarvisBrainError, type ChatTurn } from "@/lib/jarvisBrain";
 import { prisma } from "@/lib/prisma";
 import { checkRateLimit } from "@/lib/rateLimit";
 
-const CHAT_RATE_LIMIT = 30;
-const CHAT_RATE_WINDOW_MS = 60_000;
 const MAX_MESSAGE_LENGTH = 4000;
-// How many earlier turns the brain is shown, and how many the page loads.
-const HISTORY_TURNS = 20;
-const TITLE_LENGTH = 60;
 
 const ChatBodySchema = z.object({
   message: z.string().trim().min(1).max(MAX_MESSAGE_LENGTH),
@@ -20,12 +25,6 @@ const ChatBodySchema = z.object({
   // "New session"). Ignored when conversationId names a session.
   newConversation: z.boolean().optional(),
 });
-
-const messageFields = { id: true, role: true, content: true, createdAt: true } as const;
-
-function toRole(role: string): "user" | "jarvis" {
-  return role === "user" ? "user" : "jarvis";
-}
 
 /**
  * POST /api/chat { message, conversationId?, newConversation? } - the Jarvis hub's text turn.
@@ -76,36 +75,18 @@ export async function POST(request: NextRequest) {
   let userMessage;
   let history: ChatTurn[];
   try {
-    const existing = conversationId
-      ? await prisma.conversation.findFirst({ where: { id: conversationId, userId }, select: { id: true } })
-      : newConversation
-        ? null
-        : await prisma.conversation.findFirst({ where: { userId }, orderBy: { updatedAt: "desc" }, select: { id: true } });
+    const existing = await findConversation(userId, { conversationId, newConversation });
 
     if (conversationId && !existing) {
       return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
     }
 
-    conversation =
-      existing ??
-      (await prisma.conversation.create({
-        data: { userId, title: message.slice(0, TITLE_LENGTH) },
-        select: { id: true },
-      }));
+    conversation = existing ?? (await createConversation(userId, message));
 
-    // Read the earlier turns before this one is added, newest first then flipped.
-    const earlier = await prisma.message.findMany({
-      where: { conversationId: conversation.id },
-      orderBy: { createdAt: "desc" },
-      take: HISTORY_TURNS,
-      select: { role: true, content: true },
-    });
-    history = earlier.reverse().map((m) => ({ role: toRole(m.role), content: m.content }));
+    // Read the earlier turns before this one is added.
+    history = await loadHistory(conversation.id);
 
-    userMessage = await prisma.message.create({
-      data: { conversationId: conversation.id, role: "user", content: message },
-      select: messageFields,
-    });
+    userMessage = await saveUserMessage(conversation.id, message);
   } catch (error) {
     console.error("POST /api/chat failed saving the user's message:", error);
     return NextResponse.json({ error: "Couldn't save your message. Please try again." }, { status: 500 });
@@ -124,14 +105,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const [reply] = await prisma.$transaction([
-      prisma.message.create({
-        data: { conversationId: conversation.id, role: "jarvis", content: replyText },
-        select: messageFields,
-      }),
-      // Bumps updatedAt so "latest conversation" follows the last activity.
-      prisma.conversation.update({ where: { id: conversation.id }, data: { updatedAt: new Date() }, select: { id: true } }),
-    ]);
+    const reply = await saveReply(conversation.id, replyText);
     return NextResponse.json({ conversationId: conversation.id, userMessage, reply });
   } catch (error) {
     console.error("POST /api/chat failed saving the reply:", error);

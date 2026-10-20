@@ -3,10 +3,10 @@ import type { AgentStatus, MessageContent, WidgetPayload } from "./types";
 /**
  * Everything on the hub that is made up on this page rather than answered by
  * Jarvis, so the screen can be reviewed without a backend that sends widgets:
- * the slash commands and test-bench buttons that "reply" with a widget, the
- * simulated voice turn, and the agents the sidebar lists. All of it is labelled
- * as a sample where a person could mistake it for real; none of it is sent to
- * Jarvis or saved.
+ * the slash commands and test-bench buttons that "reply" with a widget, and the
+ * agents the sidebar lists. All of it is labelled as a sample where a person
+ * could mistake it for real; none of it is sent to Jarvis or saved. (Voice is
+ * not here any more: the Talk button records and sends for real.)
  */
 
 export type DemoTool = "system_status" | "calendar" | "mystery_tool";
@@ -70,25 +70,17 @@ export function demoReply(tool: DemoTool, now: number): MessageContent {
   }
 }
 
-// The simulated voice turn: the microphone is not wired up yet, so a tap on Talk
-// plays a listen -> think -> speak cycle with these made-up lines.
-export const MOCK_VOICE_QUESTION = "Find me a quiet cafe near the old town.";
-export const MOCK_VOICE_REPLIES = [
-  "Done. I've noted that for your next trip.",
-  "Three places match. Want me to open the first one?",
-  "Your poll has four votes so far, mostly for cafe hopping.",
-] as const;
-
 /**
- * The sidebar's agents and tools. `brain` is live (the controller moves it with
- * each real turn); the rest say what they are without claiming a health they
- * cannot know - a backend that reports tool status will replace this list.
+ * The sidebar's agents and tools. `brain` and `voice` are live (the controller
+ * moves them with each real turn); the rest say what they are without claiming
+ * a health they cannot know - a backend that reports tool status will replace
+ * this list.
  */
 export function initialAgents(): AgentStatus[] {
   return [
     { id: "brain", name: "Jarvis brain", kind: "brain", state: "unknown" },
     { id: "trip-planner", name: "Trip Planner", kind: "tool", state: "idle", detail: "Plans trips from chat" },
-    { id: "voice", name: "Voice", kind: "voice", state: "unavailable", detail: "Simulated in this preview" },
+    { id: "voice", name: "Voice", kind: "voice", state: "idle", detail: "Tap Talk to speak" },
     { id: "calendar", name: "Calendar", kind: "tool", state: "unavailable", detail: "Not connected yet" },
   ];
 }

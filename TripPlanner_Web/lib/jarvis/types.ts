@@ -35,8 +35,8 @@ export interface MessageContent {
 
 /**
  * Where a message came from. "demo" messages are made on this page (the widget
- * previews and the simulated voice turn): nothing was sent to Jarvis, nothing
- * was saved, and the page labels them as samples.
+ * previews): nothing was sent to Jarvis, nothing was saved, and the page labels
+ * them as samples.
  */
 export type MessageOrigin = "server" | "demo";
 
@@ -94,7 +94,7 @@ export interface ChatState {
 
 export interface OrbState {
   mode: OrbMode;
-  /** True from the moment voice mode starts until it ends (a spoken turn, listening through speaking). */
+  /** True from the moment Talk is pressed until the spoken turn ends (asking for the microphone, recording, waiting for the answer). */
   voice: boolean;
 }
 

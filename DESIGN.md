@@ -617,11 +617,11 @@ Authored moments only. The orb glides between its homes in 700ms on the page's e
 
 ### Named Rules
 **The Orb Belongs To The Stage Rule.** The orb centres on the conversation column, never on the window; it follows the dock when the column moves.
-**The Sample Rule.** Whatever the page made up to show how it will look - a previewed widget, the simulated voice turn - wears the Sample badge. Nothing invented is shown as a reading.
+**The Sample Rule.** Whatever the page made up to show how it will look - a previewed widget - wears the Sample badge. Nothing invented is shown as a reading. (A voice turn answered by the brain's MOCK speech-to-text is not made up on the page, but it says what it is in its own words - "This is a mock transcription..." - and in the Voice row.)
 **The One Chrome Rule.** A widget is drawn inside the one frame; a tool that has no view of its own is not allowed to bring its own box.
 
 ### Honest limits
-- Voice is simulated: Talk plays a listen, think, speak cycle with made-up lines and no microphone. The Trip Planner, Voice and Calendar rows in Agents & tools say what they are, not how they are: only the Jarvis brain's state is live (from each turn). A backend that reports tool status will replace the list.
+- Voice is real but one-way: Talk records from the microphone and the brain transcribes and answers it, but Jarvis does not speak the answer back, so the orb never shows Speaking from a real turn. While recording, the orb comes to the middle with a "Recording 0:07" line (an ink dot that pulses like the sidebar's Working dot, still under reduced motion) and Send / Cancel under it; the dock behind the frost is reached by keyboard only. The Jarvis brain and Voice rows are live (from each turn); the Trip Planner and Calendar rows say what they are, not how they are. A backend that reports tool status will replace the list.
 - Only `system_status` has a view. `calendar` is a known tool with a placeholder; any other tool gets the generic placeholder.
 - Sessions: the 50 most recent, no rename, delete or search; the title is the start of the first message.
 - Checked on 2026-10-20 in headless Chrome against a stand-in brain (desktop 1440x900, tablet 820, phone 390), not by a person, and the Impeccable finish reviewer was not run.

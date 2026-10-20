@@ -1,7 +1,7 @@
 "use client";
 
-import { memo, useState, type FormEvent } from "react";
-import { ArrowUp, Mic } from "lucide-react";
+import { memo, useEffect, useRef, useState, type FormEvent } from "react";
+import { ArrowUp, Mic, Square } from "lucide-react";
 import { useChatActions, useOrb, useOrbAnchors } from "@/lib/jarvis/JarvisProvider";
 import { isFocalMode } from "@/lib/jarvis/types";
 import { focusRing } from "./styles";
@@ -11,6 +11,11 @@ import { focusRing } from "./styles";
  * and Talk in ONE ruled control, so the orb reads as part of the input rather
  * than a badge beside it.
  *
+ * Talk records for real (lib/jarvis/voiceRecorder.ts) and is a toggle: one press
+ * starts, the next sends. While it records, the orb comes to the middle of the
+ * stage with a "Recording" clock and Send / Cancel (OrbStage), frosted over this
+ * dock - so the button here is reached by keyboard, and says what its next press does.
+ *
  * The draft lives here, in this component's own state, and nowhere else. Every
  * keystroke re-renders this form and only this form - not the conversation, not
  * the orb (which has its own store) - so typing never costs the animation a frame.
@@ -19,10 +24,20 @@ export const Composer = memo(function Composer() {
   const { slot } = useOrbAnchors();
   const actions = useChatActions();
   const focal = useOrb((state) => isFocalMode(state.mode));
+  const listening = useOrb((state) => state.mode === "listening");
   const voice = useOrb((state) => state.voice);
   const [draft, setDraft] = useState("");
+  const talk = useRef<HTMLButtonElement>(null);
+  const wasVoice = useRef(false);
 
   const canSend = draft.trim().length > 0 && !focal;
+
+  // A spoken turn is over and the buttons that held focus (Send / Cancel on the stage) are gone:
+  // hand focus back to Talk so the next press is one key away - unless the person already went elsewhere.
+  useEffect(() => {
+    if (wasVoice.current && !voice && document.activeElement === document.body) talk.current?.focus();
+    wasVoice.current = voice;
+  }, [voice]);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -63,14 +78,19 @@ export const Composer = memo(function Composer() {
         </button>
 
         <button
+          ref={talk}
           type="button"
           onClick={actions.toggleVoice}
-          aria-label={focal ? "Stop voice mode" : "Talk to Jarvis"}
+          aria-label={listening ? "Stop recording and send" : focal ? "Cancel this turn" : "Talk to Jarvis"}
           aria-pressed={voice}
           className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[background-color,border-color,color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] aria-pressed:border-slate-900 aria-pressed:bg-slate-900 aria-pressed:text-white sm:w-auto sm:px-3.5 ${focusRing}`}
         >
-          <Mic className="size-5" aria-hidden="true" />
-          <span className="hidden sm:inline">Talk</span>
+          {listening ? (
+            <Square className="size-4 fill-current" aria-hidden="true" />
+          ) : (
+            <Mic className="size-5" aria-hidden="true" />
+          )}
+          <span className="hidden sm:inline">{listening ? "Send" : "Talk"}</span>
         </button>
       </form>
     </div>

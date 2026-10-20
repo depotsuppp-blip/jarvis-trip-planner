@@ -185,6 +185,17 @@ httpx>=0.27.0
 fastapi>=0.110.0
 uvicorn>=0.27.0
 
+# Reads the multipart upload of POST /voice (the Talk button's recording): FastAPI
+# refuses to even declare a file-upload endpoint without it, so api_server.py will
+# not start - /chat included - until this is installed (pip install -r requirements.txt).
+python-multipart>=0.0.9
+
+# NOTE ON THE OFFLINE GUARANTEE, again: POST /voice is the one place recorded speech
+# can leave the machine. It goes to OpenAI's Whisper API (stt.py, plain httpx - no
+# openai package) ONLY when OPENAI_API_KEY is set in .env; without a key the endpoint
+# answers with a labelled mock transcription and nothing is sent anywhere. The voice
+# assistant (main.py) is unaffected and stays on-device.
+
 # --- Document text extraction (mcp_filesystem.py) ------------------------
 # The local_fs MCP server reads .pdf and .docx files by extracting their
 # text first (the text is then paged like any other file), so Jarvis can
