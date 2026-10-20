@@ -6,7 +6,12 @@
  *   body  { prompt: string,
  *           history: [{ role: "user" | "jarvis", content }],
  *           user_id?: string, app_url?: string }
- *   reply { reply: string }
+ *   reply { reply: string | object }
+ *
+ *   reply is normally a string: a plain sentence, or - when a tool showed the
+ *   person a widget - a JSON string (see lib/jarvis/messageContent.ts for the
+ *   shapes). A brain that sends the widget as an OBJECT instead is accepted too
+ *   and stored as the same JSON string, so the page reads both the same way.
  *
  *   history = earlier turns, oldest first, not including `prompt`.
  *   user_id = the signed-in person asking (User.id). Jarvis's trip tool acts on
@@ -68,9 +73,28 @@ export async function askJarvis(
   }
 
   const data: unknown = await response.json().catch(() => null);
-  const reply = (data as { reply?: unknown } | null)?.reply;
-  if (typeof reply !== "string" || !reply.trim()) {
-    throw new JarvisBrainError("Jarvis brain sent an empty reply.");
-  }
+  const reply = replyAsText((data as { reply?: unknown } | null)?.reply);
+  if (!reply) throw new JarvisBrainError("Jarvis brain sent an empty reply.");
   return reply;
+}
+
+/**
+ * What the brain's `reply` field is, as the string the chat stores: a string
+ * as it is, an object that carries a widget as its JSON, an object that is only
+ * `{ text }` as that text. Anything else - missing, blank, a number, an object
+ * that says nothing - is null, which the caller reports as an empty reply.
+ */
+export function replyAsText(reply: unknown): string | null {
+  if (typeof reply === "string") return reply.trim() ? reply : null;
+  if (typeof reply !== "object" || reply === null || Array.isArray(reply)) return null;
+
+  const body = reply as Record<string, unknown>;
+  const carriesWidget =
+    body.type === "widget" ||
+    (typeof body.widget === "string" && body.widget.trim() !== "") ||
+    (typeof body.widget === "object" && body.widget !== null) ||
+    (Array.isArray(body.widgets) && body.widgets.length > 0);
+  if (carriesWidget) return JSON.stringify(body);
+
+  return typeof body.text === "string" && body.text.trim() ? body.text : null;
 }

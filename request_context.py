@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import contextvars
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Iterator, Optional
+from dataclasses import dataclass, field
+from typing import Any, Iterator, Optional
 
 CHANNEL_WEB = "web"
 
@@ -37,6 +37,10 @@ class RequestContext:
     # Origin of the TripPlanner_Web instance that sent the request, e.g.
     # "http://localhost:3000"; "" when not known.
     app_url: str = ""
+    # Widgets the tools asked the page to draw during THIS request (see rich_reply.py).
+    # A mutable list on a frozen dataclass: the context is replaced per request, the list is
+    # filled by tools and read once by the brain when it has the final reply.
+    widgets: list[dict[str, Any]] = field(default_factory=list, compare=False, repr=False)
 
     @property
     def is_web(self) -> bool:
@@ -51,6 +55,29 @@ _CURRENT: contextvars.ContextVar[Optional[RequestContext]] = contextvars.Context
 def current() -> Optional[RequestContext]:
     """The context of the request being served, or None outside one."""
     return _CURRENT.get()
+
+
+def add_widget(widget: dict[str, Any]) -> bool:
+    """
+    Asks the web page to draw `widget` with this reply. True when the request is a
+    web chat (which can draw it), False for the voice assistant or outside a request -
+    the caller then puts the information in its spoken result instead.
+    """
+    context = current()
+    if context is None or not context.is_web:
+        return False
+    context.widgets.append(widget)
+    return True
+
+
+def take_widgets() -> list[dict[str, Any]]:
+    """The widgets added so far in this request, handed over once (the list is emptied)."""
+    context = current()
+    if context is None or not context.widgets:
+        return []
+    taken = list(context.widgets)
+    context.widgets.clear()
+    return taken
 
 
 @contextmanager

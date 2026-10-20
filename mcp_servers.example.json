@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mock": {
+      "command": "python",
+      "args": ["mock_mcp_server.py"]
+    }
+  }
+}

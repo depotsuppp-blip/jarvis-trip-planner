@@ -29,3 +29,6 @@ my_jarvis.yaml
 # Screenshots captured for the finish review (regenerated at will). The older
 # swipe-era ones already committed stay tracked; new ones stay out of git.
 .impeccable/review/
+
+# Local MCP server list (may hold env values); the checked-in template is mcp_servers.example.json
+mcp_servers.json

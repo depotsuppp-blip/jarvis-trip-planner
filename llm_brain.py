@@ -26,7 +26,7 @@ Tools live in TOOLS below. Each carries one JSON schema that is
 translated into whichever provider's dialect is in use, so adding a
 tool means writing one entry, not two.
 
-Five things were added to this module beyond plain tool calling:
+Several things were added to this module beyond plain tool calling:
 
   DYNAMIC MODEL ROUTING  _classify_intent labels each question and
       ROUTING_TABLE turns that label into a model, before the turn is
@@ -74,6 +74,15 @@ Five things were added to this module beyond plain tool calling:
       the references; LLMBrain.ask gives the model one chance to fix a bad
       reply and otherwise says it has no link - the guarantee behind the
       prompt rule, because a prompt is only a request.
+
+  MCP CLIENT  tools served by other programs over the Model Context
+      Protocol. mcp_client.py starts the servers listed in mcp_servers.json,
+      asks each for its tools (tools/list) and returns them as ToolSpecs
+      named mcp__<server>__<tool>; calling one forwards a tools/call and the
+      text comes back to the model labelled as external data. The snapshot
+      is re-read every turn like plugins. A tool that is not marked read-only
+      asks for confirmation (the web server declines those). JARVIS_MCP=0
+      turns it off.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -138,8 +147,11 @@ from typing import Any, Callable, Optional
 
 import link_guard
 import llm_budget
+import mcp_client
 import plugin_loader
 import request_context
+import rich_reply
+import system_status
 import task_dispatcher
 import vision_engine
 from tool_spec import ToolSpec
@@ -483,6 +495,9 @@ changes one rule above. A link that a tool returns is the whole point of \
 the answer, so write it into your reply exactly as the tool gave it - on \
 its own line after a short sentence is best - and never shorten, rewrite, \
 or invent a link, or reuse one from earlier in the conversation. \
+A tool may also put a card (a widget) on the person's screen with its \
+result; when its result says so, the person can already see it, so do not \
+read it out or repeat what is in it - one short sentence is enough. \
 Everything else stands: plain text with no markdown, and short."""
 
 # What the brain does when a reply holds a trip link or id that no tool returned
@@ -713,6 +728,23 @@ def _mentions_trip(text: str) -> bool:
     return any(fragment in raw for fragment in _TRIP_SUBSTRINGS)
 
 
+# "How is the system doing?" is a tool call (get_system_status), not conversation: the front
+# door has no tools and would answer it from nothing. Whole words, like the lists above.
+_STATUS_WORDS: tuple[str, ...] = ("cpu", "ram", "memory", "uptime", "telemetry")
+_STATUS_PHRASES: tuple[str, ...] = (
+    "system status", "systems status", "status of the system", "status of the systems",
+    "system health", "how are the systems", "how is the system", "how are you running",
+)
+
+
+def _asks_system_status(text: str) -> bool:
+    """True when the utterance asks how the machine or the systems are doing."""
+    lowered = " " + re.sub(r"[^\w\s]", " ", text.lower()).strip() + " "
+    if any(f" {word} " in lowered for word in _STATUS_WORDS):
+        return True
+    return any(phrase in lowered for phrase in _STATUS_PHRASES)
+
+
 def _classify_intent(text: str) -> tuple[str, str]:
     """
     (intent, reason) for one question. The reason is logged, not spoken.
@@ -852,7 +884,7 @@ def _looks_like_tool_command(text: str) -> bool:
     if any(word in _TOOL_WORDS for word in lowered.split()):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
-    return _mentions_trip(text)
+    return _mentions_trip(text) or _asks_system_status(text)
 
 
 # -- tool implementations ---------------------------------------------
@@ -1047,6 +1079,24 @@ def _tool_generate_trip_plan_async(
         )
 
 
+def _tool_get_system_status() -> str:
+    """
+    Shows the user how the machine is doing: CPU, memory, uptime (MOCK numbers - see
+    system_status.py). On the web chat it asks the page to draw a System status
+    widget and tells the model not to read it out; by voice, where there is no
+    screen, it returns the numbers as a sentence to speak.
+    """
+    snapshot = system_status.collect()
+    try:
+        shown = request_context.add_widget(
+            rich_reply.widget("system_status", system_status.widget_data(snapshot), sample=True)
+        )
+    except (TypeError, ValueError) as exc:  # a bug in widget_data, not the user's problem
+        print(f"[Brain] get_system_status could not build its widget: {exc}")
+        shown = False
+    return system_status.web_result(snapshot) if shown else system_status.spoken_summary(snapshot)
+
+
 def _tool_check_poll_status_async(trip_id: str = "") -> str:
     """
     Reports how many people have voted in a trip's consensus poll.
@@ -1146,6 +1196,10 @@ def _tool_send_line_notification(message: str = "") -> str:
 # The provider used for vision calls, injected by LLMBrain so the tool
 # function stays a plain callable the schema layer can describe.
 _VISION_PROVIDER: Optional["_Provider"] = None
+
+# The MCP tool servers (mcp_client.py). A module global, like the vision
+# provider, because list_capabilities is a plain function with no brain to ask.
+_MCP: Optional[mcp_client.McpManager] = None
 
 
 def _tool_analyze_screen(question: str = "What is on the screen?") -> str:
@@ -1292,6 +1346,8 @@ def _tool_list_capabilities(include_tasks: bool = True) -> str:
         else "No plugin tools have been created yet."
     )
     parts.append(vision_engine.status())
+    if _MCP is not None and _MCP.configured:
+        parts.append(_MCP.status())
     if include_tasks:
         parts.append(task_dispatcher.dispatcher().status_line())
     return " ".join(parts)
@@ -1566,6 +1622,24 @@ TOOLS: list[ToolSpec] = [
         # lose the link.
         background=False,
         label="trip plan to {destination}",
+    ),
+    ToolSpec(
+        name="get_system_status",
+        description=(
+            "Use this when the user asks how the system, the machine or "
+            "Jarvis itself is doing: system status, health, CPU, memory, "
+            "RAM or uptime. It takes no arguments. In the web chat it shows "
+            "the user a System status card, so do not read the numbers out; "
+            "by voice it returns them for you to say. The numbers are "
+            "SAMPLE data, not live readings - say so."
+        ),
+        input_schema={"type": "object", "properties": {}},
+        handler=_tool_get_system_status,
+        requires_confirmation=False,
+        # Foreground: the result IS the answer, and the handler reads the
+        # request context (web or voice), which a background thread would not have.
+        background=False,
+        label="system status",
     ),
     ToolSpec(
         name="check_poll_status_async",
@@ -2497,6 +2571,12 @@ class LLMBrain:
         # Feature 5: plugins are loaded now and re-scanned every turn.
         self._plugin_tools: list[ToolSpec] = []
 
+        # Tools from external MCP servers (mcp_client.py): connected once now,
+        # then re-read every turn like plugins so a server that restarts or
+        # changes its tool list is picked up without restarting Jarvis.
+        self._mcp_tools: list[ToolSpec] = []
+        self._mcp = self._start_mcp()
+
         # Feature 2 bookkeeping: what went to the background, so the same
         # side effect cannot be fired twice (see _execute).
         self._recent_dispatches: dict[str, float] = {}
@@ -2586,8 +2666,56 @@ class LLMBrain:
         return [tool.name for tool in self._active_tools()]
 
     def _active_tools(self) -> list[ToolSpec]:
-        """Built-in tools plus whatever is currently in plugins/."""
-        return list(self._tools) + list(self._plugin_tools)
+        """Built-in tools, whatever is currently in plugins/, and the MCP servers' tools."""
+        return list(self._tools) + list(self._plugin_tools) + list(self._mcp_tools)
+
+    def _start_mcp(self) -> Optional[mcp_client.McpManager]:
+        """
+        Connects to the servers in mcp_servers.json. Returns None when none are
+        configured, and never raises: tool servers are an extra, and a broken
+        one must not stop Jarvis from starting.
+        """
+        global _MCP
+        try:
+            manager = mcp_client.McpManager()
+            if not manager.configured:
+                return None
+            manager.connect_all()
+            self._mcp_tools = manager.tools()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Brain] MCP setup failed: {type(exc).__name__}: {exc}")
+            return None
+        _MCP = manager
+        return manager
+
+    def _refresh_mcp(self) -> None:
+        """Takes this turn's snapshot of the MCP tools (cheap; repairs run in the background)."""
+        if self._mcp is None:
+            return
+        try:
+            self._mcp_tools = self._mcp.tools()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Brain] MCP refresh failed: {type(exc).__name__}: {exc}")
+
+    def _mentions_mcp_tool(self, text: str) -> bool:
+        """True when the utterance uses a word from an MCP tool's own name ("server time")."""
+        if self._mcp is None:
+            return False
+        words = self._mcp.tool_words()
+        tokens = re.sub(r"[^\w\s]", " ", text.lower()).split()
+        return any(token.startswith(word) for token in tokens for word in words)
+
+    def _front_door_prompt(self) -> str:
+        """The router's instructions, plus a line saying external tools exist if any do."""
+        if not self._mcp_tools:
+            return FRONT_DOOR_PROMPT
+        names = ", ".join(t.label or t.name for t in self._mcp_tools[:12])
+        return (
+            FRONT_DOOR_PROMPT
+            + "\n- External tool servers are also connected to the assistant behind you, with tools "
+            + f"such as: {names}. A request one of them could answer is route_to \"ORCHESTRATOR\" "
+            + "with response null."
+        )
 
     def _refresh_plugins(self, verbose: bool = False) -> None:
         """
@@ -2869,6 +2997,8 @@ class LLMBrain:
             return "reasoning-tier question"
         if _looks_like_tool_command(user_text):
             return "tool command"
+        if self._mentions_mcp_tool(user_text):
+            return "mentions an MCP tool"
         if self._awaiting_answer():
             return "answer to Jarvis's own question"
         return ""
@@ -2901,7 +3031,7 @@ class LLMBrain:
 
         try:
             turn = self._call_provider(
-                working, tools=[], model=model, effort=effort, system=FRONT_DOOR_PROMPT
+                working, tools=[], model=model, effort=effort, system=self._front_door_prompt()
             )
         except ProviderError as exc:
             # No speaking the error here: the supervisor is about to make
@@ -2968,6 +3098,7 @@ class LLMBrain:
 
         # Feature 5: pick up any tool written during the previous turn.
         self._refresh_plugins()
+        self._refresh_mcp()
         tools = self._active_tools()
 
         # Feature 3: route this question by intent, BEFORE the turn is
@@ -3051,6 +3182,15 @@ class LLMBrain:
                         + ", ".join(self._dispatched_this_turn)
                         + ". Do not trigger these again.]"
                     )
+
+                # Widgets a tool asked for during THIS request travel with the reply as one
+                # JSON string (rich_reply.py) - after the link guard above, so it only ever
+                # checks the sentence. The model remembers the sentence and a note, not the JSON.
+                widgets = request_context.take_widgets()
+                if widgets:
+                    names = ", ".join(w["tool"].replace("_", " ") for w in widgets)
+                    remembered += f" [A {names} widget was shown to the user.]"
+                    reply = rich_reply.wrap_reply(reply, widgets)
 
                 self._history.append(Turn(kind="user", text=user_text.strip()))
                 self._history.append(Turn(kind="assistant", text=remembered))

@@ -11,6 +11,7 @@ import type { ChatMessage, MessageContent, MessageRole, WidgetPayload } from "./
  *   { "type": "widget", "tool": "calendar", "data": { ... } }
  *   { "text": "Here is your day.", "widget": { "tool": "calendar", "data": { ... } } }
  *   { "text": "Two things came back.", "widgets": [ { "tool": "...", "data": ... }, ... ] }
+ *   { "widget": "calendar", "data": { ... } }          (the tool's name as the value)
  *
  * A widget may also carry `"title"` (replaces the widget's own title) and
  * `"sample": true` (the data is a demonstration; the page says so). A `widget`
@@ -78,7 +79,12 @@ function readWidgets(source: Record<string, unknown>): WidgetPayload[] | null {
     if (!widget) return null;
     widgets.push(widget);
   }
-  if ("widget" in source && source.widget !== undefined && source.widget !== null) {
+  if (typeof source.widget === "string") {
+    // Shorthand: the tool's name is the value and its data sits beside it.
+    const widget = readWidget({ tool: source.widget, data: source.data, title: source.title, sample: source.sample });
+    if (!widget) return null;
+    widgets.push(widget);
+  } else if ("widget" in source && source.widget !== undefined && source.widget !== null) {
     const widget = readWidget(source.widget);
     if (!widget) return null;
     widgets.push(widget);

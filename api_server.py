@@ -3,7 +3,8 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
 
     POST /chat   { "prompt": "...", "history": [{ "role": "user"|"jarvis", "content": "..." }],
                    "user_id": "...", "app_url": "..." }
-              -> { "reply": "..." }
+              -> { "reply": "..." }   (a plain sentence, or - when a tool showed the
+                                       person a widget - a JSON string, see rich_reply.py)
     GET  /health -> { "ok": true, "provider": "...", "model": "..." }
 
 Stateless by design: the web app's database is the source of truth for the
@@ -46,6 +47,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import request_context
+import rich_reply
 from llm_brain import LLMBrain
 
 HOST = "127.0.0.1"
@@ -112,7 +114,11 @@ def chat(body: ChatRequest) -> ChatResponse:
     if not brain.available:
         raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
 
-    turns = [("user" if t.role == "user" else "assistant", t.content) for t in body.history]
+    # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
+    turns = [
+        ("user", t.content) if t.role == "user" else ("assistant", rich_reply.history_text(t.content))
+        for t in body.history
+    ]
     caller = request_context.RequestContext(
         channel=request_context.CHANNEL_WEB,
         user_id=body.user_id.strip(),
