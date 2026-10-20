@@ -44,8 +44,8 @@ const TargetSchema = z.object({
  * 415 not audio, 422 nothing was heard, 429 rate-limited, 502 transcription or
  * the brain failed, 500 database failed.
  *
- * `engine` is "openai" when speech-to-text really ran and "mock" when the brain
- * has no key for it - then `transcript` is a stand-in sentence, not the words.
+ * `engine` says who transcribed it: "openai" (the Whisper API) or "local"
+ * (faster-whisper on the brain's own machine, when it has no OpenAI key).
  */
 export async function POST(request: NextRequest) {
   const userId = await getSessionUserId();

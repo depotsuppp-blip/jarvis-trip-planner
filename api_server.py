@@ -7,10 +7,13 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                                        person a widget - a JSON string, see rich_reply.py)
     POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
                    history (a JSON list shaped like /chat's), user_id, app_url
-              -> { "transcript": "...", "reply": "...", "engine": "openai"|"mock" }
-                 Speech-to-text (stt.py) first, then the transcript is asked exactly as a
-                 typed /chat prompt would be. 422 when nothing was heard.
-    GET  /health -> { "ok": true, "provider": "...", "model": "...", "stt": "openai"|"mock" }
+              -> { "transcript": "...", "reply": "...", "engine": "openai"|"local" }
+                 Speech-to-text (stt.py: OpenAI Whisper with OPENAI_API_KEY, otherwise
+                 faster-whisper on this machine) first, then the transcript is asked
+                 exactly as a typed /chat prompt would be. 422 when nothing was heard.
+    GET  /health -> { "ok": true, "provider": "...", "model": "...",
+                      "stt": "openai"|"local", "stt_ready": true|false }
+                 stt_ready is false while the on-device model is still loading.
 
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
@@ -45,6 +48,7 @@ Things that differ from the voice assistant, deliberately:
 from __future__ import annotations
 
 import threading
+from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -87,7 +91,7 @@ class ChatResponse(BaseModel):
 class VoiceResponse(BaseModel):
     transcript: str
     reply: str
-    # Who did the listening: "openai" (real) or "mock" (no key, nothing was actually heard).
+    # Who did the listening: "openai" (the Whisper API) or "local" (faster-whisper on this machine).
     engine: str
 
 
@@ -99,7 +103,16 @@ def _decline(question: str) -> bool:
     return False
 
 
-app = FastAPI(title="Jarvis brain", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # The on-device speech model takes seconds to load: start that now, on its own
+    # thread (importing it is slow too), so the first Talk press does not wait for it
+    # and the server is not held back from answering. A no-op when OPENAI_API_KEY is set.
+    threading.Thread(target=stt.warm_up, name="jarvis-stt-warmup", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Jarvis brain", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -126,7 +139,8 @@ def health() -> dict:
         "ok": brain.available,
         "provider": brain.provider_name,
         "model": brain.model,
-        "stt": stt.ENGINE_OPENAI if stt.is_configured() else stt.ENGINE_MOCK,
+        "stt": stt.engine(),
+        "stt_ready": stt.is_ready(),
     }
 
 

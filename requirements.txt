@@ -75,6 +75,10 @@ vosk>=0.3.45
 #
 # Without it, ACTIVE mode falls back to Vosk and English-only commands.
 #
+# Also the speech-to-text behind the web hub's Talk button when no
+# OPENAI_API_KEY is set (stt.py -> api_server.py POST /voice): the browser's
+# recording is decoded by PyAV and transcribed here, on this machine.
+#
 # Also supplies end-of-speech detection (vad_capture.py): faster-whisper
 # bundles the Silero VAD model as an ONNX file, and vad_capture.py runs it
 # on the onnxruntime already required above for openWakeWord. There is no
@@ -192,9 +196,11 @@ python-multipart>=0.0.9
 
 # NOTE ON THE OFFLINE GUARANTEE, again: POST /voice is the one place recorded speech
 # can leave the machine. It goes to OpenAI's Whisper API (stt.py, plain httpx - no
-# openai package) ONLY when OPENAI_API_KEY is set in .env; without a key the endpoint
-# answers with a labelled mock transcription and nothing is sent anywhere. The voice
-# assistant (main.py) is unaffected and stays on-device.
+# openai package) ONLY when OPENAI_API_KEY is set in .env. Without a key the recording
+# is transcribed on this machine by faster-whisper (declared above, in the Module 9
+# block - the same model and settings as the voice assistant, and PyAV inside it
+# decodes the browser's WebM/MP4 without a separate FFmpeg) and nothing is sent
+# anywhere. With neither a key nor faster-whisper, /voice says so instead of guessing.
 
 # --- Document text extraction (mcp_filesystem.py) ------------------------
 # The local_fs MCP server reads .pdf and .docx files by extracting their

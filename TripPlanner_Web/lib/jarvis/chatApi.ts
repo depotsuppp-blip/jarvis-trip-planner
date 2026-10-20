@@ -52,7 +52,7 @@ export interface TurnData {
 /** A spoken turn: the same answer as a typed one, plus the words that were heard. */
 export interface VoiceTurnData extends TurnData {
   transcript: string;
-  /** "openai" when speech-to-text really ran; "mock" when the brain has no key for it and `transcript` is a stand-in. */
+  /** Who transcribed it: "openai" (the Whisper API) or "local" (faster-whisper on the brain's own machine). */
   engine: string;
 }
 

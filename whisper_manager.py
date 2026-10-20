@@ -259,6 +259,30 @@ def _beam_size() -> int:
         return 5
 
 
+# A repeated prompt fragment shorter than this is not told apart from a real command
+# that happens to be in the prompt ("check database", "run workflow").
+PROMPT_ECHO_MIN_CHARS = 20
+
+
+def _fold(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def _echoes_prompt(text: str) -> bool:
+    """
+    True when `text` is just a piece of the initial prompt said back.
+
+    Given audio with nothing in it to transcribe - room noise, a hum, a tone that
+    gets past the VAD - Whisper tends to answer with the prompt it was primed with
+    ("Bilingual Thai-English voice commands."). For the voice assistant that is
+    noise in a log; for the web hub it would become a message the person never
+    said. The prompt itself has to stay (see the module docstring), so the echo is
+    recognised instead: a long enough fragment, letters only, found inside it.
+    """
+    heard = _fold(text)
+    return len(heard) >= PROMPT_ECHO_MIN_CHARS and heard in _fold(_initial_prompt())
+
+
 def is_available() -> bool:
     """True if the faster-whisper package imported."""
     return _WHISPER_AVAILABLE
@@ -375,6 +399,11 @@ class WhisperTranscriber:
     @property
     def description(self) -> str:
         return f"faster-whisper {self._size} ({self._device}/{self._compute})"
+
+    @property
+    def load_error(self) -> str:
+        """Why the model could not be loaded; '' while it is loading and once it has loaded."""
+        return self._load_error
 
     def preload_async(self) -> None:
         """
@@ -493,18 +522,7 @@ class WhisperTranscriber:
 
         started = time.monotonic()
         try:
-            segments, info = self._model.transcribe(
-                audio,
-                language=_language(),          # None -> auto-detect
-                task="transcribe",             # never "translate"
-                initial_prompt=_initial_prompt(),
-                beam_size=_beam_size(),
-                vad_filter=vad_filter,         # trim silence before decoding
-                # Each command is independent; carrying context across
-                # them makes Whisper repeat the previous sentence when
-                # this one is short or noisy.
-                condition_on_previous_text=False,
-            )
+            segments, info = self._model.transcribe(audio, **self._decode_options(vad_filter))
             text = " ".join(segment.text.strip() for segment in segments).strip()
         except Exception as exc:  # noqa: BLE001 - must not break the session loop
             print(f"[Whisper] Transcription failed: {type(exc).__name__}: {exc}")
@@ -518,6 +536,59 @@ class WhisperTranscriber:
             f"{elapsed:.1f}s decode, language={detected} ({confidence:.0%})."
         )
         return text
+
+    def transcribe_recording(self, source, vad_filter: bool = True) -> str:
+        """
+        Transcribes an ENCODED recording - a path or a binary file object holding
+        WebM/Opus, MP4/AAC, WAV and the like. faster-whisper decodes it and
+        resamples to 16 kHz mono itself (through PyAV, which carries its own
+        FFmpeg), so no codec is needed beyond the installed packages.
+
+        For audio this module did not capture: the web hub's Talk button
+        (stt.py) hands over whatever MediaRecorder produced. Same model, same
+        options as transcribe() - see _decode_options. Text that only repeats the
+        initial prompt (what Whisper says when there is nothing to transcribe) is
+        dropped, so a recording of noise comes back as "", not as a made-up message.
+
+        Unlike transcribe(), this RAISES when the model is not loaded or the
+        recording cannot be decoded: a person waiting on a reply is owed the
+        difference between "nothing was said" (returns "") and "it broke".
+        The caller waits for the model first (ensure_loaded).
+        """
+        if self._model is None:
+            raise RuntimeError(self._load_error or "The speech model is not loaded.")
+
+        started = time.monotonic()
+        segments, info = self._model.transcribe(source, **self._decode_options(vad_filter))
+        heard = [segment.text.strip() for segment in segments]
+        spoken = [part for part in heard if part and not _echoes_prompt(part)]
+        if len(spoken) < len([part for part in heard if part]):
+            print("[Whisper] Dropped text that only repeats the initial prompt (no speech to transcribe).")
+        text = " ".join(spoken).strip()
+
+        elapsed = time.monotonic() - started
+        detected = getattr(info, "language", "?")
+        confidence = getattr(info, "language_probability", 0.0) or 0.0
+        print(
+            f"[Whisper] {getattr(info, 'duration', 0.0):.1f}s recording -> "
+            f"{elapsed:.1f}s decode, language={detected} ({confidence:.0%}), {len(text)} characters."
+        )
+        return text
+
+    @staticmethod
+    def _decode_options(vad_filter: bool) -> dict:
+        """The decoding settings, in one place so every way into the model uses the same ones."""
+        return {
+            "language": _language(),               # None -> auto-detect
+            "task": "transcribe",                  # never "translate"
+            "initial_prompt": _initial_prompt(),
+            "beam_size": _beam_size(),
+            "vad_filter": vad_filter,              # trim silence before decoding
+            # Each command is independent; carrying context across
+            # them makes Whisper repeat the previous sentence when
+            # this one is short or noisy.
+            "condition_on_previous_text": False,
+        }
 
     # -- capture -------------------------------------------------------
 

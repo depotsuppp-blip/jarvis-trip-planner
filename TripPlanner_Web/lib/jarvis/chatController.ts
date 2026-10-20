@@ -420,9 +420,8 @@ export class ChatController {
     if (this.disposed) return;
 
     if (result.ok) {
-      // "mock" means the brain has no speech-to-text key: what it "heard" is a stand-in sentence, and the page says so.
-      const mock = result.data.engine === "mock";
-      this.setAgent("voice", "ready", mock ? "Mock transcription - no speech-to-text key" : "Heard you");
+      // Say where the words were heard: "local" never left the brain's machine, "openai" went to the Whisper API.
+      this.setAgent("voice", "ready", result.data.engine === "local" ? "Heard you, on this device" : "Heard you");
       this.setAgent("brain", "ready");
       const heard = toChatMessage(result.data.userMessage);
       const reply = toChatMessage(result.data.reply);

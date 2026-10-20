@@ -30,13 +30,14 @@
  *   POST {JARVIS_VOICE_URL}   default: JARVIS_BRAIN_URL with its /chat swapped for /voice
  *   body  multipart/form-data: audio (the recording), history (a JSON list of
  *         the same turns as above), user_id?, app_url?
- *   reply { transcript: string, reply: string | object, engine: "openai" | "mock" }
+ *   reply { transcript: string, reply: string | object, engine: "openai" | "local" }
  *   422 { detail }                 nothing was heard in the recording
  *   502 { detail, transcript? }    transcription failed (no transcript), or the
  *                                  words were heard but the brain had no answer
  *
- * `engine` says who did the listening: "mock" means no speech-to-text key is
- * set on the brain, so `transcript` is a stand-in sentence, not what was said.
+ * `engine` says who did the listening: "openai" is the Whisper API (the brain has
+ * an OPENAI_API_KEY and the recording left the machine); "local" is faster-whisper
+ * on the brain's own machine.
  */
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string };
@@ -108,7 +109,7 @@ export class JarvisVoiceError extends JarvisBrainError {
 export interface VoiceAnswer {
   transcript: string;
   reply: string;
-  /** "mock": no speech-to-text key is configured, so `transcript` is a stand-in sentence. */
+  /** Who transcribed it: "openai" (the Whisper API) or "local" (faster-whisper on the brain's machine). */
   engine: string;
 }
 

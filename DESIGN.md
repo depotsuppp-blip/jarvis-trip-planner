@@ -617,7 +617,7 @@ Authored moments only. The orb glides between its homes in 700ms on the page's e
 
 ### Named Rules
 **The Orb Belongs To The Stage Rule.** The orb centres on the conversation column, never on the window; it follows the dock when the column moves.
-**The Sample Rule.** Whatever the page made up to show how it will look - a previewed widget - wears the Sample badge. Nothing invented is shown as a reading. (A voice turn answered by the brain's MOCK speech-to-text is not made up on the page, but it says what it is in its own words - "This is a mock transcription..." - and in the Voice row.)
+**The Sample Rule.** Whatever the page made up to show how it will look - a previewed widget - wears the Sample badge. Nothing invented is shown as a reading. (Voice is not one of these: a spoken turn is transcribed by the brain, and the Voice row says where - "on this device" for faster-whisper.)
 **The One Chrome Rule.** A widget is drawn inside the one frame; a tool that has no view of its own is not allowed to bring its own box.
 
 ### Honest limits
