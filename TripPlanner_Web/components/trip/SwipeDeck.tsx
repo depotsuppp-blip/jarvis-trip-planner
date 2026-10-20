@@ -29,13 +29,8 @@ import {
   Undo2,
   X,
 } from "lucide-react";
-import {
-  DECK_CATEGORY_LABELS,
-  type DeckPlace,
-  type DeckPlaceCategory,
-  type SwipeChoice,
-  type TasteAnswer,
-} from "@/lib/tripTypes";
+import { summarizeTaste } from "@/lib/tasteSummary";
+import type { DeckPlace, DeckPlaceCategory, SwipeChoice, TasteAnswer } from "@/lib/tripTypes";
 
 // How far (px) a card has to be dragged for letting go to commit a swipe...
 const SWIPE_DISTANCE_PX = 110;
@@ -72,15 +67,20 @@ const NUDGE_STORAGE_KEY = "tripPlanner.swipeNudgeSeen";
 const NUDGE_DELAY_MS = 700;
 const NUDGE_MS = 1100;
 
+// Liked places listed on the finish card before "+N more", and how many themes
+// it calls the person's top vibes.
+const LIKED_ROWS_SHOWN = 4;
+const TOP_VIBES_SHOWN = 3;
+
 // The card stack is sized from the viewport so the Undo/Pass/Like buttons
 // below it stay on screen even on a short phone: everything else on the page
-// (sticky bar, counters, buttons, hint, attribution, page padding) measures
-// 19.1rem, so the card gets what's left, up to 32rem. Shared by the real stack
+// (sticky header, counters, buttons, hint, attribution, page padding) is
+// 23.05rem, so the card gets what's left, up to 32rem. Shared by the real stack
 // and the skeleton so nothing jumps when the deck finishes loading.
-const STACK_HEIGHT_CLASS = "h-[clamp(16rem,calc(100svh-19.2rem),32rem)]";
+const STACK_HEIGHT_CLASS = "h-[clamp(16rem,calc(100svh-23.05rem),32rem)]";
 // While the "picks weren't saved" banner is showing it takes 4rem more, so
 // the card gives that back rather than pushing the buttons off screen.
-const STACK_HEIGHT_WITH_BANNER_CLASS = "h-[clamp(12rem,calc(100svh-23.2rem),32rem)]";
+const STACK_HEIGHT_WITH_BANNER_CLASS = "h-[clamp(12rem,calc(100svh-27.05rem),32rem)]";
 
 const compactCount = new Intl.NumberFormat("en", { notation: "compact" });
 
@@ -247,22 +247,64 @@ async function postSwipe(
   }
 }
 
-// The finished quiz, handed over as the person's Taste Profile (see
-// POST /api/taste-profile, which also marks the quiz as done for them).
-// `keepalive` lets the request outlive the page, so closing the tab right after
-// the last card doesn't lose it. Like postSwipe, a save with no answer within
-// SAVE_TIMEOUT_MS counts as failed.
-async function postTasteProfile(answers: TasteAnswer[]): Promise<boolean> {
+// Why the Taste Profile did not save, as far as the browser can tell. It words
+// the banner and what goes to the console; only "offline" and "server" are worth
+// trying again by themselves (a signed-out person, a rejected body or a
+// rate-limited one will get the same answer a second later).
+type ProfileFailure = "signed-out" | "busy" | "invalid" | "offline" | "server";
+
+// The pauses before the automatic second and third attempt. The server's write
+// is a replace, so repeating a request that was half seen is safe.
+const PROFILE_RETRY_DELAYS_MS = [800, 2500];
+
+// One attempt at POST /api/taste-profile: null when saved, else why not. Like
+// postSwipe, a save with no answer within SAVE_TIMEOUT_MS counts as failed. The
+// reason is logged here (status + the server's `code`) so a failure is never
+// just a red banner: it can be read in the browser console and matched to the
+// "[taste-profile]" line in the server log.
+async function postTasteProfileOnce(answers: TasteAnswer[], keepalive: boolean): Promise<ProfileFailure | null> {
   try {
-    const { ok } = await requestJson("/api/taste-profile", SAVE_TIMEOUT_MS, {
+    const { ok, status, data } = await requestJson("/api/taste-profile", SAVE_TIMEOUT_MS, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ answers }),
-      keepalive: true,
+      ...(keepalive ? { keepalive: true } : {}),
     });
-    return ok;
-  } catch {
-    return false;
+    if (ok) return null;
+
+    console.error("[taste-profile] the save was refused", { status, code: (data as { code?: unknown } | null)?.code });
+    return status === 401 ? "signed-out" : status === 429 ? "busy" : status === 400 ? "invalid" : "server";
+  } catch (error) {
+    console.error("[taste-profile] the save did not get an answer", error);
+    return "offline";
+  }
+}
+
+// The finished quiz, handed over as the person's Taste Profile (see
+// POST /api/taste-profile, which also marks the quiz as done for them).
+// `keepalive` lets the first request outlive the page, so closing the tab right
+// after the last card doesn't lose it; the follow-up attempts leave it off in
+// case a browser is what refused it.
+async function postTasteProfile(answers: TasteAnswer[]): Promise<ProfileFailure | null> {
+  let failure = await postTasteProfileOnce(answers, true);
+  for (const delay of PROFILE_RETRY_DELAYS_MS) {
+    if (failure !== "offline" && failure !== "server") break;
+    await new Promise((resolve) => window.setTimeout(resolve, delay));
+    failure = await postTasteProfileOnce(answers, false);
+  }
+  return failure;
+}
+
+function profileFailureMessage(failure: ProfileFailure) {
+  switch (failure) {
+    case "signed-out":
+      return "You were signed out, so your taste profile wasn't saved.";
+    case "busy":
+      return "Your taste profile wasn't saved - too many tries. Wait a moment, then retry.";
+    case "offline":
+      return "Your taste profile wasn't saved - check your connection, then retry.";
+    default:
+      return "Your taste profile wasn't saved.";
   }
 }
 
@@ -277,21 +319,38 @@ function summarize(liked: number, passed: number, total: number) {
 // Shared pieces
 // ---------------------------------------------------------------------
 
-// The swipe step speaks the Modern Editorial dialect, the same as the plan
-// view and sign-in: a white ground, 1px slate rules, ink text, 6px corners
-// and no shadows. Deep Signal Rose (rose-600) means "like", the one primary
-// action and the keyboard focus ring - nothing else.
-const focusClass =
-  "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600";
-const buttonShape = `inline-flex items-center justify-center gap-2 rounded-md font-semibold transition-[background-color,border-color,color,scale] duration-150 ease-out active:scale-[0.98] ${focusClass}`;
-const primaryButtonClass = `${buttonShape} h-12 bg-rose-600 px-5 text-sm text-white hover:bg-rose-700`;
-// The full-width primary (52px, 16px label) - its own string rather than
-// primaryButtonClass plus overrides, since two utilities for one property
-// (text-sm / text-base) are decided by stylesheet order, not by which comes
-// last in the class attribute.
-const primaryButtonLargeClass = `${buttonShape} h-13 w-full bg-rose-600 px-6 text-base text-white hover:bg-rose-700`;
-const secondaryButtonClass = `${buttonShape} h-12 border border-slate-300 bg-white px-5 text-sm text-slate-900 hover:border-slate-900`;
-const ghostButtonClass = `${buttonShape} h-12 px-5 text-sm text-slate-700 hover:bg-slate-100`;
+// The swipe step is the playful part of the app: big rounded cards with soft
+// shadows, round buttons and one loud rose. Deep Signal Rose (rose-600) means
+// "like", the one primary action and nothing else; the focus ring is its pale
+// tint. (The plan view and sign-in speak the stricter Modern Editorial dialect
+// - a taste quiz that feels like a form gets abandoned.)
+const primaryButtonClass =
+  "inline-flex min-h-12 items-center justify-center gap-2 rounded-full bg-rose-600 px-5 text-sm font-semibold text-white shadow-md shadow-rose-600/20 outline-none transition hover:bg-rose-700 focus-visible:ring-4 focus-visible:ring-rose-200 active:scale-[0.98]";
+// The full-width submit-sized primary (52-56px, 16px label) - its own string
+// rather than primaryButtonClass plus overrides, since two utilities for one
+// property (text-sm / text-base) are decided by stylesheet order, not by
+// which comes last in the class attribute.
+const primaryButtonLargeClass =
+  "inline-flex min-h-14 w-full items-center justify-center gap-2 rounded-full bg-rose-600 px-6 text-base font-semibold text-white shadow-md shadow-rose-600/20 outline-none transition hover:bg-rose-700 focus-visible:ring-4 focus-visible:ring-rose-200 active:scale-[0.98]";
+const secondaryButtonClass =
+  "inline-flex min-h-12 items-center justify-center gap-2 rounded-full border border-slate-200 bg-white px-5 text-sm font-semibold text-slate-700 shadow-sm outline-none transition hover:bg-slate-50 focus-visible:ring-4 focus-visible:ring-slate-300 active:scale-[0.98]";
+const ghostButtonClass =
+  "inline-flex min-h-12 items-center justify-center gap-2 rounded-full px-5 text-sm font-semibold text-slate-700 outline-none transition hover:bg-slate-100 focus-visible:ring-4 focus-visible:ring-slate-300 active:scale-[0.98]";
+
+/**
+ * The ticket's tear line: a dashed Perforation with a half-moon notch bitten
+ * out of each edge, built the same way as the poll page's boarding pass. The
+ * notches overlap the card's own border, so the card must not clip its
+ * children (the photo clips itself instead).
+ */
+function Perforation() {
+  return (
+    <div aria-hidden="true" className="relative border-t border-dashed border-slate-300">
+      <span className="absolute -left-px -top-2.5 h-5 w-2.5 rounded-r-full border border-l-0 border-slate-200 bg-slate-50" />
+      <span className="absolute -right-px -top-2.5 h-5 w-2.5 rounded-l-full border border-r-0 border-slate-200 bg-slate-50" />
+    </div>
+  );
+}
 
 // Google requires this attribution wherever Places content is shown without
 // a Google map. The text form is the permitted fallback for tight spaces;
@@ -304,22 +363,30 @@ function unsavedPicksMessage(count: number) {
   return count === 1 ? "1 pick wasn't saved." : `${count} picks weren't saved.`;
 }
 
-function SaveFailedBanner({ message, onRetry }: { message: string; onRetry: () => void }) {
+function SaveFailedBanner({
+  message,
+  onRetry,
+  actionLabel = "Retry",
+}: {
+  message: string;
+  onRetry: () => void;
+  actionLabel?: string;
+}) {
   return (
     <div
       role="alert"
-      className="mb-4 flex items-center justify-between gap-3 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
+      className="mb-4 flex items-center justify-between gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
     >
       <span className="flex items-center gap-2 font-medium">
-        <CircleAlert className="size-4 shrink-0 text-red-600" aria-hidden="true" />
+        <CircleAlert className="h-4 w-4 shrink-0 text-red-500" aria-hidden="true" />
         {message}
       </span>
       <button
         type="button"
         onClick={onRetry}
-        className={`-my-3 shrink-0 rounded-md px-2 py-3 font-semibold underline underline-offset-2 ${focusClass}`}
+        className="-my-3 shrink-0 rounded-full px-2 py-3 font-semibold underline underline-offset-2 outline-none focus-visible:ring-4 focus-visible:ring-red-200"
       >
-        Retry
+        {actionLabel}
       </button>
     </div>
   );
@@ -328,7 +395,7 @@ function SaveFailedBanner({ message, onRetry }: { message: string; onRetry: () =
 /** A key cap in the desktop hint line. */
 function Key({ children }: { children: ReactNode }) {
   return (
-    <kbd className="inline-flex h-5 min-w-6 items-center justify-center rounded border border-slate-300 bg-white px-1.5 text-slate-600">
+    <kbd className="inline-flex h-5 min-w-6 items-center justify-center rounded-full border border-slate-200 bg-white px-1.5 text-slate-600 shadow-sm">
       {children}
     </kbd>
   );
@@ -349,41 +416,37 @@ function DeckMessage({
 }) {
   const toneClass =
     tone === "alert"
-      ? "bg-red-50 text-red-600 ring-red-200"
-      : "bg-slate-100 text-slate-600 ring-slate-200";
+      ? "bg-red-50 text-red-500 ring-red-200"
+      : "bg-slate-100 text-slate-500 ring-slate-200";
 
   return (
     <section
       role={tone === "alert" ? "alert" : undefined}
-      className="rounded-md border border-slate-200 bg-white p-6"
+      className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm"
     >
-      <div className={`flex size-10 items-center justify-center rounded-md ring-1 ${toneClass}`}>{icon}</div>
+      <div className={`flex h-12 w-12 items-center justify-center rounded-2xl ring-1 ${toneClass}`}>
+        {icon}
+      </div>
       <h2 className="mt-4 text-xl font-bold tracking-tight text-slate-900">{title}</h2>
-      <p className="mt-1.5 text-sm leading-6 text-slate-600">{body}</p>
+      <p className="mt-1.5 text-sm leading-relaxed text-slate-600">{body}</p>
       {children}
     </section>
   );
 }
 
 // ---------------------------------------------------------------------
-// The card
+// The ticket
 // ---------------------------------------------------------------------
 
 type PhotoState = "loading" | "loaded" | "failed";
 
-// The text block under the photo has a fixed minimum height - room for a
-// two-line name and the row beneath it (117px with its top rule) - so the
-// hairline between photo and text sits at the same height on every card (and
-// in the skeleton), and a name starts in the same place on each.
-const CARD_TEXT_CLASS = "flex min-h-[7.5rem] flex-col px-5 py-4";
-
 /**
- * The visual face of one card: a photo on top, a hairline, and under it the
- * place's name, WHERE IN THE WORLD it is and which taste it stands for ("Rome
- * · History" - the deck spans the globe, so every card says where), and its
- * rating. The photo's loading state lives in SwipeDeck (not here), so a card
- * that is dealt back by Undo - or finished loading while it waited behind the
- * others - doesn't reload or flash a placeholder when it reaches the top.
+ * The visual face of one card: a photo on top, a tear line, and a stub with
+ * the name, the rating and WHERE IN THE WORLD it is (the deck spans the globe,
+ * so every card says where - it is what explains a place from the other side
+ * of the world). The photo's loading state lives in SwipeDeck (not here), so a
+ * card that is dealt back by Undo - or finished loading while it waited behind
+ * the others - doesn't reload or flash a placeholder when it reaches the top.
  */
 function PlaceCard({
   place,
@@ -406,9 +469,9 @@ function PlaceCard({
   return (
     <article
       aria-label={`${place.name}, ${place.city}`}
-      className="relative flex h-full select-none flex-col overflow-hidden rounded-md border border-slate-200 bg-white"
+      className="relative flex h-full select-none flex-col rounded-3xl border border-slate-200 bg-white shadow-xl shadow-slate-900/10"
     >
-      <div className="relative min-h-0 flex-1 bg-slate-100">
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-t-[calc(1.5rem-1px)] bg-slate-100">
         {showPhoto ? (
           <>
             {photoState === "loading" && (
@@ -429,18 +492,21 @@ function PlaceCard({
           </>
         ) : (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
-            <ImageOff className="size-8 text-slate-500" strokeWidth={1.5} aria-hidden="true" />
-            <span className="text-sm font-medium text-slate-600">No photo</span>
+            <ImageOff className="h-8 w-8 text-slate-400" strokeWidth={1.5} aria-hidden="true" />
+            {/* Ink Body, not Muted: Muted drops to 4.35:1 on the Stub Grey fill. */}
+            <span className="text-[11px] font-medium uppercase tracking-[0.1em] text-slate-600">
+              No photo
+            </span>
           </div>
         )}
 
-        {/* Google's own label for this exact place. It stays beside the theme in the text below, not instead of it: the search that surfaced a place isn't always the same thing (a mall can turn up under "cafes"). */}
-        <span className="absolute left-3 top-3 max-w-[70%] truncate rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold leading-none text-slate-700">
+        {/* A neutral label, not a per-category icon: the text is Google's own type for this exact place, but the search that surfaced it isn't always the same thing (a mall can turn up under "cafes"). */}
+        <span className="absolute left-3 top-3 max-w-[70%] truncate rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-medium uppercase leading-none tracking-[0.1em] text-slate-600 shadow-sm">
           {place.categoryLabel}
         </span>
 
         {credit && (
-          <span className="absolute bottom-3 left-3 flex max-w-[80%] items-baseline gap-1.5 rounded-md bg-slate-900 px-2.5 py-1 text-xs font-medium text-white">
+          <span className="absolute bottom-3 left-3 flex max-w-[80%] items-baseline gap-1.5 rounded-full bg-slate-900/70 px-3 py-1 text-xs font-medium text-white">
             <span className="shrink-0 font-semibold uppercase tracking-wider">Photo</span>
             <span aria-hidden="true">&middot;</span>
             {credit.uri ? (
@@ -461,49 +527,44 @@ function PlaceCard({
         <div aria-hidden="true" className="pointer-events-none absolute inset-0">
           <span
             style={{ opacity: likeStamp }}
-            className="absolute left-5 top-16 -rotate-12 rounded-md border-2 border-rose-600 bg-white px-3 py-1 text-2xl font-extrabold uppercase tracking-widest text-rose-600"
+            className="absolute left-5 top-16 -rotate-12 rounded-xl border-[3px] border-rose-600 bg-white px-3 py-1 text-2xl font-extrabold uppercase tracking-widest text-rose-600"
           >
             Like
           </span>
           <span
             style={{ opacity: passStamp }}
-            className="absolute right-5 top-16 rotate-12 rounded-md border-2 border-slate-900 bg-white px-3 py-1 text-2xl font-extrabold uppercase tracking-widest text-slate-900"
+            className="absolute right-5 top-16 rotate-12 rounded-xl border-[3px] border-slate-700 bg-white px-3 py-1 text-2xl font-extrabold uppercase tracking-widest text-slate-700"
           >
             Pass
           </span>
         </div>
       </div>
 
-      {/* The line height leaves room for Thai tone marks, and letter-spacing stays at its default because tightening it can collide combining marks. */}
-      <div className={`${CARD_TEXT_CLASS} border-t border-slate-200`}>
+      <Perforation />
+
+      {/* The stub has a fixed height - room for a two-line name - so the tear line sits at the same height on every card; name and the row under it sit together in the middle of it. The line height leaves room for Thai tone marks, and letter-spacing stays at its default because tightening it can collide combining marks. */}
+      <div className="flex min-h-[7.5rem] flex-col justify-center px-5 pb-5 pt-4">
         <h2 className="line-clamp-2 text-xl font-bold leading-[1.4] text-slate-900">{place.name}</h2>
 
-        {/* One row. Left: where in the world, and which taste this card measures - the second thing read, and the one that says why a place from the other side of the world is being asked about. Right: the rating. */}
-        <div className="mt-1 flex items-center justify-between gap-3">
-          <p className="flex min-w-0 items-center gap-1.5 text-[15px] leading-6 text-slate-600">
-            <MapPin className="size-4 shrink-0 text-slate-500" aria-hidden="true" />
-            <span className="min-w-0 truncate">
-              <span className="font-semibold text-slate-900">{place.city}</span>
-              <span aria-hidden="true"> &middot; </span>
-              <span className="sr-only">, </span>
-              {DECK_CATEGORY_LABELS[place.category] ?? place.category}
-            </span>
-          </p>
-
-          <div className="flex shrink-0 items-center gap-1 text-[13px] leading-5">
-            {place.rating !== null ? (
-              <>
-                <Star className="size-3.5 fill-amber-400 text-amber-400" aria-hidden="true" />
-                <span className="sr-only">Rated</span>
-                <span className="font-semibold text-slate-900">{place.rating.toFixed(1)}</span>
-                {place.ratingCount !== null && (
-                  <span className="text-slate-500">({compactCount.format(place.ratingCount)})</span>
-                )}
-              </>
-            ) : (
-              <span className="text-slate-500">No ratings yet</span>
-            )}
-          </div>
+        <div className="mt-2 flex items-center gap-1.5 text-sm">
+          {place.rating !== null ? (
+            <>
+              <Star className="h-4 w-4 shrink-0 fill-amber-400 text-amber-400" aria-hidden="true" />
+              <span className="sr-only">Rated</span>
+              <span className="font-semibold text-slate-900">{place.rating.toFixed(1)}</span>
+              {place.ratingCount !== null && (
+                <span className="text-slate-500">({compactCount.format(place.ratingCount)})</span>
+              )}
+            </>
+          ) : (
+            <span className="text-slate-500">No ratings yet</span>
+          )}
+          <span aria-hidden="true" className="text-slate-300">
+            &middot;
+          </span>
+          <span className="sr-only">, in</span>
+          <MapPin className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
+          <span className="min-w-0 truncate text-slate-600">{place.city}</span>
         </div>
       </div>
     </article>
@@ -512,7 +573,7 @@ function PlaceCard({
 
 /**
  * Stand-in for the whole deck while it loads - same stack, same heights,
- * same controls, same hairline, so the real thing drops in without anything
+ * same controls, same tear line, so the real thing drops in without anything
  * shifting. Exported so the page can show it while it's still waiting on the
  * session (without the caption, which only makes sense once places are being
  * fetched).
@@ -526,38 +587,38 @@ export function SwipeDeckSkeleton({ slow = false, caption = false }: { slow?: bo
 
       <div className="motion-safe:animate-pulse">
         <div className="mb-3 flex h-4 items-center justify-between">
-          <div className="h-3 w-14 rounded-sm bg-slate-200" />
-          <div className="h-3 w-20 rounded-sm bg-slate-200" />
+          <div className="h-3 w-14 rounded-full bg-slate-200" />
+          <div className="h-3 w-20 rounded-full bg-slate-200" />
         </div>
-        <div className="mb-4 h-0.5 w-full bg-slate-200" />
+        <div className="mb-4 h-1.5 w-full rounded-full bg-slate-200" />
 
         <div className={`relative mx-auto w-full ${STACK_HEIGHT_CLASS}`}>
-          <div className="absolute inset-0 translate-y-[calc(20px+5%)] scale-90 rounded-md border border-slate-200 bg-white opacity-50" />
-          <div className="absolute inset-0 translate-y-[calc(10px+2.5%)] scale-95 rounded-md border border-slate-200 bg-white opacity-80" />
-          <div className="absolute inset-0 flex flex-col overflow-hidden rounded-md border border-slate-200 bg-white">
-            <div className="min-h-0 flex-1 bg-slate-200" />
-            <div className={`${CARD_TEXT_CLASS} border-t border-slate-200`}>
+          <div className="absolute inset-0 translate-y-[calc(20px+5%)] scale-90 rounded-3xl border border-slate-200 bg-white opacity-50" />
+          <div className="absolute inset-0 translate-y-[calc(10px+2.5%)] scale-95 rounded-3xl border border-slate-200 bg-white opacity-80" />
+          <div className="absolute inset-0 flex flex-col rounded-3xl border border-slate-200 bg-white shadow-xl shadow-slate-900/10">
+            <div className="min-h-0 flex-1 rounded-t-[calc(1.5rem-1px)] bg-slate-200" />
+            <Perforation />
+            <div className="flex min-h-[7.5rem] flex-col justify-center px-5 pb-5 pt-4">
               <div className="space-y-2.5">
-                <div className="h-5 w-3/4 rounded-sm bg-slate-200" />
-                <div className="h-5 w-1/2 rounded-sm bg-slate-200" />
+                <div className="h-5 w-3/4 rounded-full bg-slate-200" />
+                <div className="h-5 w-1/2 rounded-full bg-slate-200" />
               </div>
-              <div className="mt-3 flex items-center justify-between">
-                <div className="h-4 w-32 rounded-sm bg-slate-200" />
-                <div className="h-3.5 w-16 rounded-sm bg-slate-200" />
-              </div>
+              <div className="mt-3 h-4 w-32 rounded-full bg-slate-200" />
             </div>
           </div>
         </div>
 
-        <div className="mt-6 grid grid-cols-[auto_1fr_1fr] gap-3">
-          <div className="h-13 w-24 rounded-md bg-slate-200" />
-          <div className="h-13 rounded-md bg-slate-200" />
-          <div className="h-13 rounded-md bg-slate-200" />
+        <div className="mt-7 flex items-start justify-center gap-7">
+          <div className="h-16 w-16 p-2">
+            <div className="h-12 w-12 rounded-full bg-slate-200" />
+          </div>
+          <div className="h-16 w-16 rounded-full bg-slate-200" />
+          <div className="h-16 w-16 rounded-full bg-slate-200" />
         </div>
       </div>
 
       {caption && (
-        <p aria-hidden="true" className="mt-6 text-center text-sm text-slate-600">
+        <p aria-hidden="true" className="mt-6 text-center text-sm text-slate-500">
           {slow ? status : "Picking places from around the world..."}
         </p>
       )}
@@ -565,29 +626,15 @@ export function SwipeDeckSkeleton({ slow = false, caption = false }: { slow?: bo
   );
 }
 
-interface TasteRow {
-  category: DeckPlaceCategory;
-  liked: number;
-  total: number;
-}
-
-/** How many of each theme's cards were liked, most liked first (ties keep the deck's own order). */
-function tasteRows(deck: DeckPlace[], choices: Record<string, SwipeChoice>): TasteRow[] {
-  const rows = new Map<DeckPlaceCategory, TasteRow>();
-  for (const place of deck) {
-    const row = rows.get(place.category) ?? { category: place.category, liked: 0, total: 0 };
-    row.total += 1;
-    if (choices[place.id] === "LIKE") row.liked += 1;
-    rows.set(place.category, row);
-  }
-  return [...rows.values()].sort((a, b) => b.liked - a.liked);
-}
-
 /**
- * The finish card: what was liked, theme by theme, and the way back. Its
- * Saving / Saved word covers both the card-by-card saves and the one that
- * hands the whole set over as the person's Taste Profile; either failing is
- * said in a banner with its own Retry.
+ * The finish card: a ticket stub of what was picked, and the way back. It says
+ * what the person LIKED - their top vibes and the places behind them - and
+ * nothing about what they passed on: a pass on a theme's three sample photos is
+ * not a verdict on the theme, so there is no per-theme tally and no "0 of 3"
+ * (see lib/tasteSummary.ts, which reads the same way for trip planning). Its
+ * Saving / Saved word covers both the card-by-card saves and the one that hands
+ * the whole set over as the person's Taste Profile; either failing is said in a
+ * banner with its own Retry.
  */
 function DoneCard({
   tripId,
@@ -597,6 +644,7 @@ function DoneCard({
   pendingSaves,
   failedCount,
   profileStatus,
+  profileFailure,
   canUndo,
   onUndo,
   onStartOver,
@@ -610,24 +658,47 @@ function DoneCard({
   pendingSaves: number;
   failedCount: number;
   profileStatus: "saving" | "saved" | "failed";
+  profileFailure: ProfileFailure | null;
   canUndo: boolean;
   onUndo: () => void;
   onStartOver: () => void;
   onRetry: () => void;
   onRetryProfile: () => void;
 }) {
-  const liked = deck.filter((place) => choices[place.id] === "LIKE").length;
-  const passed = deck.filter((place) => choices[place.id] === "DISLIKE").length;
+  const likedPlaces = deck.filter((place) => choices[place.id] === "LIKE");
+  const passedCount = deck.filter((place) => choices[place.id] === "DISLIKE").length;
+  const hiddenLiked = Math.max(likedPlaces.length - LIKED_ROWS_SHOWN, 0);
   const saveFailed = failedCount > 0 || profileStatus === "failed";
+
+  // The same summary the trip planner is given, so "Top vibes" is exactly what a
+  // plan will lean towards. Null is "nothing stands out" (nothing liked, or so
+  // much liked that no theme does).
+  const topVibes =
+    summarizeTaste(
+      deck.flatMap((place) => {
+        const action = choices[place.id];
+        return action ? [{ userId: "me", category: place.category, action }] : [];
+      })
+    )?.loved.slice(0, TOP_VIBES_SHOWN) ?? [];
 
   return (
     <div>
       {failedCount > 0 && <SaveFailedBanner message={unsavedPicksMessage(failedCount)} onRetry={onRetry} />}
-      {profileStatus === "failed" && (
-        <SaveFailedBanner message="Your taste profile wasn't saved." onRetry={onRetryProfile} />
-      )}
+      {profileStatus === "failed" &&
+        (profileFailure === "signed-out" ? (
+          <SaveFailedBanner
+            message={profileFailureMessage(profileFailure)}
+            actionLabel="Sign in"
+            onRetry={() => window.location.reload()}
+          />
+        ) : (
+          <SaveFailedBanner
+            message={profileFailureMessage(profileFailure ?? "server")}
+            onRetry={onRetryProfile}
+          />
+        ))}
 
-      <section className="rounded-md border border-slate-200 bg-white">
+      <section className="rounded-3xl border border-slate-200 bg-white shadow-sm">
         <div className="p-5">
           <div className="flex items-start justify-between gap-3">
             <h2
@@ -635,53 +706,70 @@ function DoneCard({
               tabIndex={-1}
               className="text-2xl font-bold leading-tight tracking-tight text-slate-900 outline-none"
             >
-              You&apos;re all set
+              You&apos;re all set!
             </h2>
-            {!saveFailed && (
-              <span className="mt-1.5 inline-flex shrink-0 items-center gap-1.5 text-xs font-semibold text-slate-700">
-                {pendingSaves > 0 || profileStatus === "saving" ? (
-                  <>
-                    <RefreshCw className="size-3 motion-safe:animate-spin" aria-hidden="true" />
-                    Saving
-                  </>
-                ) : (
-                  <>
-                    <Check className="size-3.5" strokeWidth={3} aria-hidden="true" />
-                    Saved
-                  </>
-                )}
-              </span>
-            )}
+            {!saveFailed &&
+              (pendingSaves > 0 || profileStatus === "saving" ? (
+                <span className="mt-1 inline-flex shrink-0 items-center gap-1.5 rounded-full border border-slate-200 bg-slate-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.1em] text-slate-600">
+                  <RefreshCw className="h-3 w-3 motion-safe:animate-spin" aria-hidden="true" />
+                  Saving
+                </span>
+              ) : (
+                <span className="mt-1 inline-flex shrink-0 items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.1em] text-emerald-700">
+                  <Check className="h-3 w-3" strokeWidth={3} aria-hidden="true" />
+                  Saved
+                </span>
+              ))}
           </div>
-          <p className="mt-1.5 text-sm text-slate-600">{summarize(liked, passed, deck.length)}</p>
+          <p className="mt-1.5 text-sm text-slate-600">{summarize(likedPlaces.length, passedCount, deck.length)}</p>
         </div>
 
-        <div className="border-t border-slate-200 p-5">
-          <h3 className="text-sm font-semibold text-slate-900">Liked by theme</h3>
-          <ul className="mt-3 divide-y divide-slate-200">
-            {tasteRows(deck, choices).map((row) => (
-              <li key={row.category} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
-                <span className="min-w-0 truncate text-sm font-medium text-slate-900">
-                  {DECK_CATEGORY_LABELS[row.category] ?? row.category}
-                </span>
-                <span className="flex shrink-0 items-center gap-3">
-                  <span aria-hidden="true" className="flex gap-1">
-                    {Array.from({ length: row.total }, (_, index) => (
-                      <span
-                        key={index}
-                        className={`h-1.5 w-5 rounded-full ${index < row.liked ? "bg-slate-900" : "bg-slate-200"}`}
-                      />
-                    ))}
-                  </span>
-                  <span className="w-12 text-right text-sm tabular-nums text-slate-600">
-                    {row.liked} of {row.total}
-                  </span>
-                </span>
-              </li>
-            ))}
-          </ul>
-          <p className="mt-4 flex items-center gap-2 text-sm text-slate-600">
-            <Lock className="size-4 shrink-0" aria-hidden="true" />
+        <Perforation />
+
+        <div className="p-5">
+          {topVibes.length > 0 ? (
+            <>
+              <h3 className="text-[11px] font-semibold uppercase tracking-[0.1em] text-slate-500">Your top vibes</h3>
+              <ul aria-label="Your top vibes" className="mt-2.5 flex flex-wrap gap-2">
+                {topVibes.map((theme) => (
+                  <li
+                    key={theme.category}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-rose-50 px-3.5 py-2 text-sm font-semibold text-rose-700 ring-1 ring-rose-200"
+                  >
+                    <Heart className="h-3.5 w-3.5 fill-rose-500 text-rose-500" aria-hidden="true" />
+                    {theme.label}
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p className="text-sm text-slate-600">
+              {likedPlaces.length > 0
+                ? "You liked a bit of everything, so your plans will stay well-rounded."
+                : "Nothing caught your eye this time - that's fine. Your plans will stay open to everything."}
+            </p>
+          )}
+
+          {likedPlaces.length > 0 && (
+            <>
+              <h3 className="mt-5 text-[11px] font-semibold uppercase tracking-[0.1em] text-slate-500">
+                Places you liked
+              </h3>
+              <ul aria-label="Places you liked" className="mt-1.5 divide-y divide-slate-200">
+                {likedPlaces.slice(0, LIKED_ROWS_SHOWN).map((place) => (
+                  <li key={place.id} className="flex items-baseline justify-between gap-3 py-2.5">
+                    <span className="min-w-0 truncate text-sm font-medium text-slate-900">{place.name}</span>
+                    <span className="max-w-[40%] shrink-0 truncate text-xs text-slate-500">
+                      {place.categoryLabel}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {hiddenLiked > 0 && <p className="pt-2.5 text-sm text-slate-500">+{hiddenLiked} more</p>}
+            </>
+          )}
+          <p className="mt-5 flex items-center gap-2 text-sm text-slate-500">
+            <Lock className="h-4 w-4 shrink-0" aria-hidden="true" />
             Only you can see what you picked.
           </p>
         </div>
@@ -693,12 +781,12 @@ function DoneCard({
         </Link>
         <div className={`grid gap-3 ${canUndo ? "grid-cols-2" : "grid-cols-1"}`}>
           <button type="button" onClick={onStartOver} className={secondaryButtonClass}>
-            <RefreshCw className="size-4" aria-hidden="true" />
+            <RefreshCw className="h-4 w-4" aria-hidden="true" />
             Review again
           </button>
           {canUndo && (
             <button type="button" onClick={onUndo} className={ghostButtonClass}>
-              <Undo2 className="size-4" aria-hidden="true" />
+              <Undo2 className="h-4 w-4" aria-hidden="true" />
               Undo last swipe
             </button>
           )}
@@ -929,13 +1017,13 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
   // the same answers again after an Undo sends nothing.
   const profileTried = useRef("");
   const [profileSaved, setProfileSaved] = useState("");
-  const [profileFailed, setProfileFailed] = useState("");
+  const [profileFailed, setProfileFailed] = useState<{ signature: string; failure: ProfileFailure } | null>(null);
   const [profileAttempt, setProfileAttempt] = useState(0);
   const profileStatus = !tasteSignature
     ? "saving"
     : tasteSignature === profileSaved
       ? "saved"
-      : tasteSignature === profileFailed
+      : tasteSignature === profileFailed?.signature
         ? "failed"
         : "saving";
 
@@ -944,18 +1032,18 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
   useEffect(() => {
     if (!tasteSignature || pendingSaves > 0 || profileTried.current === tasteSignature) return;
     profileTried.current = tasteSignature;
-    void postTasteProfile(JSON.parse(tasteSignature) as TasteAnswer[]).then((saved) => {
+    void postTasteProfile(JSON.parse(tasteSignature) as TasteAnswer[]).then((failure) => {
       // The set may have changed while this was in flight (Undo, Review again):
       // then this is no longer the answer to report.
       if (profileTried.current !== tasteSignature) return;
-      if (saved) setProfileSaved(tasteSignature);
-      else setProfileFailed(tasteSignature);
+      if (failure === null) setProfileSaved(tasteSignature);
+      else setProfileFailed({ signature: tasteSignature, failure });
     });
   }, [tasteSignature, pendingSaves, profileAttempt]);
 
   function retryProfile() {
     profileTried.current = "";
-    setProfileFailed("");
+    setProfileFailed(null);
     setProfileAttempt((attempt) => attempt + 1);
   }
 
@@ -1164,13 +1252,13 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
     return (
       <DeckMessage
         tone="alert"
-        icon={<CircleAlert className="size-5" aria-hidden="true" />}
+        icon={<CircleAlert className="h-6 w-6" aria-hidden="true" />}
         title="Couldn't load places"
         body={loadError}
       >
         <div className="mt-6 flex flex-wrap gap-3">
           <button type="button" onClick={reload} className={primaryButtonClass}>
-            <RefreshCw className="size-4" aria-hidden="true" />
+            <RefreshCw className="h-4 w-4" aria-hidden="true" />
             Try again
           </button>
         </div>
@@ -1182,13 +1270,13 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
     return (
       <DeckMessage
         tone="neutral"
-        icon={<Globe className="size-5" aria-hidden="true" />}
+        icon={<Globe className="h-6 w-6" aria-hidden="true" />}
         title="No places right now"
         body="We couldn't find any places to show. Try again in a little while."
       >
         <div className="mt-6 flex">
           <button type="button" onClick={reload} className={primaryButtonClass}>
-            <RefreshCw className="size-4" aria-hidden="true" />
+            <RefreshCw className="h-4 w-4" aria-hidden="true" />
             Try again
           </button>
         </div>
@@ -1211,6 +1299,7 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
           pendingSaves={pendingSaves}
           failedCount={failedCount}
           profileStatus={profileStatus}
+          profileFailure={profileFailed?.failure ?? null}
           canUndo={canUndo}
           onUndo={undo}
           onStartOver={startOver}
@@ -1292,18 +1381,18 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
   return (
     <>
       <div>
-        <div className="mb-3 flex items-center justify-between text-[13px] tabular-nums text-slate-600">
+        <div className="mb-3 flex items-center justify-between text-xs font-semibold uppercase tracking-wider text-slate-500">
           <span>
-            <span className="font-semibold text-slate-900">{answered}</span> of {deck.length}
+            {answered} of {deck.length}
           </span>
           <span className="flex items-center gap-1.5">
             {/* A fixed-size slot, so the spinner appearing doesn't nudge the count. */}
-            <span className="flex size-3 items-center justify-center" title={pendingSaves > 0 ? "Saving" : undefined}>
+            <span className="flex h-3 w-3 items-center justify-center" title={pendingSaves > 0 ? "Saving" : undefined}>
               {pendingSaves > 0 && (
-                <RefreshCw className="size-3 motion-safe:animate-spin" aria-label="Saving" />
+                <RefreshCw className="h-3 w-3 motion-safe:animate-spin" aria-label="Saving" />
               )}
             </span>
-            <Heart className="size-3.5" aria-hidden="true" />
+            <Heart className="h-3 w-3" aria-hidden="true" />
             {likedCount} liked
           </span>
         </div>
@@ -1313,10 +1402,10 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
           aria-valuemin={0}
           aria-valuemax={deck.length}
           aria-valuenow={answered}
-          className="mb-4 h-0.5 w-full overflow-hidden bg-slate-200"
+          className="mb-4 h-1.5 w-full overflow-hidden rounded-full bg-slate-200"
         >
           <div
-            className="h-full bg-slate-900 transition-[width] duration-300 motion-reduce:transition-none"
+            className="h-full rounded-full bg-rose-600 transition-[width] duration-300 motion-reduce:transition-none"
             style={{ width: `${(answered / deck.length) * 100}%` }}
           />
         </div>
@@ -1362,35 +1451,45 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
           })}
         </div>
 
-        <div className="mt-6 grid grid-cols-[auto_1fr_1fr] gap-3">
-          <button
-            type="button"
-            onClick={undo}
-            aria-disabled={!canUndo}
-            aria-label="Undo last swipe"
-            className={`${buttonShape} h-13 border border-slate-300 bg-white px-4 text-sm text-slate-700 hover:border-slate-900 aria-disabled:opacity-50 aria-disabled:hover:border-slate-300 aria-disabled:active:scale-100`}
-          >
-            <Undo2 className="size-4" aria-hidden="true" />
-            Undo
-          </button>
-          <button
-            type="button"
-            onClick={() => decide("DISLIKE")}
-            aria-label={`Pass on ${top.name}`}
-            className={`${buttonShape} h-13 border border-slate-300 bg-white px-4 text-sm text-slate-900 hover:border-slate-900`}
-          >
-            <X className="size-[18px]" strokeWidth={2.25} aria-hidden="true" />
-            Pass
-          </button>
-          <button
-            type="button"
-            onClick={() => decide("LIKE")}
-            aria-label={`Like ${top.name}`}
-            className={`${buttonShape} h-13 bg-rose-600 px-4 text-sm text-white hover:bg-rose-700`}
-          >
-            <Heart className="size-[18px]" strokeWidth={2.25} aria-hidden="true" />
-            Like
-          </button>
+        <div className="mt-7 flex items-start justify-center gap-7">
+          <div className="flex flex-col items-center gap-2">
+            <div className="flex h-16 w-16 items-center justify-center">
+              <button
+                type="button"
+                onClick={undo}
+                aria-disabled={!canUndo}
+                aria-label="Undo last swipe"
+                className="flex h-12 w-12 items-center justify-center rounded-full border border-slate-200 text-slate-700 outline-none transition hover:bg-white focus-visible:ring-4 focus-visible:ring-slate-300 active:scale-[0.97] aria-disabled:opacity-50 aria-disabled:hover:bg-transparent aria-disabled:active:scale-100"
+              >
+                <Undo2 className="h-5 w-5" aria-hidden="true" />
+              </button>
+            </div>
+            <span className="text-xs font-medium text-slate-500">Undo</span>
+          </div>
+
+          <div className="flex flex-col items-center gap-2">
+            <button
+              type="button"
+              onClick={() => decide("DISLIKE")}
+              aria-label={`Pass on ${top.name}`}
+              className="flex h-16 w-16 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 shadow-sm outline-none transition hover:bg-slate-50 focus-visible:ring-4 focus-visible:ring-slate-300 active:scale-[0.97]"
+            >
+              <X className="h-6 w-6" strokeWidth={2.25} aria-hidden="true" />
+            </button>
+            <span className="text-xs font-medium text-slate-500">Pass</span>
+          </div>
+
+          <div className="flex flex-col items-center gap-2">
+            <button
+              type="button"
+              onClick={() => decide("LIKE")}
+              aria-label={`Like ${top.name}`}
+              className="flex h-16 w-16 items-center justify-center rounded-full bg-rose-600 text-white shadow-md shadow-rose-600/20 outline-none transition hover:bg-rose-700 focus-visible:ring-4 focus-visible:ring-rose-200 active:scale-[0.97]"
+            >
+              <Heart className="h-6 w-6" strokeWidth={2.25} aria-hidden="true" />
+            </button>
+            <span className="text-xs font-medium text-slate-500">Like</span>
+          </div>
         </div>
 
         {/* Touch screens swipe; a mouse also gets the keyboard shortcuts spelled out. */}
@@ -1400,19 +1499,19 @@ export function SwipeDeck({ tripId }: { tripId: string }) {
         <p className="mt-5 hidden items-center justify-center gap-x-4 gap-y-1.5 text-xs text-slate-500 [@media(pointer:fine)]:flex">
           <span className="inline-flex items-center gap-1.5">
             <Key>
-              <ArrowLeft className="size-3" aria-hidden="true" />
+              <ArrowLeft className="h-3 w-3" aria-hidden="true" />
             </Key>
             Pass
           </span>
           <span className="inline-flex items-center gap-1.5">
             <Key>
-              <ArrowRight className="size-3" aria-hidden="true" />
+              <ArrowRight className="h-3 w-3" aria-hidden="true" />
             </Key>
             Like
           </span>
           <span className="inline-flex items-center gap-1.5">
             <Key>
-              <Delete className="size-3" aria-hidden="true" />
+              <Delete className="h-3 w-3" aria-hidden="true" />
             </Key>
             Undo
           </span>

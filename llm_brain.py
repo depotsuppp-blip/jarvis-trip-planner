@@ -397,18 +397,29 @@ genuinely need is missing.
 - If the user declines a confirmation prompt, acknowledge it briefly and \
 do not try the same action again.
 
-Planning a trip: when the user asks for a trip to a place - "plan a trip \
-to Chiang Mai" - call generate_trip_plan_async straight away. The \
-destination is all it needs. Do not ask where they are travelling from, \
-when they are going, or about budget first; if they gave no length use 3 \
-days, if they gave no head count use 1, and say which you assumed after \
-the tool returns. Choose planning_type from what they said: a trip with \
+Planning a trip: generate_trip_plan_async needs three facts, and the user \
+must have told you all three - in this message or earlier in this \
+conversation - before you call it: the destination, how long the trip is \
+(a number of days, or dates you can count into days, counting the first \
+and the last day: 5 to 8 November is 4 days, not 3), and how many people \
+are going (the user included: "me and 3 \
+friends" is 4, "just me" is 1, "4 friends" on its own is a group of 4). \
+NEVER assume, default or guess any of them - not "3 days", not "1 \
+person", not "a long weekend". If one or more is missing, do not call the \
+tool: ask ONE short question that names everything still missing, such as \
+"How many days are you going, and how many of you?", then stop and wait \
+for the answer. Details the user gave you earlier still count, so only ask \
+for what is really missing, and once the answers are in, call the tool. \
+Do not ask anything beyond those three - not where they are travelling \
+from, not budget. Choose planning_type from what they said: a trip with \
 friends, family or colleagues who should vote is 'consensus'; a trip where \
 they already have places in mind to add is 'solo_draft'; anything else is \
 'solo_blank', which plans the whole trip for them. When the tool returns a \
 link, the link is the answer: give it to the user exactly as the tool \
 wrote it. If the tool reports an error, say what went wrong in one \
-sentence and never claim a plan exists or make up a link.
+sentence and never claim a plan exists or make up a link. If the tool says \
+it did not start because something is missing, ask the user for exactly \
+that and do not retry with a guess.
 
 A trip link is something a tool hands you, never something you remember. \
 Write a trip link or a trip id only if a tool returned it during this \
@@ -433,9 +444,11 @@ there - this is a confirmation question, so the same no-closers rule \
 above applies.
 3. Only call finalize_trip_plan_async after the user confirms - never \
 generate_trip_plan_async, which starts a brand new trip rather than \
-finalizing this one. If the user declines, treat it like any other \
-declined confirmation above: acknowledge briefly and stop, without \
-generating anything.
+finalizing this one. If it returns a link, give the user that exact link; \
+if it says they are not allowed to lock this poll, say so in one sentence \
+and mention the organizer link that was sent to LINE. If the user declines, \
+treat it like any other declined confirmation above: acknowledge briefly \
+and stop, without generating anything.
 
 Never skip step 1 for a finalization request: the user needs to hear \
 how many people have actually voted before agreeing to lock in a plan \
@@ -482,9 +495,11 @@ LINK_CORRECTION = (
     "[Not sent] Your last reply held a trip link or trip id that no tool returned "
     "during this request: {references}. A link from earlier in the conversation "
     "belongs to an earlier trip, so it must not be repeated for a new request. If "
-    "the user wants a trip planned or created, call generate_trip_plan_async now "
-    "and use only the link it returns. If no tool can give you a link, answer "
-    "without any link and say plainly that you do not have one."
+    "the user wants a trip planned or created and has told you the destination, the "
+    "number of days and the number of people, call generate_trip_plan_async now and "
+    "use only the link it returns; if any of those is missing, ask for it instead of "
+    "guessing. If no tool can give you a link, answer without any link and say "
+    "plainly that you do not have one."
 )
 LINK_FALLBACK = (
     "I can't give you a trip link for that one: I only share a link that I created "
@@ -985,8 +1000,8 @@ def _tool_generate_trip_plan_async(
     starting_location: str = "",
     destination: str = "",
     planning_type: str = "solo_blank",
-    head_count: int = 1,
-    days: int = 3,  # plugins.trip_planner.DEFAULT_PLAN_DAYS
+    head_count: int | None = None,
+    days: int | None = None,
 ) -> str:
     """
     Plans a trip with the standalone Trip Planner app.
@@ -1066,8 +1081,8 @@ def _tool_check_poll_status_async(trip_id: str = "") -> str:
 
 def _tool_finalize_trip_plan_async(trip_id: str = "") -> str:
     """
-    Reads a consensus poll's real votes and generates the final trip
-    itinerary from them, pushing the result to LINE.
+    Locks a consensus poll and generates its final plan from the votes, by
+    asking the Trip Planner app (POST /api/poll/<id>/finalize).
 
     Same shape as the other implementation-module tools: the work lives
     in plugins/trip_planner.py and is imported lazily, so a missing or
@@ -1075,11 +1090,13 @@ def _tool_finalize_trip_plan_async(trip_id: str = "") -> str:
     the brain from starting.
 
     Registered background=False (see the ToolSpec below) for the same
-    reason generate_trip_plan_async is: plugins.trip_planner already
-    backgrounds itself with its own thread and returns a tailored
-    acknowledgement immediately, so routing it through task_dispatcher
-    as well would background an already-backgrounded call and replace
-    that acknowledgement with the dispatcher's generic "started" text.
+    reason generate_trip_plan_async is. For the voice assistant,
+    plugins.trip_planner already backgrounds itself with its own thread
+    and returns a tailored acknowledgement immediately, so routing it
+    through task_dispatcher as well would background an already-backgrounded
+    call and replace that acknowledgement with the dispatcher's generic
+    "started" text. For the web chat it WAITS and returns the link to the
+    locked plan - the answer itself - or the app's reason for refusing.
     """
     try:
         from plugins import trip_planner
@@ -1467,12 +1484,15 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="generate_trip_plan_async",
         description=(
-            "Use this to plan a trip. Call it as soon as the user asks for "
-            "a trip to a place - the destination is the only thing you "
-            "need. Do NOT first ask where they are travelling from, when "
-            "they are going, or what their budget is. If they did not say "
-            "how many days use 3, if they did not say how many people use "
-            "1, and tell them what you assumed once the tool has returned.\n"
+            "Use this to plan a trip, but ONLY once the user has told you "
+            "all three of: the destination, how many days (or dates you "
+            "can count into days) and how many people are going. Details "
+            "given earlier in the conversation count. NEVER assume or "
+            "default a missing one - not 3 days, not 1 person. If any of "
+            "the three is missing, do NOT call this tool: ask the user one "
+            "short question for what is missing, wait for the answer, then "
+            "call it. Do not ask where they are travelling from or about "
+            "their budget.\n"
             "planning_type decides what happens:\n"
             "- 'solo_blank' (the default): plans the whole trip for them "
             "right now, personalized from their saved taste profile, and "
@@ -1512,14 +1532,26 @@ TOOLS: list[ToolSpec] = [
                 },
                 "head_count": {
                     "type": "integer",
-                    "description": "How many people are going, including the user. Use 1 if they did not say.",
+                    "minimum": 1,
+                    "description": (
+                        "How many people are going, including the user, "
+                        "exactly as the user said. Never a guess: if they "
+                        "have not said, ask them instead of calling."
+                    ),
                 },
                 "days": {
                     "type": "integer",
-                    "description": "How many days the trip is for, 1 to 14. Use 3 if they did not say.",
+                    "minimum": 1,
+                    "maximum": 14,
+                    "description": (
+                        "How many days the trip is for, 1 to 14, exactly as "
+                        "the user said (count a date range into days). Never "
+                        "a guess: if they have not said, ask them instead of "
+                        "calling."
+                    ),
                 },
             },
-            "required": ["destination"],
+            "required": ["destination", "days", "head_count"],
         },
         handler=_tool_generate_trip_plan_async,
         requires_confirmation=False,
@@ -1572,10 +1604,15 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="finalize_trip_plan_async",
         description=(
-            "Use this to actually generate the final trip itinerary AFTER "
-            "the user has confirmed they want to finalize the poll. This "
-            "will read the database, process the votes, and send the final "
-            "plan via LINE. Do NOT call this on its own for a finalization "
+            "Use this to actually lock a poll and generate its final trip "
+            "plan AFTER the user has confirmed they want to finalize it. "
+            "It builds the plan from the votes (and the voters' saved taste "
+            "profiles) in the Trip Planner app and returns the link to the "
+            "finished plan; give the user that exact link. From the web chat "
+            "only the person who created the poll in the chat can lock it - "
+            "if the tool reports it is not allowed, say so and mention the "
+            "organizer link that was sent to LINE. By voice the link is sent "
+            "to LINE. Do NOT call this on its own for a finalization "
             "request - it is Step 3 of a three-step process: first call "
             "check_poll_status_async, then tell the user the count and ask "
             "them to confirm, and only call this tool once they say yes."
@@ -1599,12 +1636,13 @@ TOOLS: list[ToolSpec] = [
         # gated by requires_confirmation: the user already confirmed in
         # words as part of the two-step SYSTEM_PROMPT rule, so a second,
         # generic "do you authorize running finalize_trip_plan_async?"
-        # prompt here would ask the same question twice. The handler
-        # backgrounds itself (its own thread, see plugins/trip_planner.py)
-        # and returns its own tailored acknowledgement in well under a
-        # second - that is exactly the string this tool needs the model
-        # to speak, so it must run inline rather than be replaced by
-        # task_dispatcher's generic "started" text.
+        # prompt here would ask the same question twice. For the voice
+        # assistant the handler backgrounds itself (its own thread, see
+        # plugins/trip_planner.py) and returns its own tailored
+        # acknowledgement in well under a second - exactly the string this
+        # tool needs the model to speak, which task_dispatcher's generic
+        # "started" text would replace. For the web chat the handler WAITS
+        # (~15-30 s) and returns the plan's link, which is the answer.
         background=False,
         label="trip finalization for {trip_id}",
     ),

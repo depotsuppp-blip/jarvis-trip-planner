@@ -114,6 +114,27 @@ screen, so it still starts a background thread and pushes to LINE - except that
 link, instead of logging a Gemini itinerary and promising a link "in the next
 phase". Without TRIP_API_SECRET_KEY that old Gemini path still runs.
 
+FINALIZING A POLL
+-------------------
+finalize_trip_plan_async asks the app to lock the poll and generate its plan
+from the votes (POST {app}/api/poll/<id>/finalize, signed like the create
+call). It used to make a plan of its own here - a taste-blind JSON itinerary
+that was printed to the console and never stored, announced over LINE as if
+it had been sent - which is gone: the plan is the app's own grounded one
+(real venues, travel times, the voters' Taste Profiles), stored there and
+answered with its link. From the web chat the call is synchronous and the link
+is the tool result; from the microphone it runs on a thread and the link goes
+to LINE, as everything else voice does.
+
+WHO may lock a poll this way is the app's decision, from Poll.createdByUserId,
+and the request only says who is asking: a poll made from the web chat (see
+_create_poll_admin_token, which records the creator) can be locked from the
+chat only by the person who made it, and a poll made by voice can be locked by
+voice (no user id - the owner at the microphone), never the other way round.
+The poll's voting link is public, so without that rule any signed-in person
+could lock someone else's poll just by asking Jarvis. The organizer's own admin
+link (POST /api/trigger-jarvis) is unaffected and still works for every poll.
+
 PRIVACY CONSTRAINT - READ BEFORE TOUCHING starting_location
 -------------------------------------------------------------
 starting_location is the user's home, hotel, or wherever they currently
@@ -294,13 +315,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
-# A transitive dependency of both google-genai and anthropic already
-# (both vendor it for their own request/response models), so this is
-# only ever missing if NEITHER LLM SDK is installed either - a state
-# _run_finalization_agent already treats as "no provider configured."
-# Guarded the same way as every other SDK import below, so importing
-# this module (which llm_brain.py does unconditionally at startup) can
-# never crash Jarvis's boot over a missing optional package.
+# A transitive dependency of google-genai already (it vendors it for its
+# own request/response models), so this is only ever missing if that SDK
+# is not installed either - a state _run_planner_agent already reports as
+# "google-genai is not installed." Guarded the same way as every other
+# SDK import below, so importing this module (which llm_brain.py does
+# unconditionally at startup) can never crash Jarvis's boot over a
+# missing optional package.
 try:
     import pydantic
 except ImportError:  # pragma: no cover - environment-dependent
@@ -320,15 +341,6 @@ except ImportError:  # pragma: no cover - environment-dependent
     genai_errors = None  # type: ignore[assignment]
     genai_types = None  # type: ignore[assignment]
 
-# Used by finalize_trip_plan_async's Planner Agent call, alongside the
-# google-genai import above - see "PROVIDER SELECTION" in that function's
-# docstring for why both live here rather than being imported from
-# llm_brain.py (which already imports this module).
-try:
-    import anthropic
-except ImportError:  # pragma: no cover - environment-dependent
-    anthropic = None  # type: ignore[assignment]
-
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - environment-dependent
@@ -342,31 +354,34 @@ class GeminiRateLimitError(Exception):
     """Gemini returned HTTP 429 - a quota to wait out, not a bug to report."""
 
 
-class FinalizationRateLimitError(Exception):
-    """
-    The finalization Planner Agent (Anthropic or Gemini, whichever ran)
-    was rate-limited - a quota to wait out, not a bug. Distinct from
-    GeminiRateLimitError above: that one is Gemini-specific and used only
-    by the solo_blank path, while finalize_trip_plan_async can hit either
-    provider's rate limit depending on which one is configured.
-    """
-
-
 _VALID_PLANNING_TYPES = frozenset({"solo_blank", "solo_draft", "consensus"})
 
-# How many days a trip is planned for when nobody said - three is a trip
-# rather than a day out, and short enough to generate well inside the web
-# app's 60 s budget - and the most the Trip Planner app will plan
-# (lib/tripDates.ts's MAX_TRIP_DAYS; it clamps again on its side).
-DEFAULT_PLAN_DAYS = 3
+# The most days the Trip Planner app will plan (lib/tripDates.ts's
+# MAX_TRIP_DAYS; it clamps again on its side). There is deliberately no default
+# length: a trip whose length the user never gave is asked about, not planned.
 MAX_PLAN_DAYS = 14
 
-# (connect, read) seconds for POST /api/trip/create. Unlike every other call
-# here, the app runs a whole generation before it answers (two LLM calls,
-# Places, Routes: ~15-30 s measured, capped at its 60 s maxDuration), so the
+
+def _positive_int(value: object) -> int | None:
+    """
+    `value` as a whole number of at least 1, or None when it is missing or not
+    one - the model sending null, 0, "" or words. A bool is not a count.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 1 else None
+
+# (connect, read) seconds for the calls that make the Trip Planner app run a
+# whole generation before it answers - POST /api/trip/create and POST
+# /api/poll/<id>/finalize (two LLM calls, Places, Routes: ~15-30 s measured,
+# capped at the app's 60 s maxDuration). Unlike every other call here, so the
 # read timeout is generous - the web chat's own limit, lib/jarvisBrain.ts's
 # BRAIN_TIMEOUT_MS, has to cover this plus the model's turns around it.
-_CREATE_TRIP_TIMEOUT = (5.0, 100.0)
+_PLAN_API_TIMEOUT = (5.0, 100.0)
 
 # See "MODEL / SDK CHOICE, AND QUOTA" above before changing this.
 GEMINI_PLANNER_MODEL = "gemini-flash-lite-latest"
@@ -396,26 +411,6 @@ _GEMINI_TIMEOUT = 60.0
 # an itinerary; more just spends prompt tokens restating a long tail the
 # Planner Agent will not use.
 _MAX_PLACES = 5
-
-# ---------------------------------------------------------------------
-# finalize_trip_plan_async config
-# ---------------------------------------------------------------------
-
-# High-effort tier for BOTH providers - this is a one-shot, per-poll
-# call the user is not waiting on live (see "WHY THIS MUST NOT BLOCK"
-# reasoning applied to _finalize_trip_task below), unlike solo_blank's
-# gemini-flash-lite-latest which is optimized for latency. These mirror
-# llm_brain.py's own MODEL_DEEP / GEMINI_MODEL_DEEP (its INTENT_COMPLEX
-# row in ROUTING_TABLE) - kept as separate constants rather than
-# imported, since llm_brain.py already imports this module and importing
-# it back here would be a circular import.
-FINALIZE_ANTHROPIC_MODEL = "claude-opus-5"
-FINALIZE_GEMINI_MODEL = "gemini-2.5-pro"
-
-# A full multi-day itinerary needs far more room than llm_brain.py's
-# MAX_TOKENS=1024, which is tuned for short spoken replies, not JSON.
-_FINALIZE_MAX_TOKENS = 4096
-
 
 def _ensure_env_loaded() -> None:
     """Best-effort .env load, mirroring plugins/os_orchestrator.py."""
@@ -605,45 +600,35 @@ if pydantic is not None:
 
     class Itinerary(pydantic.BaseModel):
         """
-        The one shape every Planner Agent call (solo_blank's
-        _run_planner_agent and finalization's
-        _run_finalization_agent_anthropic/_gemini) must produce. Passed
-        to Gemini as response_schema (structured output) and to
-        Anthropic as a tool's input_schema (forced tool_choice) - so a
-        provider now returns data conforming to this shape at the API
-        level, rather than "please reply with only a JSON object" prose
-        the model could ignore or wrap in markdown fences.
+        The shape solo_blank's Planner Agent call (_run_planner_agent,
+        the Gemini fallback when the Trip Planner app is not configured)
+        must produce. Passed to Gemini as response_schema (structured
+        output), so the provider returns data conforming to this shape at
+        the API level, rather than "please reply with only a JSON object"
+        prose the model could ignore or wrap in markdown fences.
         _validate_itinerary below is still the single place this gets
         checked, since structured output is the provider's best effort,
         not a guarantee this project controls.
+
+        Polls are not planned here: finalize_trip_plan_async asks the Trip
+        Planner app to lock and generate them (POST /api/poll/<id>/finalize),
+        and that app's own, richer itinerary (real venues, travel times,
+        costs) is stored there - see TripPlanner_Web/lib/itinerary.ts.
         """
 
         destination: str
         days: list[ItineraryDay]
         notes: str
 
-    # Anthropic has no response_schema equivalent - a forced tool call
-    # (tool_choice below) is how this project gets the same structured-
-    # output guarantee from Claude. Built once from the same Itinerary
-    # model Gemini's response_schema uses, so there is exactly one
-    # definition of "what an itinerary looks like" for both providers.
-    _ITINERARY_TOOL: dict[str, Any] = {
-        "name": "submit_itinerary",
-        "description": "Submit the completed trip itinerary.",
-        "input_schema": Itinerary.model_json_schema(),
-    }
-
 else:  # pragma: no cover - see the pydantic import guard above
     ItineraryDay = None  # type: ignore[assignment,misc]
     Itinerary = None  # type: ignore[assignment,misc]
-    _ITINERARY_TOOL = None  # type: ignore[assignment]
 
 
 def _validate_itinerary(data: Any) -> dict[str, Any]:
     """
-    Validates an already-parsed itinerary (a dict from json.loads for
-    Gemini, or an Anthropic tool_use block's .input directly) against
-    Itinerary and returns it as a plain dict.
+    Validates an already-parsed itinerary (the dict from json.loads of
+    Gemini's reply) against Itinerary and returns it as a plain dict.
 
     Raises pydantic.ValidationError (a ValueError subclass) on anything
     that doesn't match - the caller's broad `except Exception` already
@@ -736,7 +721,9 @@ class _ConsensusPoll:
     admin_sent: bool = False
 
 
-def _open_consensus_poll(destination: str, days: int, base_url: str) -> _ConsensusPoll:
+def _open_consensus_poll(
+    destination: str, days: int, base_url: str, created_by_user_id: str = ""
+) -> _ConsensusPoll:
     """
     The whole job of a 'consensus' trip: create a poll, mint its admin
     token, and send two LINE messages - the public voting link (safe to
@@ -766,12 +753,18 @@ def _open_consensus_poll(destination: str, days: int, base_url: str) -> _Consens
     result to say what reached LINE. Only the LINE pushes are guarded: a
     link that cannot be built (see assert_link_not_localhost_in_production)
     raises, as it always has.
+
+    `created_by_user_id` is the signed-in person whose chat asked for the poll
+    ("" for voice): the web app records it so that person - and only that
+    person - can later lock the poll from the chat (finalize_trip_plan_async).
     """
     trip_id = str(uuid.uuid4())
     poll_url = build_liff_link(f"/trip/poll/{trip_id}")
 
     admin_token = secrets.token_urlsafe(32)
-    admin_token_stored = _create_poll_admin_token(trip_id, admin_token, base_url, days)
+    admin_token_stored = _create_poll_admin_token(
+        trip_id, admin_token, base_url, days, created_by_user_id
+    )
     poll = _ConsensusPoll(trip_id=trip_id, admin_stored=admin_token_stored)
 
     try:
@@ -1086,11 +1079,10 @@ def check_poll_status_async(trip_id: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# finalize_trip_plan_async - Step 3 of the two-step consensus
-# finalization rule (see the SYSTEM_PROMPT rule in llm_brain.py): reads
-# the real poll data over HTTP and generates the actual itinerary,
-# called only after the user has confirmed following
-# check_poll_status_async above.
+# Signed calls to the Trip Planner app. finalize_trip_plan_async (below)
+# is Step 3 of the two-step consensus finalization rule (see the
+# SYSTEM_PROMPT rule in llm_brain.py): called only after the user has
+# confirmed following check_poll_status_async above.
 # ---------------------------------------------------------------------
 
 
@@ -1107,9 +1099,12 @@ def _sign_request(
 
     With `body` (the exact bytes about to be sent) the signed string also
     ends in ".{sha256(body) as hex}" - lib/serverAuth.ts on the Next.js side.
-    Used by POST /api/trip/create, whose body carries the user the trip is
-    for: a captured signature must not be replayable with a different one.
-    The older routes sign no body and are called without it.
+    Used where the body carries authority - the user a trip is for (POST
+    /api/trip/create), who is asking to lock a poll (POST
+    /api/poll/<id>/finalize), who created a poll (POST
+    /api/poll/<id>/admin-token with createdByUserId): a captured signature
+    must not be replayable with a different one. The older calls sign no body
+    and are made without it.
     """
     ts = str(int(time.time()))
     message = f"{ts}.{method}.{path}"
@@ -1124,7 +1119,9 @@ def _sign_poll_request(trip_id: str, secret: str) -> tuple[str, str]:
     return _sign_request("GET", f"/api/poll/{trip_id}", secret)
 
 
-def _create_poll_admin_token(trip_id: str, admin_token: str, base_url: str, days: int) -> bool:
+def _create_poll_admin_token(
+    trip_id: str, admin_token: str, base_url: str, days: int, created_by_user_id: str = ""
+) -> bool:
     """
     POST {base_url}/api/poll/<trip_id>/admin-token - mints this trip's
     admin credential for "Lock & Generate Plan" (see
@@ -1141,6 +1138,14 @@ def _create_poll_admin_token(trip_id: str, admin_token: str, base_url: str, days
     ride along as a ?days=<n> URL param on the admin link, but that reset
     to the hardcoded default on every page reload or friend link since
     nothing about it was actually saved server-side.
+
+    `created_by_user_id` is the signed-in person whose web chat is creating
+    the poll ("" for a poll made by voice). The route stores it as
+    Poll.createdByUserId, which is what later lets that person - and nobody
+    else - lock the poll from the chat (finalize_trip_plan_async). Because it
+    carries authority, a request that names a creator is signed over its BODY
+    (see _sign_request); a poll made by voice sends no creator and keeps the
+    path-only signature it always had, byte for byte.
 
     Returns False on ANY failure: missing requests package, missing
     TRIP_API_SECRET_KEY, connection refused, timeout, or a non-2xx
@@ -1159,15 +1164,26 @@ def _create_poll_admin_token(trip_id: str, admin_token: str, base_url: str, days
         return False
 
     path = f"/api/poll/{trip_id}/admin-token"
-    ts, sig = _sign_request("POST", path, secret)
+    if created_by_user_id:
+        # The exact bytes that are signed are the exact bytes that are sent.
+        body = json.dumps(
+            {"adminToken": admin_token, "days": days, "createdByUserId": created_by_user_id},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        ts, sig = _sign_request("POST", path, secret, body)
+        request_args: dict[str, Any] = {
+            "data": body,
+            "headers": {"Content-Type": "application/json", "X-Ts": ts, "X-Sig": sig},
+        }
+    else:
+        ts, sig = _sign_request("POST", path, secret)
+        request_args = {
+            "json": {"adminToken": admin_token, "days": days},
+            "headers": {"X-Ts": ts, "X-Sig": sig},
+        }
 
     try:
-        response = requests.post(
-            f"{base_url}{path}",
-            json={"adminToken": admin_token, "days": days},
-            headers={"X-Ts": ts, "X-Sig": sig},
-            timeout=(3, 10),
-        )
+        response = requests.post(f"{base_url}{path}", timeout=(3, 10), **request_args)
         response.raise_for_status()
     except requests.exceptions.RequestException as exc:
         print(
@@ -1183,27 +1199,24 @@ def _fetch_poll_data(trip_id: str, base_url: str) -> Optional[dict[str, Any]]:
     """
     GET {base_url}/api/poll/<trip_id> - the Next.js "Data Bridge" this
     tool reads consensus votes through (see app/api/poll/[id]/route.ts),
-    authenticated with an HMAC signature since that route now rejects
-    unsigned requests.
+    authenticated with an HMAC signature: a request that presents
+    X-Ts/X-Sig is verified in full, one without is an ordinary anonymous read.
+    Used by check_poll_status_async.
 
     Returns None on ANY failure: missing requests package, missing
     secret, connection refused (the Next.js dev server isn't running),
     timeout, a non-2xx status (including a 401 from a bad/expired
-    signature), or a body that isn't valid JSON. Unlike weather/places
-    in the solo_blank path, there is no reasonable itinerary to build
-    without this data, so the caller treats None as "stop here", not
-    "proceed with partial data". The try/except below exists so this
-    background thread (see _finalize_trip_task) dies gracefully instead
-    of raising into nothing if the server is unreachable or returns
-    malformed JSON.
+    signature), or a body that isn't valid JSON. The caller treats None as
+    "say plainly that the poll could not be read", never as "proceed with
+    made-up numbers".
     """
     if requests is None:
-        print("[TripPlanner] finalize: the requests package is not installed.")
+        print("[TripPlanner] poll-read: the requests package is not installed.")
         return None
 
     secret = (os.getenv("TRIP_API_SECRET_KEY") or "").strip()
     if not secret:
-        print("[TripPlanner] finalize: TRIP_API_SECRET_KEY is not configured.")
+        print("[TripPlanner] poll-read: TRIP_API_SECRET_KEY is not configured.")
         return None
 
     url = f"{base_url}/api/poll/{trip_id}"
@@ -1217,13 +1230,13 @@ def _fetch_poll_data(trip_id: str, base_url: str) -> Optional[dict[str, Any]]:
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as exc:
-        print(f"[TripPlanner] finalize: poll fetch failed ({url}): {type(exc).__name__}: {exc}")
+        print(f"[TripPlanner] poll-read: poll fetch failed ({url}): {type(exc).__name__}: {exc}")
         return None
 
     try:
         return response.json()
     except ValueError as exc:
-        print(f"[TripPlanner] finalize: poll response from {url} was not valid JSON: {exc}")
+        print(f"[TripPlanner] poll-read: poll response from {url} was not valid JSON: {exc}")
         return None
 
 
@@ -1262,8 +1275,14 @@ def _trip_api_configured() -> bool:
     return requests is not None and bool((os.getenv("TRIP_API_SECRET_KEY") or "").strip())
 
 
-def _explain_create_failure(status: int, data: dict[str, Any], base_url: str) -> str:
-    """What a non-201 answer from POST /api/trip/create means, in a sentence."""
+def _explain_api_failure(status: int, data: dict[str, Any], base_url: str, what: str) -> str:
+    """
+    What an unexpected answer from a signed call to the Trip Planner app means,
+    in a sentence. `what` names the route ("trip-creation", "poll-finalize").
+    The app's own words are passed on when it gave any: they are the most
+    specific thing available ("No real places were found for ...", "Only the
+    person who created this poll ...").
+    """
     message = data.get("error") if isinstance(data.get("error"), str) else ""
     message = message.strip().rstrip(".")
 
@@ -1275,7 +1294,7 @@ def _explain_create_failure(status: int, data: dict[str, Any], base_url: str) ->
     if status == 404 and not message:
         # Next's own HTML 404 page: no JSON, no "error" field.
         return (
-            f"the Trip Planner app at {base_url} has no trip-creation route, so it is an "
+            f"the Trip Planner app at {base_url} has no {what} route, so it is an "
             "older version (restart it, or deploy the latest)"
         )
     if message:
@@ -1283,26 +1302,25 @@ def _explain_create_failure(status: int, data: dict[str, Any], base_url: str) ->
     return f"the Trip Planner app answered HTTP {status}"
 
 
-def _post_trip_create(
-    base_url: str, user_id: str, destination: str, days: int, head_count: int
-) -> dict[str, Any]:
+def _signed_post(
+    base_url: str,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    what: str,
+    ok_statuses: tuple[int, ...],
+) -> tuple[int, dict[str, Any]]:
     """
-    POST {base_url}/api/trip/create - asks the Trip Planner app to plan ONE
-    trip to `destination` right now (the pipeline in
-    TripPlanner_Web/lib/tripGeneration.ts, personalized from `user_id`'s Taste
-    Profile when there is one) and store it. Blocks until the plan exists:
-    ~15-30 s, so only the web chat's synchronous path and background threads
-    call it.
+    POST {base_url}{path} with `payload` as the JSON body and a signature that
+    covers that body (see _sign_request), for the calls that make the Trip
+    Planner app run a whole generation before it answers (hence
+    _PLAN_API_TIMEOUT). Returns (status, data) when the app answers with one of
+    `ok_statuses`; raises TripApiError for everything else - not configured,
+    unreachable, timed out, or any other answer, with the app's own reason
+    passed on (see _explain_api_failure). `what` names the route in messages.
 
-    Authenticated like the admin-token call, with one addition: the signature
-    also covers the request body (see _sign_request), because the body names
-    the user the trip is for. `user_id` "" plans for nobody in particular
-    (the voice assistant).
-
-    Returns the app's answer - {tripId, path, destination, days, stops,
-    personalized, taste} - and raises TripApiError for every failure: not
-    configured, unreachable, timed out, or any non-201 answer (the app's own
-    reason is passed on: no real places for that destination, rate-limited...).
+    Blocks for as long as the generation takes (~15-30 s), so only the web
+    chat's synchronous path and background threads call it.
     """
     _ensure_env_loaded()
     if requests is None:
@@ -1314,10 +1332,6 @@ def _post_trip_create(
             "(it must equal API_SECRET_KEY in TripPlanner_Web/.env.local)"
         )
 
-    path = "/api/trip/create"
-    payload: dict[str, Any] = {"destination": destination, "days": days, "headCount": head_count}
-    if user_id:
-        payload["userId"] = user_id
     # The exact bytes that are signed are the exact bytes that are sent -
     # json=payload would let requests serialize it a second time, differently.
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -1328,13 +1342,13 @@ def _post_trip_create(
             f"{base_url}{path}",
             data=body,
             headers={"Content-Type": "application/json", "X-Ts": ts, "X-Sig": sig},
-            timeout=_CREATE_TRIP_TIMEOUT,
+            timeout=_PLAN_API_TIMEOUT,
         )
     except requests.exceptions.Timeout as exc:
-        _log(f"[TripPlanner] create-trip: timed out ({base_url}{path}): {exc}")
-        raise TripApiError("the Trip Planner app took too long to plan it") from exc
+        _log(f"[TripPlanner] {what}: timed out ({base_url}{path}): {exc}")
+        raise TripApiError(f"the Trip Planner app took too long to answer the {what} request") from exc
     except requests.exceptions.RequestException as exc:
-        _log(f"[TripPlanner] create-trip: request failed ({base_url}{path}): {type(exc).__name__}: {exc}")
+        _log(f"[TripPlanner] {what}: request failed ({base_url}{path}): {type(exc).__name__}: {exc}")
         raise TripApiError(f"the Trip Planner app at {base_url} is not reachable (is it running?)") from exc
 
     try:
@@ -1344,16 +1358,73 @@ def _post_trip_create(
     if not isinstance(data, dict):
         data = {}
 
-    if response.status_code != 201:
+    if response.status_code not in ok_statuses:
         _log(
-            f"[TripPlanner] create-trip: HTTP {response.status_code} from {base_url}{path}: "
+            f"[TripPlanner] {what}: HTTP {response.status_code} from {base_url}{path}: "
             f"{str(data.get('error') or response.text[:200])[:200]}"
         )
-        raise TripApiError(_explain_create_failure(response.status_code, data, base_url))
+        raise TripApiError(_explain_api_failure(response.status_code, data, base_url, what))
+
+    return response.status_code, data
+
+
+def _post_trip_create(
+    base_url: str, user_id: str, destination: str, days: int, head_count: int
+) -> dict[str, Any]:
+    """
+    POST {base_url}/api/trip/create - asks the Trip Planner app to plan ONE
+    trip to `destination` right now (the pipeline in
+    TripPlanner_Web/lib/tripGeneration.ts, personalized from `user_id`'s Taste
+    Profile when there is one) and store it.
+
+    Authenticated like the admin-token call, with one addition: the signature
+    also covers the request body (see _sign_request), because the body names
+    the user the trip is for. `user_id` "" plans for nobody in particular
+    (the voice assistant).
+
+    Returns the app's answer - {tripId, path, destination, days, stops,
+    personalized, taste} - and raises TripApiError for every failure: not
+    configured, unreachable, timed out, or any non-201 answer (the app's own
+    reason is passed on: no real places for that destination, rate-limited...).
+    """
+    payload: dict[str, Any] = {"destination": destination, "days": days, "headCount": head_count}
+    if user_id:
+        payload["userId"] = user_id
+    _, data = _signed_post(base_url, "/api/trip/create", payload, what="trip-creation", ok_statuses=(201,))
 
     trip_id, page = data.get("tripId"), data.get("path")
     if not isinstance(trip_id, str) or not isinstance(page, str) or not page.startswith("/trip/poll/"):
         raise TripApiError("the Trip Planner app answered, but not with a trip link")
+    return data
+
+
+def _post_poll_finalize(base_url: str, trip_id: str, user_id: str) -> dict[str, Any]:
+    """
+    POST {base_url}/api/poll/<trip_id>/finalize - asks the Trip Planner app to
+    lock the poll and generate its plan from the votes (lib/pollLock.ts,
+    personalized from the voters' Taste Profiles) without the organizer's admin
+    token.
+
+    `user_id` is the signed-in person asking, from the web chat, and "" from
+    the microphone. The app decides whether that caller may lock THIS poll
+    (Poll.createdByUserId: a poll made in the chat is lockable from the chat by
+    its creator only, a poll made by voice by voice only) and answers 403 with
+    its reason otherwise; Jarvis only reports who is asking.
+
+    Returns the app's answer - {tripId, path, locked, alreadyLocked,
+    destination, days, stops, and for a fresh plan voters, tasteVoters,
+    personalized, taste} - and raises TripApiError for every failure: not
+    configured, unreachable, timed out, not allowed, no such poll, no votes,
+    already being generated (409), rate-limited...
+    """
+    payload: dict[str, Any] = {"userId": user_id} if user_id else {}
+    _, data = _signed_post(
+        base_url, f"/api/poll/{trip_id}/finalize", payload, what="poll-finalize", ok_statuses=(200, 201)
+    )
+
+    page = data.get("path")
+    if data.get("tripId") != trip_id or not isinstance(page, str) or not page.startswith("/trip/poll/"):
+        raise TripApiError("the Trip Planner app answered, but not with the poll's plan link")
     return data
 
 
@@ -1373,15 +1444,11 @@ def _describe_created_trip(data: dict[str, Any], url: str, requested_days: int, 
 
     taste = data.get("taste") if isinstance(data.get("taste"), dict) else {}
     loved = [str(label) for label in (taste.get("loved") or [])]
-    avoided = [str(label) for label in (taste.get("avoided") or [])]
 
     if data.get("personalized") is True:
         taste_note = "It was tuned to this person's saved taste profile"
         if loved:
-            taste_note += f": they love {', '.join(loved)}"
-            taste_note += f" and pass on {', '.join(avoided)}" if avoided else ""
-        elif avoided:
-            taste_note += f": they pass on {', '.join(avoided)}"
+            taste_note += f": they like {', '.join(loved)}"
         taste_note += "."
     elif has_user:
         taste_note = (
@@ -1432,7 +1499,7 @@ def _plan_trip_for_web(
 
     if planning_type == "consensus":
         try:
-            poll = _open_consensus_poll(destination, days, base_url)
+            poll = _open_consensus_poll(destination, days, base_url, context.user_id)
         except Exception as exc:  # noqa: BLE001 - e.g. a localhost link refused in production
             _log(f"[TripPlanner] Web poll for {destination} failed: {type(exc).__name__}: {exc}")
             return (
@@ -1449,19 +1516,24 @@ def _plan_trip_for_web(
         poll_url = f"{base_url}/trip/poll/{poll.trip_id}"
         # The raw admin token is in the private LINE message only - never in
         # this result, because the model repeats results and the chat is stored.
+        # Locking later has TWO ways, and the result must say so: the organizer
+        # link in LINE, and asking Jarvis right here - the app lets the person
+        # who made the poll in this chat lock it (finalize_trip_plan_async).
         if poll.admin_sent:
             line_note = (
-                "The voting link to forward to the group and the private organizer link (the only one that can "
-                "lock the plan) were sent to LINE."
+                "The voting link to forward to the group and the private organizer link (which locks the plan) "
+                "were sent to LINE."
             )
         else:
             line_note = (
-                "The private organizer link, which is the only way to lock the plan, could NOT be sent to "
-                "LINE (check the LINE settings), so tell the user this poll cannot be locked yet."
+                "The private organizer link could NOT be sent to LINE (check the LINE settings), so the person "
+                "cannot use it - but they can still lock the poll from this chat."
             )
         return (
             f"DONE: a voting poll for the {destination} trip is ready. Link: {poll_url}\n"
             f"{line_note}\n"
+            "Once the votes are in, the person can ask you to finalize this poll and you will lock it from this "
+            "chat (check the vote count first and ask them to confirm).\n"
             "Tell the user in one or two short sentences, and include the link exactly as written above."
         )
 
@@ -1515,322 +1587,130 @@ def _run_solo_trip_via_api(destination: str, head_count: int, days: int) -> None
         )
 
 
-def _build_finalization_prompt(poll_data: dict[str, Any]) -> str:
+def _describe_finalized_poll(data: dict[str, Any], url: str) -> str:
     """
-    Turns the poll API's payload into the Planner Agent's prompt.
-
-    Reads `summary` - the pre-aggregated {totalVotes, dateRangeLabel,
-    topVibes, wishlist, voters} shape app/api/poll/[id]/route.ts builds
-    via lib/tripSummary.ts's summarizePollVotes - rather than
-    re-aggregating the raw `votes` array itself, so the tallying logic
-    exists in exactly one place across both languages.
+    The tool result for a poll the app locked: what the model needs to answer
+    in a sentence or two - that it is locked and ready, the link, and what the
+    plan was built from. The link is the point of the answer, so the instruction
+    to repeat it exactly comes with it.
     """
-    summary = poll_data.get("summary")
-    if not isinstance(summary, dict):
-        summary = {}
+    destination = str(data.get("destination") or "the trip")
+    days = data.get("days") if isinstance(data.get("days"), int) else 0
+    stops = data.get("stops") if isinstance(data.get("stops"), int) else 0
+    size = f" ({days} days, {stops} stops)" if days and stops else ""
 
-    total_votes = summary.get("totalVotes", 0)
-    date_range = summary.get("dateRangeLabel") or "TBD"
-    top_vibes = summary.get("topVibes") or []
-    wishlist = summary.get("wishlist") or []
-    voters = summary.get("voters") or []
+    if data.get("alreadyLocked") is True:
+        head = f"DONE: the poll for {destination} was already locked{size}. Link: {url}"
+        note = "Nothing new was generated: this is the plan that already exists."
+    else:
+        head = f"DONE: the poll for {destination} is locked and its plan is ready{size}. Link: {url}"
+        voters = data.get("voters") if isinstance(data.get("voters"), int) else 0
+        taste_voters = data.get("tasteVoters") if isinstance(data.get("tasteVoters"), int) else 0
+        taste = data.get("taste") if isinstance(data.get("taste"), dict) else {}
+        loved = [str(label) for label in (taste.get("loved") or [])]
 
-    vibes_text = ", ".join(
-        f"{entry.get('vibe')} ({entry.get('count')} votes)"
-        for entry in top_vibes
-        if isinstance(entry, dict)
-    ) or "No vibes selected yet."
-    wishlist_text = "; ".join(str(place) for place in wishlist) or "No specific places suggested."
-    voters_text = ", ".join(str(name) for name in voters) or "the group"
+        if data.get("personalized") is True:
+            note = (
+                f"It was built from the {voters} votes and tuned to the saved taste profiles of "
+                f"{taste_voters} of the voters"
+            )
+            if loved:
+                note += f": together they like {', '.join(loved)}"
+            note += "."
+        else:
+            note = (
+                f"It follows the {voters} votes only: none of the voters has a usable taste profile saved."
+                if voters
+                else "It follows the votes only: none of the voters has a usable taste profile saved."
+            )
 
     return (
-        "Generate a complete trip itinerary based on this consensus data "
-        "from a group trip poll. Resolve any conflicting wishes by "
-        "prioritizing the most popular vibes.\n\n"
-        f"Group size: {total_votes} people ({voters_text}).\n"
-        f"Preferred dates: {date_range}.\n"
-        f"Top vibes, most to least popular: {vibes_text}.\n"
-        f"Specific places requested by the group: {wishlist_text}.\n\n"
-        "Respond with ONLY a JSON object (no markdown fences, no "
-        "commentary) shaped like:\n"
-        "{\n"
-        '  "destination": string,\n'
-        '  "days": [\n'
-        '    {"day": 1, "summary": string, "activities": [string, ...], '
-        '"meals": [string, ...]}\n'
-        "  ],\n"
-        '  "notes": string\n'
-        "}"
-    )
-
-
-def _run_finalization_agent_anthropic(prompt: str, api_key: str) -> dict[str, Any]:
-    """
-    Calls Claude for the finalization itinerary, at the same high-effort
-    tier llm_brain.py's own router reserves for its INTENT_COMPLEX
-    questions (MODEL_DEEP="claude-opus-5", EFFORT_DEEP="high"). This is a
-    one-shot, per-poll call the user is not waiting on live, unlike a
-    live conversation turn, so paying for the reasoning tier here is an
-    easy trade.
-
-    Raises FinalizationRateLimitError for a 429 - the same "quota to
-    wait out, not a bug" reasoning as GeminiRateLimitError, just for
-    whichever provider actually ran. Everything else propagates for the
-    caller's generic handler.
-    """
-    if Itinerary is None:
-        raise RuntimeError("pydantic is not installed.")
-
-    client = anthropic.Anthropic(api_key=api_key)
-    try:
-        response = client.messages.create(
-            model=FINALIZE_ANTHROPIC_MODEL,
-            max_tokens=_FINALIZE_MAX_TOKENS,
-            # THINKING_PLAIN in llm_brain.py disables thinking under the
-            # same condition.
-            thinking={"type": "disabled"},
-            output_config={"effort": "high"},
-            # A forced tool call, not a "respond with only JSON" prompt
-            # instruction - Claude has no way to reply with anything
-            # other than arguments matching _ITINERARY_TOOL's schema.
-            tools=[_ITINERARY_TOOL],
-            tool_choice={"type": "tool", "name": _ITINERARY_TOOL["name"]},
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception as exc:  # noqa: BLE001 - reclassified immediately below
-        if isinstance(exc, anthropic.RateLimitError):
-            raise FinalizationRateLimitError(str(exc)) from exc
-        raise
-
-    tool_input = next(
-        (block.input for block in response.content if getattr(block, "type", None) == "tool_use"),
-        None,
-    )
-    if tool_input is None:
-        raise ValueError("Claude did not call submit_itinerary.")
-    return _validate_itinerary(tool_input)
-
-
-def _run_finalization_agent_gemini(prompt: str, api_key: str) -> dict[str, Any]:
-    """
-    Calls Gemini for the finalization itinerary when Anthropic isn't
-    configured, at gemini-2.5-pro - llm_brain.py's GEMINI_MODEL_DEEP,
-    its own high-effort tier - rather than the gemini-flash-lite-latest
-    _run_planner_agent uses above for solo_blank. That lite tier was
-    chosen there for latency and quota reasons that do not apply here:
-    this is a one-shot, per-poll call, not one a user is waiting on live.
-    """
-    if genai is None:
-        raise RuntimeError("google-genai is not installed.")
-    if Itinerary is None:
-        raise RuntimeError("pydantic is not installed.")
-
-    client = genai.Client(api_key=api_key)
-    try:
-        response = client.models.generate_content(
-            model=FINALIZE_GEMINI_MODEL,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                http_options=genai_types.HttpOptions(
-                    timeout=int(_GEMINI_TIMEOUT * 1000),
-                    retry_options=genai_types.HttpRetryOptions(attempts=1),
-                ),
-                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
-                    disable=True
-                ),
-                # See the matching response_mime_type/response_schema in
-                # _run_planner_agent above - same structured-output
-                # guarantee, applied here too.
-                response_mime_type="application/json",
-                response_schema=Itinerary,
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001 - reclassified immediately below
-        if isinstance(exc, genai_errors.APIError) and getattr(exc, "code", None) == 429:
-            raise FinalizationRateLimitError(str(exc)) from exc
-        raise
-
-    return _validate_itinerary(json.loads(response.text))
-
-
-def _run_finalization_agent(prompt: str) -> dict[str, Any]:
-    """
-    Picks whichever provider is actually configured and calls it at its
-    highest-effort tier.
-
-    PROVIDER SELECTION - Anthropic first, Gemini as the fallback -
-    mirrors llm_brain.py's own documented order (.env.example section 1:
-    "1. ANTHROPIC_API_KEY set -> Anthropic Claude, 2. otherwise
-    GEMINI_API_KEY set -> Google Gemini"), so this tool prefers whatever
-    the rest of the assistant already prefers rather than picking
-    independently. Not imported from llm_brain.py: that module already
-    imports plugins.trip_planner (to register generate_trip_plan_async
-    as a built-in tool), and importing it back here would be a circular
-    import - see the anthropic import comment above.
-    """
-    anthropic_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
-    if anthropic_key and anthropic is not None:
-        return _run_finalization_agent_anthropic(prompt, anthropic_key)
-
-    gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-    if gemini_key and genai is not None:
-        return _run_finalization_agent_gemini(prompt, gemini_key)
-
-    raise RuntimeError(
-        "No language model provider is configured for finalization "
-        "(need ANTHROPIC_API_KEY or GEMINI_API_KEY)."
+        f"{head}\n{note}\n"
+        "Tell the user it is locked and ready in one or two short sentences and include the link exactly "
+        "as written above - never shorten, rewrite or invent a link."
     )
 
 
 # trip_ids with a finalization currently in flight - guards against
-# finalize_trip_plan_async being called twice for the SAME trip before
-# the first call's thread finishes, which would spend LLM quota twice
-# and push the result to LINE twice. Concretely: the voice assistant
-# (llm_brain.py's finalize_trip_plan_async tool) and the poll page's
-# "Lock & Generate Plan" button (POST /api/trigger-jarvis ->
-# JARVIS_WEBHOOK_URL, once that webhook receiver exists - it does not
-# yet) can both reach this function for the same trip_id from different
-# threads. A plain set, not a dict of Locks: membership alone is the
-# guard, and the thread lock below only protects the check-and-add
-# being atomic across those threads.
+# finalize_trip_plan_async being called twice for the SAME trip from the
+# microphone before the first call's thread finishes, which would push the
+# result to LINE twice. (The web app's own claim already stops a second
+# GENERATION, answering 409, so this only spares the second call a pointless
+# round trip and a confusing LINE message.) A plain set, not a dict of Locks:
+# membership alone is the guard, and the thread lock below only protects the
+# check-and-add being atomic across threads.
 _finalizing_trip_ids: set[str] = set()
 _finalizing_trip_ids_lock = threading.Lock()
 
 
 def _finalize_trip_task(trip_id: str, base_url: str) -> None:
     """
-    Runs entirely on its own thread - same "WHY THIS MUST NOT BLOCK"
-    reasoning as _plan_trip_task above: an HTTP fetch plus one
-    high-effort LLM call plus a LINE push easily lands in the same
-    5-30+ second range that reasoning was written for, and this
-    function is called from the voice assistant's supervisor loop by
-    way of finalize_trip_plan_async.
+    The voice assistant's finalization, on its own thread - same "WHY THIS MUST
+    NOT BLOCK" reasoning as _plan_trip_task above: the app's generation takes
+    ~15-30 s and the supervisor loop that called finalize_trip_plan_async must
+    not wait for it. Asks the app to lock the poll (no user id: the owner at the
+    microphone) and sends the plan's link - or the reason it failed - to LINE.
 
-    `base_url` is the web app to read the poll from, resolved on the
-    calling thread (a new thread has no request context of its own).
-
-    Always releases trip_id from _finalizing_trip_ids before returning,
-    however it exits - see finalize_trip_plan_async, which is what
-    reserves it.
+    `base_url` is the web app to call, resolved on the calling thread (a new
+    thread has no request context of its own). Always releases trip_id from
+    _finalizing_trip_ids before returning, however it exits - see
+    finalize_trip_plan_async, which is what reserves it.
     """
     try:
-        _finalize_trip_task_body(trip_id, base_url)
+        _ensure_env_loaded()
+        _log(f"[TripPlanner] Finalizing poll {trip_id} on {base_url}...")
+
+        try:
+            data = _post_poll_finalize(base_url, trip_id, "")
+            link = build_liff_link(str(data["path"]))
+            if data.get("alreadyLocked") is True:
+                message = f"โพล {trip_id} ถูกล็อกไปแล้วครับ ดูแผนได้ที่นี่: {link}"
+            else:
+                message = f"แผนทริปของโพล {trip_id} ล็อกและสร้างเสร็จแล้วครับ! ดูแผนได้ที่นี่: {link}"
+        except Exception as exc:  # noqa: BLE001 - TripApiError, or a link refused in production
+            _log(f"[TripPlanner] Finalizing poll {trip_id} failed: {type(exc).__name__}: {exc}")
+            message = f"ล็อกแผนทริป {trip_id} ไม่สำเร็จครับ ({exc}) ลองสั่งล็อกอีกครั้งได้เลยครับ"
+
+        try:
+            from plugins import line_notifier
+
+            result = line_notifier.send_line_notification(message)
+            _log(f"[TripPlanner] Finalization notification for {trip_id}: {result}")
+        except Exception as exc:  # noqa: BLE001 - the thread ends either way
+            _log(
+                f"[TripPlanner] Notifying about the {trip_id} finalization result "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
     finally:
         with _finalizing_trip_ids_lock:
             _finalizing_trip_ids.discard(trip_id)
 
 
-def _finalize_trip_task_body(trip_id: str, base_url: str) -> None:
-    """The actual finalization work - see _finalize_trip_task, which wraps this to guarantee release."""
-    _ensure_env_loaded()
-
-    print(f"[TripPlanner] Finalizing trip {trip_id}: reading the poll from {base_url}...")
-
-    poll_data = _fetch_poll_data(trip_id, base_url)
-    if poll_data is None:
-        message = (
-            f"อ่านข้อมูลโพลของทริป {trip_id} ไม่ได้ครับ "
-            "เช็คว่าเซิร์ฟเวอร์ Trip Planner (Next.js) เปิดอยู่ไหมครับ แล้วลองล็อกแผนใหม่อีกครั้ง"
-        )
-        try:
-            from plugins import line_notifier
-
-            result = line_notifier.send_line_notification(message)
-            print(f"[TripPlanner] Finalization notification for {trip_id}: {result}")
-        except Exception as exc:  # noqa: BLE001 - the thread ends either way
-            print(
-                f"[TripPlanner] Notifying about the {trip_id} poll-fetch failure "
-                f"failed: {type(exc).__name__}: {exc}"
-            )
-        return
-
-    votes = poll_data.get("votes")
-    if not isinstance(votes, list) or not votes:
-        message = (
-            f"ยังไม่มีใครโหวตทริป {trip_id} เลยครับ "
-            "รอให้เพื่อนโหวตก่อนแล้วค่อยล็อกแผนใหม่อีกครั้งนะครับ"
-        )
-        try:
-            from plugins import line_notifier
-
-            result = line_notifier.send_line_notification(message)
-            print(f"[TripPlanner] Finalization notification for {trip_id}: {result}")
-        except Exception as exc:  # noqa: BLE001 - the thread ends either way
-            print(
-                f"[TripPlanner] Notifying about the {trip_id} empty poll failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-        return
-
-    prompt = _build_finalization_prompt(poll_data)
-
-    try:
-        itinerary = _run_finalization_agent(prompt)
-
-        # See the matching try/except in _plan_trip_task above: Gemini's
-        # own response text has previously contained characters (Thai
-        # script) a Windows console on a legacy codepage cannot print,
-        # and that must never be mistaken for the API call itself
-        # failing after it already succeeded and spent quota.
-        try:
-            print(f"[TripPlanner] Finalized itinerary ready for trip {trip_id}:")
-            print(json.dumps(itinerary, ensure_ascii=False, indent=2))
-        except UnicodeEncodeError:
-            print(
-                f"[TripPlanner] Finalized itinerary ready for trip {trip_id} "
-                "(console can't render it; ASCII-safe dump below)."
-            )
-            print(json.dumps(itinerary, ensure_ascii=True, indent=2))
-
-        message = (
-            f"แผนทริป {trip_id} เสร็จเรียบร้อยแล้วครับ! "
-            "ส่งรายละเอียดทั้งหมดไปให้ทาง LINE แล้วนะครับ"
-        )
-    except FinalizationRateLimitError as exc:
-        print(f"[TripPlanner] Finalization rate-limited for trip {trip_id}: {exc}")
-        message = (
-            f"ระบบวางแผนทริป {trip_id} เต็มโควต้าชั่วคราวครับ "
-            "กรุณารอสักครู่แล้วลองล็อกแผนใหม่อีกครั้ง"
-        )
-    except Exception as exc:  # noqa: BLE001 - a background thread must not die silently
-        print(f"[TripPlanner] Finalization failed for trip {trip_id}: {type(exc).__name__}: {exc}")
-        message = (
-            f"แผนทริป {trip_id} มีปัญหาระหว่างสร้างแผนครับ "
-            "ลองล็อกแผนใหม่อีกครั้งได้เลยครับ"
-        )
-
-    try:
-        from plugins import line_notifier
-
-        result = line_notifier.send_line_notification(message)
-        print(f"[TripPlanner] Finalization notification for {trip_id}: {result}")
-    except Exception as exc:  # noqa: BLE001 - the thread ends either way
-        print(
-            f"[TripPlanner] Notifying about the {trip_id} finalization result "
-            f"failed: {type(exc).__name__}: {exc}"
-        )
-
-
 def finalize_trip_plan_async(trip_id: str) -> str:
     """
-    Reads a consensus poll's real votes and generates the final trip
-    itinerary from them, pushing the result to LINE.
+    Locks a consensus poll and generates its final plan from the votes, by
+    asking the Trip Planner app (POST /api/poll/<id>/finalize - see "FINALIZING
+    A POLL" in the module docstring). The plan is the app's own: real venues,
+    travel times, the voters' Taste Profiles, stored there.
 
-    MUST NOT wait for the plan to finish - see _finalize_trip_task's
-    docstring. The only work done on the calling thread is argument
-    cleanup and Thread.start(); the HTTP fetch, the Planner Agent call,
-    and the LINE push all happen on that thread, which this function
-    never joins. This is the reason the "success" string in this
-    function's own name and Task description ("The plan has been
-    successfully generated and sent via LINE") is NOT what this function
-    returns - that sentence describes the LINE message _finalize_trip_task
-    sends once the work is actually done; what Jarvis speaks immediately
-    is the acknowledgement below, the same split generate_trip_plan_async
-    already uses for the same reason.
+    From the web chat it runs SYNCHRONOUSLY and returns the link to the plan
+    (~15-30 s): the person is watching a chat and the link is the answer. The
+    request carries the signed-in person's id, and the app only lets the person
+    who created the poll in the chat lock it from there - everyone else gets its
+    reason back as an error for the model to relay (the organizer's link, sent
+    to LINE, still works for any poll).
+
+    From the voice assistant it MUST NOT wait - see "WHY THIS MUST NOT BLOCK":
+    the only work done on the calling thread is argument cleanup and
+    Thread.start(); the call and the LINE message with the plan's link happen in
+    _finalize_trip_task, which this function never joins. The acknowledgement it
+    returns now is what Jarvis speaks; the LINE message arrives when the work is
+    done. The voice caller has no user id and may lock a poll that was made by
+    voice.
 
     Called only as Step 3 of the two-step consensus finalization rule in
-    llm_brain.py's SYSTEM_PROMPT - after check_poll_status_async has
-    already reported the vote count and the user has confirmed.
+    llm_brain.py's SYSTEM_PROMPT - after check_poll_status_async has already
+    reported the vote count and the user has confirmed.
     """
     trip_id = _extract_trip_id(trip_id)
     if not trip_id:
@@ -1841,11 +1721,30 @@ def finalize_trip_plan_async(trip_id: str) -> str:
     context = request_context.current()
     base_url = resolve_api_base_url(context.app_url if context else "")
 
+    if context is not None and context.is_web:
+        if not context.user_id:
+            return (
+                "ERROR: this chat did not tell me who is asking, and the web app only lets the person who "
+                "created a poll lock it from the chat, so I can't lock it from here. They can use the "
+                "organizer link that was sent to LINE. Tell the user plainly; do not claim the poll was locked."
+            )
+        try:
+            data = _post_poll_finalize(base_url, trip_id, context.user_id)
+        except TripApiError as exc:
+            _log(f"[TripPlanner] Web poll {trip_id} could not be locked: {exc}")
+            return (
+                f"ERROR: the poll for trip {trip_id} could not be locked - {exc}. "
+                "Tell the user plainly what went wrong; do not claim a plan exists and do not invent a link."
+            )
+        url = f"{base_url}{data['path']}"
+        _log(f"[TripPlanner] Web poll {trip_id} locked: {url}")
+        return _describe_finalized_poll(data, url)
+
     with _finalizing_trip_ids_lock:
         if trip_id in _finalizing_trip_ids:
             return (
-                f"I'm already finalizing trip {trip_id} - I'll notify you on "
-                "LINE the moment it's ready, no need to ask again."
+                f"I'm already finalizing trip {trip_id} - I'll send the plan to LINE "
+                "the moment it's ready, no need to ask again."
             )
         _finalizing_trip_ids.add(trip_id)
 
@@ -1859,8 +1758,8 @@ def finalize_trip_plan_async(trip_id: str) -> str:
 
     print(f"[TripPlanner] Finalization assigned for trip {trip_id}.")
     return (
-        f"I've started reading the poll for trip {trip_id} and generating "
-        "the final itinerary from it. I'll notify you on LINE when it's ready."
+        f"I've started locking the poll for trip {trip_id} and generating the final plan from the votes. "
+        "I'll send the link to LINE when it's ready."
     )
 
 
@@ -1868,11 +1767,20 @@ def generate_trip_plan_async(
     starting_location: str = "",
     destination: str = "",
     planning_type: str = "solo_blank",
-    head_count: int = 1,
-    days: int = DEFAULT_PLAN_DAYS,
+    head_count: int | None = None,
+    days: int | None = None,
 ) -> str:
     """
-    Plans a trip. Only the destination is needed.
+    Plans a trip. Needs the destination, the number of days and the number of
+    people, all three stated by the user.
+
+    Nothing is defaulted. A missing or unusable `days` or `head_count` returns
+    a "NOT STARTED" sentence that tells the model to ask the user for exactly
+    that - this is the code half of the prompt rule against assuming "3 days"
+    or "1 person" (see "Planning a trip" in llm_brain.SYSTEM_PROMPT); the
+    model is told to ask first, and this makes the tool refuse when it did
+    not. A value that merely looks made up cannot be told from a real one
+    here, which is why the tool schema also marks all three as required.
 
     From the web chat (request_context says so) this runs SYNCHRONOUSLY and
     returns the link to the finished plan, poll or draft board - see "WEB
@@ -1901,15 +1809,21 @@ def generate_trip_plan_async(
     if planning_type not in _VALID_PLANNING_TYPES:
         planning_type = "solo_blank"
 
-    try:
-        head_count = max(1, int(head_count))
-    except (TypeError, ValueError):
-        head_count = 1
-
-    try:
-        days = max(1, int(days))
-    except (TypeError, ValueError):
-        days = DEFAULT_PLAN_DAYS
+    head_count = _positive_int(head_count)
+    days = _positive_int(days)
+    missing = [
+        label
+        for label, value in (("how many days the trip is", days), ("how many people are going", head_count))
+        if value is None
+    ]
+    if missing:
+        print(f"[TripPlanner] Not starting a trip to {destination}: missing {', '.join(missing)}.")
+        return (
+            f"NOT STARTED: a trip to {destination} cannot be planned until the user says "
+            f"{' and '.join(missing)}. Do not assume or guess "
+            "it - not 3 days, not 1 person. Ask the user one short question for exactly "
+            "that, then call this tool again with their answer."
+        )
 
     context = request_context.current()
     if context is not None and context.is_web:

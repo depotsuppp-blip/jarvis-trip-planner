@@ -1,9 +1,8 @@
-import Anthropic from "@anthropic-ai/sdk";
 import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import { generationFailureResponse } from "@/lib/generationErrors";
 import { formatItineraryForStorage } from "@/lib/itinerary";
-import { PlacesApiError } from "@/lib/places";
 import { prisma } from "@/lib/prisma";
 import { checkRateLimit } from "@/lib/rateLimit";
 import { verifySignedRequest } from "@/lib/serverAuth";
@@ -141,8 +140,7 @@ export async function POST(request: NextRequest) {
     const taste = userId ? await loadTastePromptInput(async () => [userId], headCount, tripId) : null;
     if (taste) {
       console.log(
-        `[trip-create] ${tripId}: taste profile - loves ${taste.taste.loved.map((t) => t.category).join(", ") || "-"}; ` +
-          `passes on ${taste.taste.avoided.map((t) => t.category).join(", ") || "-"}`
+        `[trip-create] ${tripId}: taste profile - likes ${taste.taste.loved.map((t) => t.category).join(", ") || "-"}`
       );
     }
 
@@ -189,26 +187,8 @@ export async function POST(request: NextRequest) {
         { status: 422 }
       );
     }
-    if (error instanceof PlacesApiError) {
-      console.error(`POST ${CREATE_PATH}: Places API error (${error.reason}):`, error.message);
-      return NextResponse.json(
-        { error: `Venue search is unavailable: ${error.message}`, reason: error.reason },
-        { status: 502 }
-      );
-    }
-    if (error instanceof Anthropic.RateLimitError) {
-      return NextResponse.json(
-        { error: "The plan generator is temporarily rate-limited - please try again shortly." },
-        { status: 429 }
-      );
-    }
-    if (error instanceof Anthropic.APIError) {
-      console.error(`POST ${CREATE_PATH} failed (Anthropic ${error.status}):`, error.message);
-      return NextResponse.json(
-        { error: "The plan generator is temporarily unavailable. Please try again." },
-        { status: 502 }
-      );
-    }
+    const known = generationFailureResponse(error, `POST ${CREATE_PATH}`);
+    if (known) return known;
     console.error(`POST ${CREATE_PATH} failed for trip ${tripId}:`, error);
     return NextResponse.json(
       { error: "Something went wrong while planning the trip. Please try again." },

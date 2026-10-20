@@ -1,23 +1,8 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { NextRequest, NextResponse } from "next/server";
 import { verifyAdminToken } from "@/lib/adminToken";
-import { formatItineraryForStorage, parseStoredItinerary } from "@/lib/itinerary";
-import { PlacesApiError } from "@/lib/places";
+import { generationFailureResponse } from "@/lib/generationErrors";
+import { lockAndGeneratePoll } from "@/lib/pollLock";
 import { checkRateLimit } from "@/lib/rateLimit";
-import {
-  claimPollForGeneration,
-  getDraft,
-  getPollDurationDays,
-  getPollVoterUserIds,
-  getPollVotes,
-  lockPoll,
-  releasePollClaim,
-  saveDraft,
-} from "@/lib/store";
-import { loadTastePromptInput } from "@/lib/tasteForTrip";
-import { generateItinerary } from "@/lib/tripGeneration";
-import { summarizePollVotes } from "@/lib/tripSummary";
-import { computeBestTripWindow, resolveTripDays } from "@/lib/tripDates";
 
 // Two Haiku calls, N parallel Places calls, plus one Routes API call per
 // LEG (Stage 2.5 - see lib/routes.ts's per-leg dynamic travel mode),
@@ -43,15 +28,15 @@ const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
  * POST /api/trigger-jarvis - "Lock & Generate Plan" on the poll page.
  *
  * Self-contained: reads this trip's votes from Neon via Prisma, then
- * runs a grounded pipeline (lib/tripGeneration.ts) - a Haiku call to plan
- * the day structure (categories + areas, no venue names; Stage 1), real
- * Google Places Text Search calls to find actual venues for every slot
- * (Stage 1.5), a second Haiku call to write the final itinerary choosing only
- * from that real data and estimating a per-stop cost (Stage 2), and finally,
- * in parallel: a real Google Routes API call per stop-to-stop leg with a
- * dynamically chosen travel mode (Stage 2.5, see lib/routes.ts - never another
- * LLM call, this is real data attached as-is) and a real-world forecast
- * lookup for the trip's window (Stage 2.6, see lib/weather.ts) - and
+ * runs a grounded pipeline (lib/pollLock.ts -> lib/tripGeneration.ts) - a
+ * Haiku call to plan the day structure (categories + areas, no venue names;
+ * Stage 1), real Google Places Text Search calls to find actual venues for
+ * every slot (Stage 1.5), a second Haiku call to write the final itinerary
+ * choosing only from that real data and estimating a per-stop cost (Stage 2),
+ * and finally, in parallel: a real Google Routes API call per stop-to-stop leg
+ * with a dynamically chosen travel mode (Stage 2.5, see lib/routes.ts - never
+ * another LLM call, this is real data attached as-is) and a real-world
+ * forecast lookup for the trip's window (Stage 2.6, see lib/weather.ts) - and
  * returns the finished itinerary in the response body. No dependency on
  * Jarvis's local Python backend, which never accepts inbound
  * connections.
@@ -63,13 +48,13 @@ const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
  * without a finished quiz simply add nothing, and a poll where nobody has one
  * is generated exactly as before.
  *
- * NOT YET DONE: pushing the result back into the LINE group chat the way
- * plugins/trip_planner.py's _finalize_trip_task does via line_notifier -
- * that needs LINE_CHANNEL_ACCESS_TOKEN and a target group id configured
- * in this Next.js app's own environment (a group id specifically, not
- * just a personal LINE_USER_ID push target - out of scope for now). The
- * frontend receiving the plan directly in this response is today's
- * substitute.
+ * NOT YET DONE: pushing the result back into the LINE GROUP chat.
+ * plugins/trip_planner.py's voice finalize sends the plan's link to the
+ * organizer's own LINE through line_notifier (a personal LINE_USER_ID push
+ * target); reaching the group needs LINE_CHANNEL_ACCESS_TOKEN and a target
+ * group id configured in this Next.js app's own environment - out of scope
+ * for now. The frontend receiving the plan directly in this response is
+ * today's substitute.
  *
  * AUTHORIZATION: an admin_token is required in the request body and
  * verified against Poll.adminTokenHash (see lib/adminToken.ts's
@@ -86,6 +71,10 @@ const TRIGGER_RATE_WINDOW_MS = 5 * 60_000;
  * it and cannot construct it. The frontend hiding the "Lock & Generate
  * Plan" button without this token (app/trip/poll/[id]/page.tsx) is UX
  * only; this check is the actual security boundary.
+ *
+ * The other way to lock a poll is POST /api/poll/[id]/finalize, which Jarvis
+ * calls (signed with the shared secret, for the person who created the poll);
+ * both end in the same lockAndGeneratePoll.
  */
 export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => null);
@@ -113,120 +102,37 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    // Atomically claims this trip before spending anything - see
-    // claimPollForGeneration's docstring. Two near-simultaneous "Lock &
-    // Generate Plan" clicks resolve to exactly one "claimed" and one
-    // "in_progress" (or, if the first already finished, "locked") - never
-    // two concurrent generations for the same trip.
-    const claim = await claimPollForGeneration(tripId);
+    const result = await lockAndGeneratePoll(tripId, "trigger-jarvis");
 
-    if (claim === "locked") {
-      const draft = await getDraft(tripId);
-      const stored = draft ? parseStoredItinerary(draft.text) : null;
-      if (stored) {
-        return NextResponse.json({ tripId, locked: true, itinerary: stored });
-      }
-      console.error(`POST /api/trigger-jarvis: trip ${tripId} is locked but has no valid stored plan.`);
-      return NextResponse.json(
-        { error: "This poll is locked but its plan could not be loaded." },
-        { status: 500 }
-      );
-    }
+    switch (result.kind) {
+      case "already_locked":
+        return NextResponse.json({ tripId, locked: true, itinerary: result.itinerary });
 
-    if (claim === "in_progress") {
-      return NextResponse.json(
-        { error: "A plan is already being generated for this poll - please wait a moment and try again." },
-        { status: 409 }
-      );
-    }
+      case "locked_without_plan":
+        console.error(`POST /api/trigger-jarvis: trip ${tripId} is locked but has no valid stored plan.`);
+        return NextResponse.json(
+          { error: "This poll is locked but its plan could not be loaded." },
+          { status: 500 }
+        );
 
-    // claim === "claimed" - this request now owns generation for this
-    // trip and must release the claim on every exit path below except
-    // success, which hands off to lockPoll instead.
-    try {
-      const votes = await getPollVotes(tripId);
-      if (votes.length === 0) {
-        await releasePollClaim(tripId);
+      case "in_progress":
+        return NextResponse.json(
+          { error: "A plan is already being generated for this poll - please wait a moment and try again." },
+          { status: 409 }
+        );
+
+      case "no_votes":
         return NextResponse.json(
           { error: "No one has voted on this poll yet - wait for votes before locking it." },
           { status: 400 }
         );
-      }
 
-      // The organizer's actually-requested trip length, read from
-      // Poll.durationDays (see that field's comment in
-      // prisma/schema.prisma) - captured once at poll-creation time by
-      // POST /api/poll/[id]/admin-token, NOT from this request's body.
-      // resolveTripDays re-clamps it as a defense-in-depth safety net
-      // (the write side already clamps too), so a malformed stored
-      // value never breaks generation.
-      const tripDays = resolveTripDays(await getPollDurationDays(tripId));
-
-      // Per-stage timings, logged (not just commented) so real numbers
-      // stay verifiable as this pipeline changes - see this route's
-      // maxDuration comment, which cites a real measured run. Date.now()
-      // deltas rather than console.time/timeEnd: that API's labels
-      // collide across concurrent requests for different trips, since
-      // this route has no per-request namespacing for them.
-      const summary = summarizePollVotes(votes);
-      // The specific tripDays-day window most voters overlap on - see
-      // lib/tripDates.ts's docstring for why this replaced the old
-      // earliest-start/latest-end span across every vote. Computed once
-      // here and threaded through Stage 1 (the prompt) and Stage 2.5 (the
-      // Routes API departure-date anchor) so both agree on the same
-      // dates.
-      const tripWindow = computeBestTripWindow(votes, tripDays);
-      console.log(
-        `[trigger-jarvis] ${tripId}: trip window ${tripWindow.startDate} to ${tripWindow.endDate} ` +
-          `(${tripDays}d, ${tripWindow.voterCount}/${votes.length} voters overlap)`
-      );
-
-      // The accounts behind the votes may have finished the taste quiz; a vote
-      // cast before signing in was required belongs to no account and has no
-      // profile. Null (and an unchanged plan) when none of them has one.
-      const taste = await loadTastePromptInput(() => getPollVoterUserIds(tripId), votes.length, tripId);
-      if (taste) {
-        console.log(
-          `[trigger-jarvis] ${tripId}: taste profile from ${taste.taste.people}/${votes.length} voters - ` +
-            `loves ${taste.taste.loved.map((t) => t.category).join(", ") || "-"}; ` +
-            `passes on ${taste.taste.avoided.map((t) => t.category).join(", ") || "-"}`
-        );
-      }
-
-      const itinerary = await generateItinerary(
-        { kind: "poll", summary, tripWindow, tripDays, taste },
-        { tag: "trigger-jarvis", id: tripId }
-      );
-
-      await saveDraft(tripId, formatItineraryForStorage(itinerary));
-      await lockPoll(tripId);
-
-      return NextResponse.json({ tripId, locked: true, itinerary }, { status: 201 });
-    } catch (innerError) {
-      await releasePollClaim(tripId).catch(() => {});
-      throw innerError;
+      case "generated":
+        return NextResponse.json({ tripId, locked: true, itinerary: result.itinerary }, { status: 201 });
     }
   } catch (error) {
-    if (error instanceof PlacesApiError) {
-      console.error(`POST /api/trigger-jarvis: Places API error (${error.reason}):`, error.message);
-      return NextResponse.json(
-        { error: `Venue search is unavailable: ${error.message}`, reason: error.reason },
-        { status: 502 }
-      );
-    }
-    if (error instanceof Anthropic.RateLimitError) {
-      return NextResponse.json(
-        { error: "The plan generator is temporarily rate-limited - please try again shortly." },
-        { status: 429 }
-      );
-    }
-    if (error instanceof Anthropic.APIError) {
-      console.error(`POST /api/trigger-jarvis failed (Anthropic ${error.status}):`, error.message);
-      return NextResponse.json(
-        { error: "The plan generator is temporarily unavailable. Please try again." },
-        { status: 502 }
-      );
-    }
+    const known = generationFailureResponse(error, "POST /api/trigger-jarvis");
+    if (known) return known;
     console.error(`POST /api/trigger-jarvis failed for trip ${tripId}:`, error);
     return NextResponse.json(
       { error: "Something went wrong while generating the plan. Please try again." },

@@ -193,7 +193,7 @@ export async function lockPoll(tripId: string): Promise<void> {
  * /api/trip/create - Jarvis's "plan a trip to X"), as a trip that is already
  * locked: its itinerary in TripDraft, a locked Poll row carrying the requested
  * length, and - when a signed-in person asked for it - their TripParticipant
- * row, the only record of who made the trip.
+ * row plus the Poll's createdByUserId: the records of who made the trip.
  *
  * One transaction, and only after the plan exists: a failed generation leaves
  * nothing behind. The Poll row has NO admin token (adminTokenHash stays ""), so
@@ -211,7 +211,9 @@ export async function createLockedTrip(args: {
   const { tripId, itineraryJson, durationDays, userId } = args;
   await prisma.$transaction([
     prisma.tripDraft.create({ data: { tripId, text: itineraryJson } }),
-    prisma.poll.create({ data: { tripId, locked: true, lockedAt: new Date(), durationDays } }),
+    prisma.poll.create({
+      data: { tripId, locked: true, lockedAt: new Date(), durationDays, ...(userId ? { createdByUserId: userId } : {}) },
+    }),
     ...(userId ? [prisma.tripParticipant.create({ data: { userId, tripId } })] : []),
   ]);
 }
@@ -233,17 +235,35 @@ export async function createLockedTrip(args: {
  * which doesn't exist yet at this point for a consensus trip) precisely
  * so it's already in the database before generation ever needs to read
  * it - see the field's own comment in prisma/schema.prisma.
+ *
+ * `createdByUserId` is the signed-in person whose Jarvis web chat made this
+ * poll (see Poll.createdByUserId); a poll created by voice has none, and
+ * leaving it out never clears one that is already there.
  */
 export async function createPollAdminToken(
   tripId: string,
   tokenHash: string,
-  durationDays: number
+  durationDays: number,
+  createdByUserId?: string
 ): Promise<void> {
+  const creator = createdByUserId ? { createdByUserId } : {};
   await prisma.poll.upsert({
     where: { tripId },
-    create: { tripId, adminTokenHash: tokenHash, durationDays },
-    update: { adminTokenHash: tokenHash, durationDays },
+    create: { tripId, adminTokenHash: tokenHash, durationDays, ...creator },
+    update: { adminTokenHash: tokenHash, durationDays, ...creator },
   });
+}
+
+/**
+ * Who made this poll, for the one place that must decide whether a caller may
+ * lock it without an admin token (POST /api/poll/[id]/finalize). null when no
+ * Poll row exists at all; { createdByUserId: null } for a poll made by voice or
+ * before the column existed. Reads one column and writes nothing - in particular
+ * it never creates the row the way claimPollForGeneration's upsert would.
+ */
+export async function getPollCreator(tripId: string): Promise<{ createdByUserId: string | null } | null> {
+  const row = await prisma.poll.findUnique({ where: { tripId }, select: { createdByUserId: true } });
+  return row ? { createdByUserId: row.createdByUserId } : null;
 }
 
 /** "" if no Poll row exists yet, or none was ever issued for this trip. */

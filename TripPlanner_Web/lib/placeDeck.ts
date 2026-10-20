@@ -1,5 +1,5 @@
 import type { DeckSearchPlace } from "@/lib/places";
-import type { DeckPlace, DeckPlaceCategory } from "@/lib/tripTypes";
+import { DECK_CATEGORY_LABELS, type DeckPlace, type DeckPlaceCategory } from "@/lib/tripTypes";
 
 /**
  * Pure deck-building logic for GET /api/places/deck - what to search for,
@@ -85,6 +85,36 @@ export const DECK_CATEGORIES: DeckCategorySpec[] = [
  */
 export function isDeckCategory(value: unknown): value is DeckPlaceCategory {
   return DECK_CATEGORIES.some((spec) => spec.category === value);
+}
+
+// Letters only, lower case, accents gone, one trailing "s" dropped: "Night
+// markets", "night-market" and "NIGHT_MARKETS" all squash to "nightmarket", and
+// "Cafe", "cafes" and "Café" to "cafe".
+function squashCategory(value: string): string {
+  return value
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "")
+    .replace(/s$/, "");
+}
+
+/**
+ * The deck taste a client's `category` stands for, or null when it names none.
+ * Lenient where isDeckCategory is exact: it also takes the on-screen label
+ * ("Night markets"), another case, a plural or a stray space, so a client that
+ * says "Cafes" or " History " still gets its quiz saved instead of the whole
+ * save being refused for a spelling. Always returns the canonical id.
+ */
+export function normalizeDeckCategory(value: unknown): DeckPlaceCategory | null {
+  if (typeof value !== "string") return null;
+  const wanted = squashCategory(value);
+  if (!wanted) return null;
+  const spec = DECK_CATEGORIES.find(
+    (candidate) =>
+      squashCategory(candidate.category) === wanted ||
+      squashCategory(DECK_CATEGORY_LABELS[candidate.category]) === wanted
+  );
+  return spec?.category ?? null;
 }
 
 /** The Text Search query for one seed, e.g. "quiet nature spots in Vancouver". */

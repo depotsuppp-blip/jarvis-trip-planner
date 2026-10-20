@@ -310,6 +310,19 @@ model Poll {
   /// the voice pipeline never sent a value - the same default this app
   /// always used.
   durationDays        Int       @default(5)
+  /// The signed-in person (User.id) whose Jarvis web chat created this poll
+  /// or trip, or null when it was created by voice (the device owner at the
+  /// microphone) or before this column existed. It is what lets the chat lock
+  /// a poll: POST /api/poll/[id]/finalize (the one door that needs no admin
+  /// token - Jarvis signs it with the shared secret) lets a web caller lock a
+  /// poll only if their user id equals this, and a voice caller (no user id)
+  /// only a poll whose creator is null. Without it any signed-in user could
+  /// tell Jarvis to lock a poll just because they know its public voting link.
+  /// A bare string, not a foreign key: the same convention tripId follows in
+  /// this file, and a deleted account simply leaves a creator nobody matches.
+  /// Written by POST /api/poll/[id]/admin-token (poll) and createLockedTrip in
+  /// lib/store.ts (a trip planned straight from the chat).
+  createdByUserId     String?
 }
 
 model action_logs {

@@ -5,27 +5,23 @@ import { use, useEffect, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { LoginScreen } from "@/components/auth/LoginScreen";
+import { PageHeader } from "@/components/PageHeader";
 import { SwipeDeck, SwipeDeckSkeleton } from "@/components/trip/SwipeDeck";
 import { hasCompletedTasteQuiz } from "@/lib/tasteProfile";
 
-// The swipe step speaks the Modern Editorial dialect (see the plan view and
-// sign-in): a white ground, 1px slate rules, ink text, no shadows. The bar is
-// solid white with a hairline under it, like the plan view's.
+// The swipe step is the playful part of the app: a light slate-50 ground, big
+// rounded cards with soft shadows and round buttons. (The plan view and the
+// sign-in screen speak the stricter Modern Editorial dialect; this page
+// deliberately does not - a taste quiz that feels like a form gets abandoned.)
 function Shell({ children }: { children: ReactNode }) {
   return (
     // A card in flight leaves the viewport, and a transformed box that is off
     // screen still counts as scrollable overflow - so clip it here, or the
     // page grows a horizontal scrollbar (and pans sideways on touch) for the
-    // length of every swipe. clip, unlike hidden, keeps the bar sticky.
-    <div className="min-h-svh overflow-x-clip bg-white text-slate-900">
-      <header className="sticky top-0 z-30 h-14 border-b border-slate-200 bg-white">
-        {/* The rule runs edge to edge; the words line up with the column below. */}
-        <div className="mx-auto flex h-full max-w-md flex-col justify-center px-4">
-          <h1 className="text-base font-bold tracking-tight text-slate-900">Your travel taste</h1>
-          <p className="text-[13px] leading-4 text-slate-600">Places from around the world</p>
-        </div>
-      </header>
-      <main className="mx-auto max-w-md px-4 pb-8 pt-6">{children}</main>
+    // length of every swipe. clip, unlike hidden, keeps the header sticky.
+    <div className="min-h-svh overflow-x-clip bg-slate-50">
+      <PageHeader variant="light" title="Your travel taste" subtitle="Places from around the world" />
+      <main className="mx-auto max-w-md px-4 py-6">{children}</main>
     </div>
   );
 }
@@ -107,7 +103,7 @@ export default function TripSwipePage({
           <p className="text-sm text-slate-600">You&apos;ve already finished this. Taking you back to the trip...</p>
           <Link
             href={pollPath}
-            className="mt-4 inline-block rounded-md text-sm font-semibold text-slate-900 underline underline-offset-2 outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600"
+            className="mt-4 inline-block rounded-full px-3 py-2 text-sm font-semibold text-rose-600 underline underline-offset-2 outline-none hover:text-rose-700 focus-visible:ring-4 focus-visible:ring-rose-200"
           >
             Back to trip
           </Link>
