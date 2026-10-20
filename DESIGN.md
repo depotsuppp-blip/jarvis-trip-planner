@@ -1,6 +1,6 @@
 ---
 name: Trip Planner
-description: "Boarding-pass cards on a quiet desk: light Bento/Airbnb minimalism with one rare rose accent, and an equal dark theme. One page speaks a second, ruled Editorial dialect: the locked plan view (a light grey timetable beside a real Google map). The swipe taste quiz stays playful: big rounded ticket cards, soft shadows, round buttons."
+description: "Boarding-pass cards on a quiet desk: light Bento/Airbnb minimalism with one rare rose accent, and an equal dark theme. Two pages speak a second, ruled Editorial dialect: the locked plan view (a light grey timetable beside a real Google map) and the Jarvis hub (a Desk Mist sidebar beside one white conversation column). The swipe taste quiz stays playful: big rounded ticket cards, soft shadows, round buttons."
 colors:
   desk-mist: "#f8fafc"
   paper: "#ffffff"
@@ -584,3 +584,44 @@ The Editorial restyle of the swipe step (2026-10-12) was withdrawn by the owner 
 - Only likes feed the plan: a theme with no likes is neutral, never "disliked" (`lib/tasteSummary.ts`). The plan page does not say it was personalised.
 - A deck is 24 cards only when all eight searches succeed; a failed search deals fewer, and every count follows the deck's real length.
 - The photos and places are Google's and change; the layout was checked against 24 stand-in cards (long names, no photo), not against live Places results.
+
+## Jarvis Hub (Editorial)
+
+**Scope: the Jarvis hub only** (`/jarvis`: `TripPlanner_Web/components/jarvis/*`, state in `lib/jarvis/*`). The hub was already ruled and white (hairlines, 6px corners, ink text) as a single chat column; on 2026-10-20 it became an agentic dashboard at the owner's request, "Modern Editorial: clean white space, crisp typography, high contrast". It is a third surface beside the Boarding Pass Desk and Plan (Editorial), not a change to either. No new tokens: every colour and size below is an existing one used this way.
+
+**Idea: "One conversation, ruled in."** The reply is the content, so the screen is a white column with a Desk Mist rail beside it. Anything an agent sends back that is more than words (a tool's result) arrives in the same column as a ruled block, in the same type and rules, so a widget never looks like it came from a different product.
+
+### Colors
+- **Ground:** Paper (#ffffff) for the conversation, its bars and the dock; Desk Mist (#f8fafc) for the sidebar only, the one change of ground. 1px Hairline (#e2e8f0) for every rule; Perforation (#cad5e2) as the edge of controls.
+- **Text:** Ink (#0f172b) for titles, names and the person's bubble (which is an Ink fill with white text); Ink Strong (#314158) for Jarvis's reply text; Ink Body (#45556c) for times, state words and captions (Muted #62748e only at 12px and up and never on a fill other than white or Desk Mist).
+- **Accent:** Deep Signal Rose (#ec003f) means *this one*: the text-selection highlight (white on rose), the caret, the keyboard focus outline, and the 6px dot beside the open session. It is not on a button, not on a status and not on a widget.
+- **State:** Go Green (#007a55) for "Ready" and "Operational", Alert Red (#c10007) for "Offline", "Down" and an error reply, Ink for "Working" and "Degraded". No amber (it is the rating star's). State is never colour alone: each state has its own word and, in a widget, its own icon.
+
+### Typography
+Geist; tabular numerals for every time. The ladder: 28 (the greeting, 700) / 17 (the brand and a widget's headline, 700) / 15 (a message, the top bar's title) / 14 (a session or agent row, a widget row's name) / 13 (a section's title, 600) / 12 (times, state words, a group label) / 11 (the Sample badge, uppercase). Uppercase appears twice: the orb's state word in the top bar and the Sample badge. Code (`/status`, a payload) is Geist Mono.
+
+### Layout
+Two columns on a window from 768px: the sidebar, 288px (or a 56px rail when collapsed), and the stage, which takes the rest. The sidebar's header and the stage's top bar are both 56px and share one rule across the window. The stage is a top bar, the conversation (a centred column, `max-w-2xl`, 16px gutters, 32px between messages) and the dock. Below 768px the sidebar is a drawer (320px or 85% of the window, whichever is less) over a scrim and the page behind it is inert.
+
+### Components
+- **Sidebar:** Desk Mist, Hairline on its right. Brand, then "New session" (Paper, Perforation edge, Ink), then Sessions (grouped Today / Yesterday / Previous 7 days / Earlier, newest first; a row is a name and a quiet time, the open one lifted onto a white sheet with a Hairline ring and the rose dot), then Agents & tools (a dot, a name, a state word, one line of why), then at the foot a folded **Test bench** and the account. Collapsed it is a rail: expand, new session, one dot per agent, the account's initial. The choice is remembered in the browser.
+- **Dock:** one ruled control (Perforation edge, 6px, Ink edge and a rose outline while the field has keyboard focus) holding the orb's small home, the field, Send (an Ink square) and **Talk** (Paper, an Ink fill while voice mode is on). Centred in the stage and fixed to its bottom; it is the orb's home.
+- **Orb:** one orb with two homes: 36px over the dock's left, and 224px in the middle of the **stage** - not of the window, so the sidebar is never under it - while Jarvis is listened to or is thinking. The conversation behind it is frosted and dimmed; the sidebar stays crisp, because it is where the agents show as working.
+- **Message:** the person's words in an Ink bubble on the right with a time under it; Jarvis's reply on the left under a byline (name, time), in Ink Strong, with any widgets below the text.
+- **Widget frame:** a 6px block with a Hairline: a 44px bar (icon, title, and the Sample badge when the data is made up), the body, and an optional Desk Mist footer. A tool's own view fills the body. A tool with no view yet gets the same frame with one sentence and its raw data behind a disclosure; so does data in the wrong shape and a view that throws.
+- **System status widget:** a headline (17px 700) with the time it was taken, then one ruled row per service: icon, name, latency and uptime in tabular type, an optional note, and the state word at the right.
+- **Sample badge:** 11px uppercase, 1px Perforation, 2px radius. On everything the page itself made up.
+
+### Motion
+Authored moments only. The orb glides between its homes in 700ms on the page's ease-out and follows the dock when the sidebar slides. The sidebar's width and the drawer's slide take 200ms ease-out (the drawer becomes visible at once and is hidden only after it has slid out, so focus can move into it). The frost fades in 500ms. A new message scrolls into view smoothly; opening another session jumps. Everything is skipped under `prefers-reduced-motion`.
+
+### Named Rules
+**The Orb Belongs To The Stage Rule.** The orb centres on the conversation column, never on the window; it follows the dock when the column moves.
+**The Sample Rule.** Whatever the page made up to show how it will look - a previewed widget, the simulated voice turn - wears the Sample badge. Nothing invented is shown as a reading.
+**The One Chrome Rule.** A widget is drawn inside the one frame; a tool that has no view of its own is not allowed to bring its own box.
+
+### Honest limits
+- Voice is simulated: Talk plays a listen, think, speak cycle with made-up lines and no microphone. The Trip Planner, Voice and Calendar rows in Agents & tools say what they are, not how they are: only the Jarvis brain's state is live (from each turn). A backend that reports tool status will replace the list.
+- Only `system_status` has a view. `calendar` is a known tool with a placeholder; any other tool gets the generic placeholder.
+- Sessions: the 50 most recent, no rename, delete or search; the title is the start of the first message.
+- Checked on 2026-10-20 in headless Chrome against a stand-in brain (desktop 1440x900, tablet 820, phone 390), not by a person, and the Impeccable finish reviewer was not run.

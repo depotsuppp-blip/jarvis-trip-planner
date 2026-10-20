@@ -16,6 +16,9 @@ const ChatBodySchema = z.object({
   message: z.string().trim().min(1).max(MAX_MESSAGE_LENGTH),
   // Omit to continue the user's latest conversation (or start the first one).
   conversationId: z.string().trim().min(1).max(128).optional(),
+  // True starts a NEW session instead of continuing the latest one (the hub's
+  // "New session"). Ignored when conversationId names a session.
+  newConversation: z.boolean().optional(),
 });
 
 const messageFields = { id: true, role: true, content: true, createdAt: true } as const;
@@ -25,7 +28,7 @@ function toRole(role: string): "user" | "jarvis" {
 }
 
 /**
- * POST /api/chat { message, conversationId? } - the Jarvis hub's text turn.
+ * POST /api/chat { message, conversationId?, newConversation? } - the Jarvis hub's text turn.
  * Saves the signed-in user's message, asks the brain (lib/jarvisBrain.ts) for
  * a reply, saves that too, and returns both. The user is always the
  * session's, and a conversationId that isn't theirs is treated as not found.
@@ -59,7 +62,7 @@ export async function POST(request: NextRequest) {
       { status: 400 }
     );
   }
-  const { message, conversationId } = parsed.data;
+  const { message, conversationId, newConversation } = parsed.data;
 
   const rateLimit = checkRateLimit(`chat:${userId}`, CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_MS);
   if (!rateLimit.allowed) {
@@ -75,7 +78,9 @@ export async function POST(request: NextRequest) {
   try {
     const existing = conversationId
       ? await prisma.conversation.findFirst({ where: { id: conversationId, userId }, select: { id: true } })
-      : await prisma.conversation.findFirst({ where: { userId }, orderBy: { updatedAt: "desc" }, select: { id: true } });
+      : newConversation
+        ? null
+        : await prisma.conversation.findFirst({ where: { userId }, orderBy: { updatedAt: "desc" }, select: { id: true } });
 
     if (conversationId && !existing) {
       return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
@@ -135,22 +140,29 @@ export async function POST(request: NextRequest) {
 }
 
 /**
- * GET /api/chat - the signed-in user's latest conversation, oldest message
- * first, as { conversationId, messages }. conversationId is null (and
- * messages empty) before the first message. Scoped to the session's user.
+ * GET /api/chat[?conversationId=...] - one of the signed-in user's sessions
+ * (the latest unless one is named), oldest message first, as
+ * { conversationId, messages }. conversationId is null (and messages empty)
+ * before the first message. Scoped to the session's user: naming someone
+ * else's session is a 404, exactly like naming one that does not exist.
+ *
+ * A message's `content` is returned as stored. For a reply from a tool it may
+ * be a JSON object instead of prose; the hub parses it (lib/jarvis/messageContent.ts).
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
   const userId = await getSessionUserId();
   if (!userId) {
     return NextResponse.json({ error: "Sign in to see your chat." }, { status: 401 });
   }
 
   try {
+    const wanted = request.nextUrl.searchParams.get("conversationId")?.trim();
     const conversation = await prisma.conversation.findFirst({
-      where: { userId },
+      where: wanted ? { id: wanted, userId } : { userId },
       orderBy: { updatedAt: "desc" },
       select: { id: true },
     });
+    if (wanted && !conversation) return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
     if (!conversation) return NextResponse.json({ conversationId: null, messages: [] });
 
     const recent = await prisma.message.findMany({
