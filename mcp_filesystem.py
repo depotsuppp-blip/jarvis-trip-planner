@@ -6,7 +6,10 @@ stdout - using nothing outside the standard library, and offers two tools:
 
     read_file        the text of one file, a page at a time (optional 'offset'
                      and 'length'; a reply that stops early says which offset
-                     continues it, and fits what mcp_client.py keeps of a result)
+                     continues it, and fits what mcp_client.py keeps of a result).
+                     Besides text and code it reads .pdf (PyMuPDF) and .docx
+                     (python-docx) by extracting their text first; the paging
+                     applies to that text. Other binary types are refused.
     list_directory   the files and folders inside one directory
 
 Everything is confined to the directory the server is started in (the project
@@ -43,16 +46,26 @@ Logging goes to stderr; stdout carries protocol messages and nothing else.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import json
 import os
 import sys
+import time
+import zipfile
 
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-SERVER_INFO = {"name": "jarvis-filesystem", "version": "1.0.0"}
+SERVER_INFO = {"name": "jarvis-filesystem", "version": "1.1.0"}
 
-MAX_READ_BYTES = 1_000_000   # a bigger file is refused rather than loaded
+MAX_READ_BYTES = 1_000_000   # a bigger plain-text file is refused rather than loaded
+# A PDF or Word file is mostly not text, so its size says little about how much
+# text it holds: those get a much higher limit, and what comes out is bounded
+# separately (characters, time, and what a .docx may unpack to).
+MAX_DOC_BYTES = 50_000_000
+MAX_EXTRACT_CHARS = 3_000_000
+EXTRACT_SECONDS = 20.0       # mcp_client.py gives a tool call 30 seconds
+MAX_DOCX_UNPACKED = 250_000_000
 # One reply (page note + text) must fit in what mcp_client.py keeps of a tool
 # result (its MAX_RESULT_CHARS). A longer reply would be cut at the end, after
 # the note, and the next offset would skip the lost characters.
@@ -189,6 +202,168 @@ def _whole_number(value: object, name: str, default: int, *, minimum: int) -> in
     return value
 
 
+# Formats that are not text and that this tool cannot turn into text. Anything
+# else - including files with no extension, like a Dockerfile - is read as text
+# unless its first bytes show that it is binary.
+_UNSUPPORTED_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff", ".heic",
+    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".mp4", ".mkv", ".avi", ".mov", ".webm",
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".iso",
+    ".doc", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".pyc", ".pyd", ".class", ".jar", ".whl", ".msi",
+    ".db", ".sqlite", ".sqlite3", ".npy", ".npz", ".pkl", ".pickle", ".onnx", ".pt", ".pth",
+    ".safetensors", ".gguf", ".ttf", ".otf", ".woff", ".woff2",
+})
+
+
+def _read_plain_text(real: str, label: str, size: int) -> str:
+    if size > MAX_READ_BYTES:
+        raise FsError(f"'{label}' is {_human_size(size)}; text files over {_human_size(MAX_READ_BYTES)} are not read.")
+    try:
+        with open(real, "rb") as handle:
+            data = handle.read(MAX_READ_BYTES + 1)
+    except OSError as exc:
+        raise FsError(_os_error_message(exc, label)) from exc
+    if b"\x00" in data[:8192]:
+        raise FsError(f"'{label}' looks like a binary file, not text.")
+    return data.decode("utf-8-sig", errors="replace")
+
+
+# ---- PDF and Word -----------------------------------------------------
+# The libraries are imported when first needed, so the server starts fast and
+# still works (for text files) where they are not installed. Their own console
+# chatter is sent to stderr: stdout carries protocol messages and nothing else.
+
+
+def _stop_note(reason: str) -> str:
+    return f"[Text extraction stopped {reason}; the rest of the document is not included.]"
+
+
+def _extract_pdf(real: str, label: str) -> str:
+    try:
+        try:
+            import pymupdf  # current name
+        except ImportError:
+            import fitz as pymupdf  # PyMuPDF before 1.24.3
+    except ImportError:
+        raise FsError("PDF support is not installed on this server (pip install PyMuPDF).") from None
+
+    deadline = time.monotonic() + EXTRACT_SECONDS
+    parts: list[str] = []
+    chars = 0
+    stopped = ""
+    try:
+        with contextlib.redirect_stdout(sys.stderr), pymupdf.open(real, filetype="pdf") as doc:
+            if doc.needs_pass:
+                raise FsError(f"'{label}' is password-protected and cannot be read.")
+            pages = doc.page_count
+            repaired = bool(getattr(doc, "is_repaired", False))
+            for number, page in enumerate(doc, start=1):
+                text = page.get_text("text").strip()
+                if text:
+                    parts.append(f"[Page {number}]\n{text}")
+                    chars += len(text) + 12
+                if chars >= MAX_EXTRACT_CHARS:
+                    stopped = _stop_note(f"after page {number} of {pages}: the document is longer than this tool reads")
+                    break
+                if time.monotonic() > deadline:
+                    stopped = _stop_note(f"after page {number} of {pages}: it took too long")
+                    break
+    except FsError:
+        raise
+    except Exception as exc:
+        log(f"pdf {type(exc).__name__}: {exc}")
+        raise FsError(f"'{label}' could not be opened as a PDF (it may be damaged).") from None
+
+    if not parts:
+        raise FsError(f"'{label}' has no extractable text. It may be scanned images, which this tool cannot read.")
+    text = "\n\n".join(parts)[:MAX_EXTRACT_CHARS]
+    if repaired:  # MuPDF rebuilt a broken file; say so rather than pass it off as complete
+        text = "[Note: this PDF was damaged and had to be repaired to open; some text may be missing.]\n\n" + text
+    return text + ("\n\n" + stopped if stopped else "")
+
+
+def _docx_table_lines(table) -> list[str]:
+    lines = []
+    for row in table.rows:
+        seen: set[int] = set()
+        cells = []
+        for cell in row.cells:
+            if id(cell._tc) in seen:  # a merged cell is reported once per column it spans
+                continue
+            seen.add(id(cell._tc))
+            cells.append(" ".join(cell.text.split()))
+        if any(cells):
+            lines.append(" | ".join(cells))
+    return lines
+
+
+def _extract_docx(real: str, label: str) -> str:
+    try:
+        import docx
+    except ImportError:
+        raise FsError("Word support is not installed on this server (pip install python-docx).") from None
+
+    try:
+        with zipfile.ZipFile(real) as archive:  # a .docx is a zip; refuse one that unpacks to something huge
+            unpacked = sum(info.file_size for info in archive.infolist())
+    except zipfile.BadZipFile:
+        raise FsError(f"'{label}' is not a readable .docx (it may be damaged, password-protected or another format).") from None
+    except OSError as exc:
+        raise FsError(_os_error_message(exc, label)) from exc
+    if unpacked > MAX_DOCX_UNPACKED:
+        raise FsError(f"'{label}' unpacks to {_human_size(unpacked)}, which is more than this tool reads.")
+
+    lines: list[str] = []
+    chars = 0
+    stopped = ""
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            document = docx.Document(real)
+            for block in document.iter_inner_content():  # paragraphs and tables, in document order
+                if hasattr(block, "rows"):
+                    new = _docx_table_lines(block)
+                else:
+                    new = [block.text] if block.text.strip() else []
+                lines.extend(new)
+                chars += sum(len(line) + 1 for line in new)
+                if chars >= MAX_EXTRACT_CHARS:
+                    stopped = _stop_note("because the document is longer than this tool reads")
+                    break
+    except FsError:
+        raise
+    except Exception as exc:
+        log(f"docx {type(exc).__name__}: {exc}")
+        raise FsError(f"'{label}' could not be opened as a .docx (it may be damaged).") from None
+
+    if not lines:
+        return ""
+    text = "\n".join(lines)[:MAX_EXTRACT_CHARS]
+    return text + ("\n\n" + stopped if stopped else "")
+
+
+_DOCUMENT_READERS = {".pdf": _extract_pdf, ".docx": _extract_docx}
+
+# Paging calls the tool again for each part, so the last couple of extractions
+# are kept (keyed by file, modified time and size) rather than redone each time.
+_extract_cache: dict[tuple, str] = {}
+
+
+def _extract_cached(real: str, label: str, extractor) -> str:
+    try:
+        stat = os.stat(real)
+    except OSError as exc:
+        raise FsError(_os_error_message(exc, label)) from exc
+    key = (_norm(real), stat.st_mtime_ns, stat.st_size)
+    text = _extract_cache.get(key)
+    if text is None:
+        text = extractor(real, label)
+        while len(_extract_cache) >= 2:
+            _extract_cache.pop(next(iter(_extract_cache)))
+        _extract_cache[key] = text
+    return text
+
+
 def read_file(arguments: dict) -> str:
     real, label = resolve(arguments.get("path"))
     offset = _whole_number(arguments.get("offset"), "offset", 0, minimum=0)
@@ -202,21 +377,29 @@ def read_file(arguments: dict) -> str:
         raise FsError(f"'{label}' does not exist.")
     if not os.path.isfile(real):
         raise FsError(f"'{label}' is not a regular file.")
+    ext = os.path.splitext(real)[1].lower()  # of the resolved file, so a link cannot rename a PDF into text
     try:
         size = os.path.getsize(real)
-        if size > MAX_READ_BYTES:
-            raise FsError(f"'{label}' is {_human_size(size)}; files over {_human_size(MAX_READ_BYTES)} are not read.")
-        with open(real, "rb") as handle:
-            data = handle.read(MAX_READ_BYTES + 1)
     except OSError as exc:
         raise FsError(_os_error_message(exc, label)) from exc
 
-    if b"\x00" in data[:8192]:
-        raise FsError(f"'{label}' looks like a binary file, not text.")
-    text = data.decode("utf-8-sig", errors="replace")
+    extractor = _DOCUMENT_READERS.get(ext)
+    if extractor is not None:
+        if size > MAX_DOC_BYTES:
+            raise FsError(f"'{label}' is {_human_size(size)}; documents over {_human_size(MAX_DOC_BYTES)} are not read.")
+        text = _extract_cached(real, label, extractor)
+    elif ext in _UNSUPPORTED_EXTENSIONS:
+        hint = " Save it as .docx to read it." if ext == ".doc" else ""
+        raise FsError(
+            f"'{label}' is a {ext} file, which cannot be read as text. "
+            f"This tool reads plain text and code files, .pdf and .docx documents.{hint}"
+        )
+    else:
+        text = _read_plain_text(real, label, size)
+
     total = len(text)
     if total == 0:
-        return "(the file is empty)"
+        return "(the file contains no text)"
 
     if offset > total or (offset == total and offset > 0):
         raise FsError(f"offset {offset} is at or past the end of '{label}', which has {total} characters.")
@@ -283,11 +466,12 @@ TOOLS = [
         "name": "read_file",
         "title": "Read a file",
         "description": (
-            "Reads a text file from the project folder and returns its contents. "
-            "The path must be relative to the project root, e.g. 'PRODUCT.md' or 'plugins/example.py'. "
+            "Reads a text or code file, or a .pdf or .docx document, from the project folder and returns its text. "
+            "The path must be relative to the project root, e.g. 'PRODUCT.md' or 'docs/report.pdf'. "
             "A long file comes back one part at a time: the reply starts with a line saying which characters "
-            "it shows and the offset to pass to read the next part. "
-            "Files outside the project, binary files and secrets such as .env cannot be read."
+            "it shows and the offset to pass to read the next part (for a PDF or Word file, offsets count the "
+            "extracted text, not the file). "
+            "Files outside the project, other binary files (images, spreadsheets, archives) and secrets such as .env cannot be read."
         ),
         "inputSchema": {
             "type": "object",
