@@ -4,7 +4,9 @@ A read-only file system MCP server for Jarvis (see mcp_client.py).
 It speaks the stdio transport - one JSON-RPC message per line on stdin and
 stdout - using nothing outside the standard library, and offers two tools:
 
-    read_file        the text of one file
+    read_file        the text of one file, a page at a time (optional 'offset'
+                     and 'length'; a reply that stops early says which offset
+                     continues it, and fits what mcp_client.py keeps of a result)
     list_directory   the files and folders inside one directory
 
 Everything is confined to the directory the server is started in (the project
@@ -51,7 +53,12 @@ SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "jarvis-filesystem", "version": "1.0.0"}
 
 MAX_READ_BYTES = 1_000_000   # a bigger file is refused rather than loaded
-MAX_REPLY_CHARS = 60_000     # the text of a file is cut here (the client cuts again, shorter)
+# One reply (page note + text) must fit in what mcp_client.py keeps of a tool
+# result (its MAX_RESULT_CHARS). A longer reply would be cut at the end, after
+# the note, and the next offset would skip the lost characters.
+MAX_REPLY_CHARS = 8000
+PAGE_NOTE_RESERVE = 200      # room for the "[Showing chars ...]" line
+DEFAULT_LENGTH = 8000        # asked-for page size; the real page is trimmed to fit the budget above
 MAX_LIST_ENTRIES = 500       # a folder with more entries is listed up to this
 MAX_PATH_CHARS = 1024
 
@@ -165,8 +172,27 @@ def _os_error_message(exc: OSError, label: str) -> str:
     return f"Could not read '{label}' ({type(exc).__name__})."
 
 
+def _whole_number(value: object, name: str, default: int, *, minimum: int) -> int:
+    """An int argument. Models often send numbers as strings, so '8000' is accepted too."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise FsError(f"'{name}' must be a whole number.")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if not isinstance(value, int):
+        raise FsError(f"'{name}' must be a whole number.")
+    if value < minimum:
+        raise FsError(f"'{name}' must be at least {minimum}.")
+    return value
+
+
 def read_file(arguments: dict) -> str:
     real, label = resolve(arguments.get("path"))
+    offset = _whole_number(arguments.get("offset"), "offset", 0, minimum=0)
+    length = _whole_number(arguments.get("length"), "length", DEFAULT_LENGTH, minimum=1)
     # Checked before existence, so a secret gets the same answer whether or not it is there.
     if _is_secret_path(real, is_dir=False):
         raise FsError(f"'{label}' is private and cannot be read through this tool.")
@@ -188,9 +214,25 @@ def read_file(arguments: dict) -> str:
     if b"\x00" in data[:8192]:
         raise FsError(f"'{label}' looks like a binary file, not text.")
     text = data.decode("utf-8-sig", errors="replace")
-    if len(text) > MAX_REPLY_CHARS:
-        text = text[:MAX_REPLY_CHARS] + f"\n[... cut: {len(text) - MAX_REPLY_CHARS} more characters]"
-    return text if text else "(the file is empty)"
+    total = len(text)
+    if total == 0:
+        return "(the file is empty)"
+
+    if offset > total or (offset == total and offset > 0):
+        raise FsError(f"offset {offset} is at or past the end of '{label}', which has {total} characters.")
+    # The page is trimmed so note + text stay inside MAX_REPLY_CHARS.
+    end = min(offset + min(length, MAX_REPLY_CHARS - PAGE_NOTE_RESERVE), total)
+    page = text[offset:end]
+    if offset == 0 and end == total:
+        return page  # the whole file: nothing to explain
+    if end < total:
+        note = (
+            f"[Showing chars {offset}-{end} of {total}. "
+            f"Call read_file again with offset={end} to read the next part.]"
+        )
+    else:
+        note = f"[Showing chars {offset}-{end} of {total}. This is the end of the file.]"
+    return note + "\n" + page
 
 
 def list_directory(arguments: dict) -> str:
@@ -243,12 +285,24 @@ TOOLS = [
         "description": (
             "Reads a text file from the project folder and returns its contents. "
             "The path must be relative to the project root, e.g. 'PRODUCT.md' or 'plugins/example.py'. "
+            "A long file comes back one part at a time: the reply starts with a line saying which characters "
+            "it shows and the offset to pass to read the next part. "
             "Files outside the project, binary files and secrets such as .env cannot be read."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path relative to the project root, e.g. 'DESIGN.md'."}
+                "path": {"type": "string", "description": "File path relative to the project root, e.g. 'DESIGN.md'."},
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Character position to start reading from. Default 0. Use the offset a previous reply gave to continue.",
+                },
+                "length": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Most characters to return. Default 8000, which is also the largest part one call returns.",
+                },
             },
             "required": ["path"],
         },
