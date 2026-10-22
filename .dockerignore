@@ -1,0 +1,15 @@
+# Build context for api_server.Dockerfile (the repo root).
+#
+# An allowlist: everything is ignored unless it is re-included below, so a new
+# file - .env, a key, a local database dump - can never reach the image by
+# accident. Secrets come in at run time through env_file in docker-compose.yml.
+*
+
+# What the Jarvis brain needs to run
+!requirements.txt
+!*.py
+!plugins/
+
+# ...minus bytecode caches that happen to sit beside the sources
+**/__pycache__
+**/*.pyc

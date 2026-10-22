@@ -1,0 +1,30 @@
+# Build context for nextjs.Dockerfile (this folder). Anything listed here is
+# never sent to the Docker daemon, so it cannot end up in an image layer.
+
+# Secrets. The build reads .env.local through a BuildKit secret mount instead
+# (see docker-compose.yml); the running container gets its values from env_file.
+**/.env*
+*.pem
+
+# Reinstalled / rebuilt inside the image
+node_modules
+.next
+out
+build
+coverage
+*.tsbuildinfo
+next-env.d.ts
+
+# Local runtime data and tooling
+.data
+.vercel
+.git
+.gitignore
+npm-debug.log*
+yarn-debug.log*
+.DS_Store
+
+# Not needed to build
+*.md
+nextjs.Dockerfile
+.dockerignore

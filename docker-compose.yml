@@ -1,6 +1,106 @@
-version: "3.8"
+# Jarvis, all of it, on one machine:
+#
+#   frontend  Trip Planner web app (TripPlanner_Web, Next.js)   http://localhost:3000
+#   backend   Jarvis brain (api_server.py, FastAPI)             127.0.0.1:8000, this PC only
+#   n8n       automation                                        http://localhost:5678
+#
+# First run needs two files that are NOT in git (see .env.example and
+# TripPlanner_Web/.env.example for what goes in them):
+#     .env                        read by backend
+#     TripPlanner_Web/.env.local  read by frontend, and at build time for NEXT_PUBLIC_*
+#
+#   docker compose up -d --build     start everything (and rebuild what changed)
+#   docker compose logs -f backend   follow one service
+#   docker compose down              stop; named volumes keep their data
+#
+# Shipping an update later: git pull, then `docker compose up -d --build`.
+# Only the images whose files changed are rebuilt and recreated.
+
+x-logging: &default-logging
+  # Without a cap, json-file logs grow until the disk is full - fatal for a
+  # container meant to run for months.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
+  backend:
+    build:
+      context: .
+      dockerfile: api_server.Dockerfile
+    image: jarvis-backend:latest
+    container_name: jarvis_backend
+    init: true # tini as PID 1: forwards SIGTERM for a clean stop, reaps child processes
+    env_file: .env
+    # Bound to loopback on the host: api_server.py has no authentication, so
+    # it must never be reachable from the network. The frontend reaches it
+    # over jarvis_net as http://backend:8000 and does not need this mapping.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # faster-whisper's weights (~460 MB for "small") download here on first
+      # start when OPENAI_API_KEY is not set; the volume keeps them across
+      # rebuilds.
+      - jarvis_models:/app/.models
+      # llm_budget.py's daily token record.
+      - jarvis_data:/app/.data
+    # Measured with faster-whisper "small" (int8, CPU): ~1.15 GB idle once the
+    # model is loaded, ~1.4 GB while a clip is being decoded. 3 GB is about 2x
+    # that - room for PDF/DOCX reads and longer clips - without letting a
+    # runaway process starve the rest of the PC. A bigger model
+    # (JARVIS_WHISPER_MODEL=medium) needs this raised.
+    mem_limit: 3g
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # /health answers as soon as the server is up; the Whisper model keeps
+      # loading in the background (its "stt_ready" flag).
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+    networks:
+      - jarvis_net
+
+  frontend:
+    build:
+      context: ./TripPlanner_Web
+      dockerfile: nextjs.Dockerfile
+      # next build inlines NEXT_PUBLIC_* from .env.local; passed as a secret so
+      # the file is never stored in an image layer.
+      secrets:
+        - web_env
+    image: jarvis-frontend:latest
+    container_name: jarvis_frontend
+    init: true # tini as PID 1: forwards SIGTERM for a clean stop, reaps child processes
+    env_file: ./TripPlanner_Web/.env.local
+    environment:
+      # Overrides whatever .env.local says (it points at 127.0.0.1, which
+      # inside this container is the container itself). The voice endpoint is
+      # derived from it (/chat -> /voice).
+      JARVIS_BRAIN_URL: http://backend:8000/chat
+    ports:
+      - "3000:3000"
+    mem_limit: 1g
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # NextAuth's provider list: proves the server answers without touching
+      # the database (a probe every 30 s must not keep Neon awake).
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/auth/providers').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+    networks:
+      - jarvis_net
+
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n_stable
@@ -16,5 +116,17 @@ services:
       - n8n_data:/home/node/.n8n # บันทึกข้อมูลถาวร คอนเทนเนอร์ลบ ข้อมูลก็ไม่หาย
     restart: always # เปิดคอมมาปุ๊บ ให้มันรันเองเลย (ถ้าระบบ Docker รันอยู่)
 
+networks:
+  # frontend <-> backend. Both can still reach the internet (Anthropic, Google,
+  # Neon); only the backend's own port is kept off the LAN, see above.
+  jarvis_net:
+    driver: bridge
+
+secrets:
+  web_env:
+    file: ./TripPlanner_Web/.env.local
+
 volumes:
   n8n_data:
+  jarvis_models:
+  jarvis_data:
