@@ -1,6 +1,8 @@
 import { chatApi, type ApiFailure } from "./chatApi";
 import { demoReply, initialAgents, parseDemoCommand, type DemoTool } from "./demo";
 import { toChatMessage } from "./messageContent";
+import { canSpeak, type ReplyAudio } from "./replyAudio";
+import { createSpeechPlayer } from "./speechPlayer";
 import { createStore } from "./store";
 import {
   isFocalMode,
@@ -11,6 +13,7 @@ import {
   type OrbMode,
   type OrbState,
   type SessionSummary,
+  type SpeechState,
 } from "./types";
 import {
   startRecording,
@@ -31,6 +34,13 @@ import {
  * re-renders the feed and never the orb, and the orb's mode never re-renders
  * the feed's rows - the animation keeps the main thread to itself.
  *
+ * Spoken replies. While voice replies are on (`speech`, the person's choice, kept in
+ * localStorage) every turn asks the server for audio (`speak: true`), and a reply
+ * that comes back with audio is played - but only if its own text is at most
+ * VOICE_REPLY_MAX_CHARS (replyAudio.ts), whatever the server decided. The orb shows
+ * "speaking" while the clip plays. A new turn, a session change, the Talk button or
+ * switching voice replies off cuts the clip off.
+ *
  * Staleness. Two counters keep an old answer from landing in the wrong place:
  * `turn` says which turn the orb belongs to (End, a new turn or a session
  * change bumps it, so a finished request does not drag the orb back to idle),
@@ -50,6 +60,11 @@ const VOICE_IDLE_DETAIL = "Tap Talk to speak";
 
 // The server titles a session with the start of its first message (app/api/chat/route.ts).
 const TITLE_CHARS = 60;
+
+// The person's voice-replies choice. "off" is the only value written; anything else (or no storage) means on.
+const SPEECH_STORAGE_KEY = "jarvis:voice-replies";
+// A spoken reply that has not started playing by now is given up on (see speakReply).
+const SPEECH_START_MS = 4000;
 
 const MICROPHONE_PROBLEM: Record<VoiceRecorderFailure, { message: string; detail: string }> = {
   unsupported: {
@@ -83,10 +98,18 @@ export interface ChatActions {
   finishVoice(): Promise<void>;
   /** Throws a recording away unsent, or gives up on a turn that is waiting for its answer. */
   endVoice(): void;
+  /** Turns voice replies on or off. Turning them off also cuts off a reply that is being read out. */
+  toggleSpeech(): void;
   /** Test bench: jump the orb straight to a mode. */
   forceOrb(mode: OrbMode): void;
   /** Test bench: reply with a made-up widget. */
   previewWidget(tool: DemoTool): void;
+}
+
+/** A reply that may be read aloud: the audio the server sent (if any) and the reply's own words. */
+interface SpokenReply {
+  audio: ReplyAudio | null | undefined;
+  text: string | null;
 }
 
 function initialChat(): ChatState {
@@ -116,7 +139,10 @@ function touchSession(items: SessionSummary[], id: string, title: string, at: nu
 export class ChatController {
   readonly chat = createStore<ChatState>(initialChat());
   readonly orb = createStore<OrbState>({ mode: "idle", voice: false });
+  /** On until the person turns it off; the saved choice is read in `start` (never on the server). */
+  readonly speech = createStore<SpeechState>({ enabled: true });
 
+  private readonly player = createSpeechPlayer();
   private timers: number[] = [];
   private nextId = 1;
   private turn = 0;
@@ -138,6 +164,7 @@ export class ChatController {
     toggleVoice: () => this.toggleVoice(),
     finishVoice: () => this.finishVoice(),
     endVoice: () => this.cancelTurn(),
+    toggleSpeech: () => this.toggleSpeech(),
     forceOrb: (mode) => this.forceOrb(mode),
     previewWidget: (tool) => this.previewWidget(tool),
   };
@@ -147,6 +174,7 @@ export class ChatController {
   /** Loads the saved sessions. Safe to call again after `dispose` (React StrictMode mounts twice in development). */
   start(): void {
     this.disposed = false;
+    this.loadSpeechPreference();
     this.bootstrapping = this.bootstrap();
   }
 
@@ -155,6 +183,7 @@ export class ChatController {
     this.abandonRecording();
     this.clearTimers();
     this.turn++;
+    this.player.stop();
     this.epoch++;
   }
 
@@ -260,6 +289,7 @@ export class ChatController {
 
     this.clearTimers();
     const mine = ++this.turn;
+    this.player.stop();
     const demo = parseDemoCommand(text);
 
     this.append({ role: "user", content: { text, widgets: [] }, origin: demo ? "demo" : "server" });
@@ -282,14 +312,17 @@ export class ChatController {
     const result = await chatApi.send({
       message: text,
       ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
+      ...(this.speech.getState().enabled ? { speak: true } : {}),
     });
     if (this.disposed) return;
 
+    let toSpeak: SpokenReply | null = null;
     if (result.ok) {
       this.setAgent("brain", "ready");
       const reply = toChatMessage(result.data.reply);
       const { conversationId } = result.data;
       if (epoch === this.epoch) {
+        toSpeak = { audio: result.data.audio, text: reply.content.text };
         this.chat.setState((state) => ({
           access: "signed-in",
           activeSessionId: conversationId,
@@ -307,7 +340,8 @@ export class ChatController {
       this.reportFailure(result, epoch);
     }
 
-    this.settle(mine);
+    // A reply that is being read out keeps the orb on "thinking" until the sound starts, then "speaking".
+    if (!toSpeak || !this.speakReply(toSpeak, mine)) this.settle(mine);
   }
 
   /** `agent` is the one the failure is charged to: the brain for a typed turn, Voice for a spoken one. */
@@ -338,6 +372,8 @@ export class ChatController {
 
     this.clearTimers();
     const mine = ++this.turn;
+    // The microphone must not hear Jarvis: a reply still being read out stops now.
+    this.player.stop();
     this.starting = true;
     // Pressed from the click on, so the button answers while the browser's permission prompt is up.
     this.orb.setState({ voice: true });
@@ -413,12 +449,13 @@ export class ChatController {
 
     const epoch = this.epoch;
     const { activeSessionId } = this.chat.getState();
-    const result = await chatApi.sendVoice(
-      audio.blob,
-      activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }
-    );
+    const result = await chatApi.sendVoice(audio.blob, {
+      ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
+      ...(this.speech.getState().enabled ? { speak: true } : {}),
+    });
     if (this.disposed) return;
 
+    let toSpeak: SpokenReply | null = null;
     if (result.ok) {
       // Say where the words were heard: "local" never left the brain's machine, "openai" went to the Whisper API.
       this.setAgent("voice", "ready", result.data.engine === "local" ? "Heard you, on this device" : "Heard you");
@@ -427,6 +464,7 @@ export class ChatController {
       const reply = toChatMessage(result.data.reply);
       const { conversationId } = result.data;
       if (epoch === this.epoch) {
+        toSpeak = { audio: result.data.audio, text: reply.content.text };
         this.chat.setState((state) => ({
           access: "signed-in",
           activeSessionId: conversationId,
@@ -449,7 +487,63 @@ export class ChatController {
       this.reportFailure(result, epoch, "voice");
     }
 
-    this.settle(mine);
+    if (!toSpeak || !this.speakReply(toSpeak, mine)) this.settle(mine);
+  }
+
+  // ------------------------------------------------------------------- speech
+
+  /** Reads the saved choice. Only `start` calls this: it needs `window`, which the server render has not got. */
+  private loadSpeechPreference(): void {
+    try {
+      this.speech.setState({ enabled: window.localStorage.getItem(SPEECH_STORAGE_KEY) !== "off" });
+    } catch {
+      // Storage blocked (private window, site data off): the choice just lasts until the page closes.
+    }
+  }
+
+  toggleSpeech(): void {
+    const enabled = !this.speech.getState().enabled;
+    this.speech.setState({ enabled });
+    try {
+      if (enabled) window.localStorage.removeItem(SPEECH_STORAGE_KEY);
+      else window.localStorage.setItem(SPEECH_STORAGE_KEY, "off");
+    } catch {
+      // See loadSpeechPreference.
+    }
+    if (!enabled) this.player.stop();
+  }
+
+  /**
+   * Plays `reply`'s audio - if voice replies are still on, the turn is still the current one,
+   * and the reply's own text is short enough (the server applies the same limit; this is the
+   * page's own check). Returns true when the audio was handed to the player, which then owns
+   * the end of the turn: the orb stays on "thinking" until sound really starts (so it never
+   * flashes "idle" in between, nor claims "speaking" over silence), says "speaking" while it
+   * plays, and goes idle when it ends - however it ends (finished, refused by the browser,
+   * cut off). The give-up timer is for a clip that neither starts nor fails, which would
+   * otherwise leave the orb thinking, and the input locked, for good.
+   */
+  private speakReply({ audio, text }: SpokenReply, turn: number): boolean {
+    if (!audio || !canSpeak(text) || !this.speech.getState().enabled) return false;
+    if (this.disposed || this.turn !== turn) return false;
+
+    let started = false;
+    const giveUp = window.setTimeout(() => {
+      if (!started) this.player.stop();
+    }, SPEECH_START_MS);
+
+    this.player.play(audio, {
+      onStart: () => {
+        started = true;
+        window.clearTimeout(giveUp);
+        if (this.turn === turn) this.orb.setState({ mode: "speaking", voice: false });
+      },
+      onEnd: () => {
+        window.clearTimeout(giveUp);
+        if (this.turn === turn) this.orb.setState({ mode: "idle", voice: false });
+      },
+    });
+    return true;
   }
 
   // -------------------------------------------------------------- test bench
@@ -459,6 +553,7 @@ export class ChatController {
     this.resetVoiceAgent();
     this.clearTimers();
     this.turn++;
+    this.player.stop();
     this.orb.setState({ mode, voice: mode !== "idle" });
   }
 
@@ -467,6 +562,7 @@ export class ChatController {
     this.resetVoiceAgent();
     this.clearTimers();
     const mine = ++this.turn;
+    this.player.stop();
     this.orb.setState({ mode: "thinking", voice: false });
     this.later(DEMO_THINK_MS, () => {
       this.append({ role: "jarvis", content: demoReply(tool, Date.now()), origin: "demo" });
@@ -481,6 +577,7 @@ export class ChatController {
     this.abandonRecording();
     this.clearTimers();
     this.turn++;
+    this.player.stop();
     this.orb.setState({ mode: "idle", voice: false });
     this.resetVoiceAgent();
   }

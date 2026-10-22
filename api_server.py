@@ -2,18 +2,26 @@
 HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
 
     POST /chat   { "prompt": "...", "history": [{ "role": "user"|"jarvis", "content": "..." }],
-                   "user_id": "...", "app_url": "..." }
-              -> { "reply": "..." }   (a plain sentence, or - when a tool showed the
-                                       person a widget - a JSON string, see rich_reply.py)
+                   "user_id": "...", "app_url": "...", "speak": false }
+              -> { "reply": "...", "audio": null }
+                 reply is a plain sentence, or - when a tool showed the person a widget -
+                 a JSON string, see rich_reply.py. audio is {"mime": "audio/mpeg",
+                 "base64": "..."} only when "speak" was true AND the reply's plain text is at
+                 most 200 characters AND the voice worked (reply_audio.py, Edge-TTS); in every
+                 other case it is null and the reply is just text.
     POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
-                   history (a JSON list shaped like /chat's), user_id, app_url
-              -> { "transcript": "...", "reply": "...", "engine": "openai"|"local" }
+                   history (a JSON list shaped like /chat's), user_id, app_url, speak
+              -> { "transcript": "...", "reply": "...", "engine": "openai"|"local", "audio": null }
                  Speech-to-text (stt.py: OpenAI Whisper with OPENAI_API_KEY, otherwise
                  faster-whisper on this machine) first, then the transcript is asked
                  exactly as a typed /chat prompt would be. 422 when nothing was heard.
     GET  /health -> { "ok": true, "provider": "...", "model": "...",
-                      "stt": "openai"|"local", "stt_ready": true|false }
-                 stt_ready is false while the on-device model is still loading.
+                      "stt": "openai"|"local", "stt_ready": true|false,
+                      "tts": true|false, "mcp_tools": ["mcp__web_search__web_search", ...] }
+                 stt_ready is false while the on-device model is still loading. tts says whether
+                 replies can be spoken (Edge-TTS installed and not switched off). mcp_tools are
+                 the tool-server tools the brain has: the bundled filesystem and web search
+                 servers start with the brain, with nothing to configure (mcp_client.py).
 
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
@@ -29,6 +37,10 @@ without them is still a web chat - links are allowed in the reply - it just
 cannot plan a trip for anyone in particular.
 
 Run:  python api_server.py      (127.0.0.1:8000, local only)
+
+The brain, and with it the bundled MCP tool servers, is started when the server starts
+(a background thread), not on the first message, so the first person to ask does not
+wait for them.
 
 Things that differ from the voice assistant, deliberately:
 
@@ -49,13 +61,14 @@ from __future__ import annotations
 
 import threading
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
+import reply_audio
 import request_context
 import rich_reply
 import stt
@@ -82,10 +95,18 @@ class ChatRequest(BaseModel):
     history: list[HistoryTurn] = Field(default_factory=list, max_length=MAX_HISTORY_TURNS)
     user_id: str = Field(default="", max_length=128)
     app_url: str = Field(default="", max_length=300)
+    # The person has voice replies on: also answer with audio when the reply is short enough.
+    speak: bool = False
+
+
+class ReplyAudio(BaseModel):
+    mime: str
+    base64: str
 
 
 class ChatResponse(BaseModel):
     reply: str
+    audio: Optional[ReplyAudio] = None
 
 
 class VoiceResponse(BaseModel):
@@ -93,6 +114,7 @@ class VoiceResponse(BaseModel):
     reply: str
     # Who did the listening: "openai" (the Whisper API) or "local" (faster-whisper on this machine).
     engine: str
+    audio: Optional[ReplyAudio] = None
 
 
 _history_turns = TypeAdapter(Annotated[list[HistoryTurn], Field(max_length=MAX_HISTORY_TURNS)])
@@ -103,12 +125,22 @@ def _decline(question: str) -> bool:
     return False
 
 
+def _warm_brain() -> None:
+    """Builds the brain now, which also starts the bundled MCP tool servers (filesystem, web search)."""
+    try:
+        _get_brain()
+    except Exception as exc:  # noqa: BLE001 - the first request will try again and report it
+        print(f"[API] Starting the brain failed: {type(exc).__name__}: {exc}")
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # The on-device speech model takes seconds to load: start that now, on its own
     # thread (importing it is slow too), so the first Talk press does not wait for it
     # and the server is not held back from answering. A no-op when OPENAI_API_KEY is set.
     threading.Thread(target=stt.warm_up, name="jarvis-stt-warmup", daemon=True).start()
+    # Same idea for the brain: its MCP tool servers take a few seconds to start.
+    threading.Thread(target=_warm_brain, name="jarvis-brain-warmup", daemon=True).start()
     yield
 
 
@@ -122,14 +154,18 @@ app.add_middleware(
 
 _brain: LLMBrain | None = None
 _lock = threading.Lock()
+# Held while the brain is being built, so the start-up thread and a request that arrives
+# meanwhile share one brain (two would start the MCP tool servers twice).
+_build_lock = threading.Lock()
 
 
 def _get_brain() -> LLMBrain:
-    """Built on first use, so importing this module (or /health) stays cheap."""
+    """Built once - at start-up on a background thread, or on first use. Importing this module stays cheap."""
     global _brain
-    if _brain is None:
-        _brain = LLMBrain(confirm=_decline)
-    return _brain
+    with _build_lock:
+        if _brain is None:
+            _brain = LLMBrain(confirm=_decline)
+        return _brain
 
 
 @app.get("/health")
@@ -141,10 +177,14 @@ def health() -> dict:
         "model": brain.model,
         "stt": stt.engine(),
         "stt_ready": stt.is_ready(),
+        "tts": reply_audio.enabled(),
+        "mcp_tools": [name for name in brain.tool_names if name.startswith("mcp__")],
     }
 
 
-def _answer(brain: LLMBrain, prompt: str, history: list[HistoryTurn], user_id: str, app_url: str) -> str:
+def _answer(
+    brain: LLMBrain, prompt: str, history: list[HistoryTurn], user_id: str, app_url: str, speak: bool = False
+) -> str:
     """One turn through the brain, as /chat and /voice both ask it. May return ''."""
     # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
     turns = [
@@ -155,6 +195,8 @@ def _answer(brain: LLMBrain, prompt: str, history: list[HistoryTurn], user_id: s
         channel=request_context.CHANNEL_WEB,
         user_id=user_id.strip(),
         app_url=app_url.strip(),
+        # Only asked to keep answers short when they can actually be spoken.
+        voice_reply=speak and reply_audio.enabled(),
     )
     with _lock:
         brain.set_history(turns)
@@ -167,6 +209,23 @@ def _answer(brain: LLMBrain, prompt: str, history: list[HistoryTurn], user_id: s
     return reply
 
 
+def _audio_for(reply: str, speak: bool) -> Optional[ReplyAudio]:
+    """
+    The spoken version of `reply`, or None: not asked for, longer than the voice limit,
+    or the voice is unavailable. Called after _answer has released the brain's lock - the
+    network round trip to the voice must not hold up anyone else's message - and it never
+    raises, so a voice failure leaves the person with the text.
+    """
+    if not speak:
+        return None
+    try:
+        payload = reply_audio.for_reply(reply)
+        return ReplyAudio(**payload) if payload else None
+    except Exception as exc:  # noqa: BLE001 - audio is an extra; a bug in it must not cost the person their answer
+        print(f"[API] Spoken reply failed: {type(exc).__name__}: {exc}")
+        return None
+
+
 # A plain `def`, not async: ask() blocks for seconds on the network, and
 # FastAPI runs sync endpoints in its thread pool so the event loop stays free.
 @app.post("/chat", response_model=ChatResponse)
@@ -175,10 +234,10 @@ def chat(body: ChatRequest) -> ChatResponse:
     if not brain.available:
         raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
 
-    reply = _answer(brain, body.prompt, body.history, body.user_id, body.app_url)
+    reply = _answer(brain, body.prompt, body.history, body.user_id, body.app_url, body.speak)
     if not reply:
         raise HTTPException(status_code=502, detail="The brain returned an empty reply.")
-    return ChatResponse(reply=reply)
+    return ChatResponse(reply=reply, audio=_audio_for(reply, body.speak))
 
 
 # Sync for the same reason as /chat: transcription and the brain both block on the network.
@@ -190,6 +249,7 @@ def voice(
     history: str = Form("[]"),
     user_id: str = Form("", max_length=128),
     app_url: str = Form("", max_length=300),
+    speak: bool = Form(False),
 ) -> VoiceResponse | JSONResponse:
     brain = _get_brain()
     # Checked first: no point paying for a transcription nobody can answer.
@@ -217,14 +277,14 @@ def voice(
     if not transcript:
         raise HTTPException(status_code=422, detail="I couldn't hear anything in that recording.")
 
-    reply = _answer(brain, transcript, turns, user_id, app_url)
+    reply = _answer(brain, transcript, turns, user_id, app_url, speak)
     if not reply:
         # The words WERE heard: the caller gets them back so the person's message is not lost.
         return JSONResponse(
             status_code=502,
             content={"detail": "The brain returned an empty reply.", "transcript": transcript, "engine": heard.engine},
         )
-    return VoiceResponse(transcript=transcript, reply=reply, engine=heard.engine)
+    return VoiceResponse(transcript=transcript, reply=reply, engine=heard.engine, audio=_audio_for(reply, speak))
 
 
 if __name__ == "__main__":

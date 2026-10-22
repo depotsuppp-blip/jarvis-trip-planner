@@ -76,13 +76,15 @@ Several things were added to this module beyond plain tool calling:
       prompt rule, because a prompt is only a request.
 
   MCP CLIENT  tools served by other programs over the Model Context
-      Protocol. mcp_client.py starts the servers listed in mcp_servers.json,
-      asks each for its tools (tools/list) and returns them as ToolSpecs
-      named mcp__<server>__<tool>; calling one forwards a tools/call and the
-      text comes back to the model labelled as external data. The snapshot
-      is re-read every turn like plugins. A tool that is not marked read-only
-      asks for confirmation (the web server declines those). JARVIS_MCP=0
-      turns it off.
+      Protocol. mcp_client.py starts the bundled servers (local_fs and
+      web_search - no configuration needed) and those listed in
+      mcp_servers.json, asks each for its tools (tools/list) and returns
+      them as ToolSpecs named mcp__<server>__<tool>; calling one forwards a
+      tools/call and the text comes back to the model labelled as external
+      data. The snapshot is re-read every turn like plugins. A tool that
+      is not marked read-only asks for confirmation (the web server
+      declines those). JARVIS_MCP=0 turns it off, JARVIS_MCP_CORE=0 turns
+      off just the bundled ones.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -499,6 +501,21 @@ A tool may also put a card (a widget) on the person's screen with its \
 result; when its result says so, the person can already see it, so do not \
 read it out or repeat what is in it - one short sentence is enough. \
 Everything else stands: plain text with no markdown, and short."""
+
+# Appended after WEB_CHAT_ADDENDUM when the person has voice replies turned on
+# (request_context.voice_reply). The page reads a reply aloud only when its text is
+# at most rich_reply.VOICE_MAX_CHARS characters, so this asks for conversational
+# answers inside that size - and says plainly that a longer, needed answer is fine,
+# so the limit never costs an answer its substance.
+VOICE_REPLY_ADDENDUM = """
+
+The person has voice replies turned on: a reply of 200 characters or fewer \
+is also read aloud to them. So keep conversational answers - small talk, a \
+confirmation, a quick fact, a yes or no - to one or two short sentences \
+within 200 characters, in plain words that sound natural spoken. That limit \
+is for conversation only: when the task needs more (search results, a plan, \
+what is in a file) write what it needs - it is shown on screen and not read \
+aloud."""
 
 # What the brain does when a reply holds a trip link or id that no tool returned
 # during this request (link_guard.py says which): it is not sent. The model gets
@@ -3238,6 +3255,8 @@ class LLMBrain:
             caller = request_context.current()
             if caller is not None and caller.is_web:
                 prompt += WEB_CHAT_ADDENDUM
+                if caller.voice_reply:
+                    prompt += VOICE_REPLY_ADDENDUM
         else:
             prompt = system
 

@@ -21,6 +21,18 @@ transports are not implemented; a server that only offers those needs a
 stdio bridge in front of it. There is no dependency on the `mcp` package -
 the protocol subset used here is small enough to read in one sitting.
 
+BUNDLED SERVERS
+---------------
+Two servers ship with Jarvis and start with it, with no configuration at all:
+
+    local_fs     mcp_filesystem.py   read files and list folders in the project
+    web_search   mcp_websearch.py    search the web (DuckDuckGo)
+
+mcp_servers.json is for everything else. An entry there with the same name as
+a bundled server replaces it (different arguments, `"confirm": "never"`, ...),
+and `{"disabled": true}` switches that one off. JARVIS_MCP_CORE=0 starts none of
+the bundled ones; JARVIS_MCP=0 starts no MCP server at all.
+
 CONFIG
 ------
 `mcp_servers.json` next to this file (or the path in JARVIS_MCP_CONFIG), in
@@ -156,37 +168,77 @@ def _expand(value: str) -> str:
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: os.environ.get(m.group(1), ""), value)
 
 
-def load_config(path: Optional[str] = None) -> list[ServerConfig]:
+def _env_off(name: str) -> bool:
+    return os.environ.get(name, "1").strip().lower() in ("0", "false", "no", "off")
+
+
+# The servers that ship with Jarvis: (name, script next to this file). They run on
+# the interpreter that runs Jarvis ("python" below stands for it, see _resolve_command)
+# with the project folder as their working directory - mcp_filesystem.py confines
+# itself to that folder.
+_BUNDLED = (
+    ("local_fs", "mcp_filesystem.py"),
+    ("web_search", "mcp_websearch.py"),
+)
+
+
+def bundled_servers() -> list[ServerConfig]:
+    """The servers that start with no configuration. A script that is not on disk is left out."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        ServerConfig(name, "python", [os.path.join(here, script)], {}, here)
+        for name, script in _BUNDLED
+        if os.path.isfile(os.path.join(here, script))
+    ]
+
+
+def load_config(path: Optional[str] = None, *, bundled: Optional[bool] = None) -> list[ServerConfig]:
     """
-    Reads the server list. Never raises: a missing file is "no servers", and
-    a malformed entry is reported and skipped so one typo cannot hide the rest.
+    The servers to start: the bundled ones, then those in the config file. Never
+    raises: a missing file just means only the bundled servers, and a malformed
+    entry is reported and skipped so one typo cannot hide the rest (or the bundled
+    servers). A file entry with a bundled server's name replaces it, and a
+    disabled one removes it.
+
+    `bundled` defaults to True for the normal config location and False when a
+    caller names a `path` of its own (a test, a tool): that file is then the whole list.
     """
-    if os.environ.get("JARVIS_MCP", "1").strip().lower() in ("0", "false", "no", "off"):
+    if _env_off("JARVIS_MCP"):
         return []
-    path = path or config_path()
+    include_bundled = (path is None) if bundled is None else bundled
+    from_file, claimed = _read_config_file(path or config_path())
+    if not include_bundled or _env_off("JARVIS_MCP_CORE"):
+        return from_file
+    return [server for server in bundled_servers() if server.name not in claimed] + from_file
+
+
+def _read_config_file(path: str) -> tuple[list[ServerConfig], set[str]]:
+    """The file's servers, and the names it claims (usable or disabled) - a claimed name is not bundled."""
     if not os.path.isfile(path):
-        return []
+        return [], set()
     try:
         with open(path, "r", encoding="utf-8-sig") as handle:
             raw = json.load(handle)
     except (OSError, ValueError) as exc:
         _log(f"[MCP] Could not read {path}: {exc}")
-        return []
+        return [], set()
 
     servers = raw.get("mcpServers", raw) if isinstance(raw, dict) else None
     if not isinstance(servers, dict):
         _log(f"[MCP] {path}: expected an object with an 'mcpServers' key.")
-        return []
+        return [], set()
 
     base = os.path.dirname(os.path.abspath(path))
     configs: list[ServerConfig] = []
     seen: set[str] = set()
+    claimed: set[str] = set()
     for raw_name, entry in servers.items():
         name = _slug(raw_name)
         if not name or not isinstance(entry, dict):
             _log(f"[MCP] Skipping the server entry {raw_name!r}: needs a name and an object.")
             continue
         if entry.get("disabled"):
+            claimed.add(name)
             continue
         command = entry.get("command")
         if not isinstance(command, str) or not command.strip():
@@ -196,6 +248,7 @@ def load_config(path: Optional[str] = None) -> list[ServerConfig]:
             _log(f"[MCP] Skipping {name!r}: another server has the same name once simplified.")
             continue
         seen.add(name)
+        claimed.add(name)
 
         args = entry.get("args", [])
         args = [_expand(str(a)) for a in args] if isinstance(args, list) else []
@@ -214,7 +267,7 @@ def load_config(path: Optional[str] = None) -> list[ServerConfig]:
         configs.append(
             ServerConfig(name, _expand(command.strip()), args, env, cwd, max(1.0, timeout), confirm)
         )
-    return configs
+    return configs, claimed
 
 
 # =====================================================================
@@ -786,7 +839,7 @@ def _cli(argv: list[str]) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     manager = McpManager()
     if not manager.configured:
-        print(f"No MCP servers configured. Copy mcp_servers.example.json to {os.path.basename(config_path())}.")
+        print("No MCP servers are enabled (JARVIS_MCP=0, or JARVIS_MCP_CORE=0 with nothing in mcp_servers.json).")
         return 1
     manager.connect_all()
     specs = manager.tools()

@@ -3,8 +3,8 @@
 import { memo } from "react";
 import Link from "next/link";
 import { useSession } from "next-auth/react";
-import { Menu } from "lucide-react";
-import { useChat, useOrb, useShell, useShellActions } from "@/lib/jarvis/JarvisProvider";
+import { Menu, Volume2, VolumeX } from "lucide-react";
+import { useChat, useChatActions, useOrb, useShell, useShellActions, useSpeech } from "@/lib/jarvis/JarvisProvider";
 import { selectActiveTitle } from "@/lib/jarvis/selectors";
 import { ORB_LABEL } from "./orbModes";
 import { focusRing, iconButton } from "./styles";
@@ -12,13 +12,19 @@ import { focusRing, iconButton } from "./styles";
 /**
  * The 56px bar over the conversation: the open session's title, what Jarvis is
  * doing right now (a live region, so a screen reader hears "Thinking" and
- * "Idle"), and - only when signed out - the way in. On a phone it also carries
- * the button that opens the sidebar drawer.
+ * "Idle"), the voice-replies switch, and - only when signed out - the way in. On
+ * a phone it also carries the button that opens the sidebar drawer.
+ *
+ * Voice replies: Jarvis reads its short replies aloud, by itself, so the person
+ * needs a way to stop that. This switch is it - one press mutes (and cuts off a reply
+ * being read out), the choice is kept on this device.
  */
 export const TopBar = memo(function TopBar() {
   const title = useChat(selectActiveTitle);
   const mode = useOrb((state) => state.mode);
   const drawerOpen = useShell((state) => state.drawerOpen);
+  const voiceReplies = useSpeech((state) => state.enabled);
+  const actions = useChatActions();
   const shell = useShellActions();
   // useSession re-renders on every window focus; here it only costs this small bar.
   const { status } = useSession();
@@ -41,6 +47,21 @@ export const TopBar = memo(function TopBar() {
       <span className="shrink-0 text-xs font-medium uppercase tracking-[0.08em] text-slate-600" aria-live="polite">
         {ORB_LABEL[mode]}
       </span>
+
+      <button
+        type="button"
+        onClick={actions.toggleSpeech}
+        aria-pressed={voiceReplies}
+        aria-label="Voice replies"
+        title={voiceReplies ? "Voice replies on - press to mute" : "Voice replies off - press to turn on"}
+        className={`${iconButton} ml-1`}
+      >
+        {voiceReplies ? (
+          <Volume2 className="size-5" aria-hidden="true" />
+        ) : (
+          <VolumeX className="size-5 text-slate-500" aria-hidden="true" />
+        )}
+      </button>
 
       {status === "unauthenticated" && (
         <Link

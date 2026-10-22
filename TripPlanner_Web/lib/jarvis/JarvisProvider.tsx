@@ -4,7 +4,7 @@ import { createContext, createRef, useContext, useEffect, useState, type ReactNo
 import { ChatController, type ChatActions } from "./chatController";
 import { createShellStore, type ShellState, type ShellStore } from "./shell";
 import { useStore } from "./store";
-import type { ChatState, OrbState } from "./types";
+import type { ChatState, OrbState, SpeechState } from "./types";
 
 /**
  * Hands the hub's three long-lived things to the components below it: the
@@ -59,6 +59,11 @@ export function useChat<S>(select: (state: ChatState) => S): S {
 /** One slice of the orb state (its mode, whether voice mode is on). */
 export function useOrb<S>(select: (state: OrbState) => S): S {
   return useStore(useJarvis().controller.orb, select);
+}
+
+/** One slice of the voice-replies state (whether Jarvis's short replies are read aloud). */
+export function useSpeech<S>(select: (state: SpeechState) => S): S {
+  return useStore(useJarvis().controller.speech, select);
 }
 
 /** One slice of the layout state (sidebar collapsed, drawer open). */

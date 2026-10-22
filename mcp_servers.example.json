@@ -1,9 +1,5 @@
 {
   "mcpServers": {
-    "local_fs": {
-      "command": "python",
-      "args": ["mcp_filesystem.py"]
-    },
     "mock": {
       "command": "python",
       "args": ["mock_mcp_server.py"]

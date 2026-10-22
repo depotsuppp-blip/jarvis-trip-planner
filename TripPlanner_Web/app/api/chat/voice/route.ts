@@ -12,6 +12,7 @@ import {
 } from "@/lib/chatTurns";
 import { askJarvisByVoice, JarvisBrainError, JarvisVoiceError, type ChatTurn } from "@/lib/jarvisBrain";
 import { checkRateLimit } from "@/lib/rateLimit";
+import { speakableAudio } from "@/lib/jarvis/replyAudio";
 
 // A minute of speech is well under 1 MB in any browser's codec; the brain enforces the same ceiling.
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
@@ -27,6 +28,8 @@ const TargetSchema = z.object({
  *   audio             the recording (whatever MediaRecorder produced: WebM, MP4, Ogg...)
  *   conversationId?   continue this session; omit to continue the latest one
  *   newConversation?  "true" starts a NEW session instead (ignored with conversationId)
+ *   speak?            "true" also returns the answer as audio when it is short enough
+ *                     (see POST /api/chat; the audio is not saved)
  *
  * The brain (Python, POST /voice) transcribes the audio and answers the words
  * exactly as it would a typed message. This route then saves BOTH sides of the
@@ -39,7 +42,7 @@ const TargetSchema = z.object({
  * lose it - the words were heard and the brain then had no answer - saves the
  * transcript before answering 502, as the typed route does.
  *
- * Responses: 200 { conversationId, userMessage, reply, transcript, engine },
+ * Responses: 200 { conversationId, userMessage, reply, transcript, engine, audio? },
  * 400 not a recording, 401 signed out, 404 unknown conversation, 413 too big,
  * 415 not audio, 422 nothing was heard, 429 rate-limited, 502 transcription or
  * the brain failed, 500 database failed.
@@ -83,6 +86,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "conversationId is not valid." }, { status: 400 });
   }
   const { conversationId, newConversation } = target.data;
+  const speak = form.get("speak") === "true";
 
   // Looked up before the audio goes anywhere, so a stale session id costs no transcription.
   let existing: { id: string } | null;
@@ -100,7 +104,7 @@ export async function POST(request: NextRequest) {
 
   let heard: Awaited<ReturnType<typeof askJarvisByVoice>>;
   try {
-    heard = await askJarvisByVoice(audio, history, { userId, appUrl: request.nextUrl.origin });
+    heard = await askJarvisByVoice(audio, history, { userId, appUrl: request.nextUrl.origin, speak });
   } catch (error) {
     const failure = error instanceof JarvisVoiceError ? error : null;
     const message = error instanceof JarvisBrainError ? error.message : "Jarvis couldn't answer just now.";
@@ -126,12 +130,14 @@ export async function POST(request: NextRequest) {
     const conversation = existing ?? (await createConversation(userId, heard.transcript));
     const userMessage = await saveUserMessage(conversation.id, heard.transcript);
     const reply = await saveReply(conversation.id, heard.reply);
+    const audio = speakableAudio(heard.reply, heard.audio);
     return NextResponse.json({
       conversationId: conversation.id,
       userMessage,
       reply,
       transcript: heard.transcript,
       engine: heard.engine,
+      ...(audio ? { audio } : {}),
     });
   } catch (error) {
     console.error("POST /api/chat/voice failed saving the turn:", error);

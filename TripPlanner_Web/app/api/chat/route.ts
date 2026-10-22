@@ -12,6 +12,7 @@ import {
   saveUserMessage,
 } from "@/lib/chatTurns";
 import { askJarvis, JarvisBrainError, type ChatTurn } from "@/lib/jarvisBrain";
+import { speakableAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 import { prisma } from "@/lib/prisma";
 import { checkRateLimit } from "@/lib/rateLimit";
 
@@ -24,10 +25,12 @@ const ChatBodySchema = z.object({
   // True starts a NEW session instead of continuing the latest one (the hub's
   // "New session"). Ignored when conversationId names a session.
   newConversation: z.boolean().optional(),
+  // The person has voice replies on: also return the reply as audio when it is short enough.
+  speak: z.boolean().optional(),
 });
 
 /**
- * POST /api/chat { message, conversationId?, newConversation? } - the Jarvis hub's text turn.
+ * POST /api/chat { message, conversationId?, newConversation?, speak? } - the Jarvis hub's text turn.
  * Saves the signed-in user's message, asks the brain (lib/jarvisBrain.ts) for
  * a reply, saves that too, and returns both. The user is always the
  * session's, and a conversationId that isn't theirs is treated as not found.
@@ -44,7 +47,12 @@ const ChatBodySchema = z.object({
  * clickable. The link itself is never a secret: opening it needs the same
  * sign-in as any trip page.
  *
- * Responses: 200 { conversationId, userMessage, reply }, 400 bad body, 401
+ * With `speak: true` the brain also voices the reply, and the response carries it as
+ * `audio: { mime, base64 }` - only when the reply's own text is at most 200 characters
+ * (lib/jarvis/replyAudio.ts) and the voice worked. The audio is for this response only:
+ * it is not saved with the message, and a reply without it is just text.
+ *
+ * Responses: 200 { conversationId, userMessage, reply, audio? }, 400 bad body, 401
  * signed out, 404 unknown conversation, 429 rate-limited, 502 brain failed,
  * 500 database failed.
  */
@@ -61,7 +69,7 @@ export async function POST(request: NextRequest) {
       { status: 400 }
     );
   }
-  const { message, conversationId, newConversation } = parsed.data;
+  const { message, conversationId, newConversation, speak } = parsed.data;
 
   const rateLimit = checkRateLimit(`chat:${userId}`, CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_MS);
   if (!rateLimit.allowed) {
@@ -93,9 +101,12 @@ export async function POST(request: NextRequest) {
   }
 
   let replyText: string;
+  let audio: ReplyAudio | null = null;
   try {
-    replyText = (await askJarvis(message, history, { userId, appUrl: request.nextUrl.origin })).trim();
+    const answer = await askJarvis(message, history, { userId, appUrl: request.nextUrl.origin, speak });
+    replyText = answer.reply.trim();
     if (!replyText) throw new Error("The brain returned an empty reply.");
+    audio = speakableAudio(replyText, answer.audio);
   } catch (error) {
     console.error(`POST /api/chat: the brain failed for conversation ${conversation.id}:`, error);
     return NextResponse.json(
@@ -106,7 +117,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const reply = await saveReply(conversation.id, replyText);
-    return NextResponse.json({ conversationId: conversation.id, userMessage, reply });
+    return NextResponse.json({ conversationId: conversation.id, userMessage, reply, ...(audio ? { audio } : {}) });
   } catch (error) {
     console.error("POST /api/chat failed saving the reply:", error);
     return NextResponse.json({ error: "Couldn't save Jarvis's reply. Please try again." }, { status: 500 });

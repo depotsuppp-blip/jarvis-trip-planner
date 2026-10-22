@@ -22,6 +22,11 @@ Only the web chat gets widgets. The voice assistant speaks, so a tool that
 shows a widget on the web returns its numbers as a sentence there (see
 system_status.py and request_context.add_widget).
 
+The same module decides what the hub may READ ALOUD (see `speech_for`): a reply
+whose plain text is at most VOICE_MAX_CHARS (200) characters. Making the audio
+is reply_audio.py's job (edge-tts); this module only says which words, so it
+stays free of that dependency.
+
 Dependency-free, like request_context.py and link_guard.py, so the brain, a
 tool and the server can all import it without a cycle.
 """
@@ -83,27 +88,87 @@ def history_text(content: str) -> str:
     sentence it said and a note that a widget was shown, not a blob of JSON it
     might then imitate. Anything that is not a widget envelope is returned as is.
     """
-    stripped = content.strip()
-    if not (stripped.startswith("{") and stripped.endswith("}")):
-        return content
-    try:
-        parsed = json.loads(stripped)
-    except ValueError:
-        return content
-    if not isinstance(parsed, dict):
+    parsed = _envelope(content)
+    if parsed is None:
         return content
 
-    shown: list[Any] = []
-    if parsed.get("type") == "widget":
-        shown.append(parsed)
-    if isinstance(parsed.get("widget"), dict):
-        shown.append(parsed["widget"])
-    if isinstance(parsed.get("widgets"), list):
-        shown.extend(item for item in parsed["widgets"] if isinstance(item, dict))
-    names = [str(item.get("tool")) for item in shown if isinstance(item.get("tool"), str)]
+    names = [str(item.get("tool")) for item in _widgets_in(parsed) if isinstance(item.get("tool"), str)]
     if not names:
         return content
 
     text = parsed.get("text") if isinstance(parsed.get("text"), str) else ""
     note = "[Showed the user a " + ", ".join(name.replace("_", " ") for name in names) + " widget.]"
     return f"{text.strip()} {note}".strip()
+
+
+def _envelope(content: str) -> Optional[dict[str, Any]]:
+    """`content` as the JSON object it is, or None when it is plain prose (or JSON that is not an object)."""
+    stripped = content.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _widgets_in(envelope: dict[str, Any]) -> list[dict[str, Any]]:
+    """The widgets an envelope carries, in any of the three shapes the page reads."""
+    shown: list[dict[str, Any]] = []
+    if envelope.get("type") == "widget":
+        shown.append(envelope)
+    if isinstance(envelope.get("widget"), dict):
+        shown.append(envelope["widget"])
+    if isinstance(envelope.get("widgets"), list):
+        shown.extend(item for item in envelope["widgets"] if isinstance(item, dict))
+    return shown
+
+
+# =====================================================================
+# What gets read aloud
+# =====================================================================
+
+# The hub plays a reply out loud only when its plain text is this long or shorter:
+# the "conversational" size - a sentence or two, not a plan or a list of results.
+# The page enforces the same number on its side (lib/jarvis/replyAudio.ts), so a
+# brain that ignored it still could not make the page read an essay aloud.
+VOICE_MAX_CHARS = 200
+
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
+_URL = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+_MD_BLOCK = re.compile(r"^\s{0,3}(?:#{1,6}|>|[-+*]|\d+[.)])\s+", re.MULTILINE)
+_MD_MARKS = re.compile(r"[*`]+")
+
+
+def spoken_text(reply: str) -> str:
+    """
+    The words of a reply, without its widgets: the sentence itself, or the `text` of a
+    widget envelope ('' when the reply is only a widget). This is "the plain text
+    response" the voice limit is measured on.
+    """
+    envelope = _envelope(reply)
+    if envelope is not None and _widgets_in(envelope):
+        text = envelope.get("text")
+        return text.strip() if isinstance(text, str) else ""
+    return reply.strip()
+
+
+def speech_for(reply: str, limit: int = VOICE_MAX_CHARS) -> Optional[str]:
+    """
+    What to read aloud for `reply`, or None when it should not be spoken: there is
+    no text, or the text is longer than `limit` characters (counted on the text as
+    the person reads it, before anything is stripped for the voice). A link, or
+    markdown a voice would pronounce as symbols, is taken out of what is spoken.
+    """
+    text = spoken_text(reply)
+    if not text or len(text) > limit:
+        return None
+
+    cleaned = _MD_LINK.sub(r"\1", text)
+    cleaned = _URL.sub(" ", cleaned)
+    cleaned = _MD_BLOCK.sub("", cleaned)
+    cleaned = _MD_MARKS.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Nothing left that a voice could say (a bare link, only punctuation).
+    return cleaned if re.search(r"\w", cleaned) else None

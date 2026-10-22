@@ -98,6 +98,11 @@ export interface OrbState {
   voice: boolean;
 }
 
+/** Whether Jarvis's short replies are read aloud (the person's choice, kept on this device). */
+export interface SpeechState {
+  enabled: boolean;
+}
+
 /** Centre stage only while Jarvis is being listened to or is thinking; idle and speaking send the orb home. */
 export function isFocalMode(mode: OrbMode): boolean {
   return mode === "listening" || mode === "thinking";

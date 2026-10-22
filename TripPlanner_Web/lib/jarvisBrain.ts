@@ -1,3 +1,5 @@
+import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
+
 /**
  * The one place the chat route asks "what does Jarvis say?": a POST to the
  * Python brain. The brain's side of the contract:
@@ -5,8 +7,14 @@
  *   POST {JARVIS_BRAIN_URL}   default http://127.0.0.1:8000/chat
  *   body  { prompt: string,
  *           history: [{ role: "user" | "jarvis", content }],
- *           user_id?: string, app_url?: string }
- *   reply { reply: string | object }
+ *           user_id?: string, app_url?: string, speak?: true }
+ *   reply { reply: string | object, audio?: { mime, base64 } | null }
+ *
+ *   speak = the person has voice replies on: the brain also voices the reply
+ *           (Edge-TTS) when its plain text is at most 200 characters, and sends
+ *           the MP3 as `audio`. It is null otherwise - too long, or the voice
+ *           failed - and the reply is then just text. The audio is checked here
+ *           (parseReplyAudio) and handed to the page; it is never stored.
  *
  *   reply is normally a string: a plain sentence, or - when a tool showed the
  *   person a widget - a JSON string (see lib/jarvis/messageContent.ts for the
@@ -29,8 +37,9 @@
  *
  *   POST {JARVIS_VOICE_URL}   default: JARVIS_BRAIN_URL with its /chat swapped for /voice
  *   body  multipart/form-data: audio (the recording), history (a JSON list of
- *         the same turns as above), user_id?, app_url?
- *   reply { transcript: string, reply: string | object, engine: "openai" | "local" }
+ *         the same turns as above), user_id?, app_url?, speak? ("true")
+ *   reply { transcript: string, reply: string | object, engine: "openai" | "local",
+ *           audio?: { mime, base64 } | null }
  *   422 { detail }                 nothing was heard in the recording
  *   502 { detail, transcript? }    transcription failed (no transcript), or the
  *                                  words were heard but the brain had no answer
@@ -42,8 +51,14 @@
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string };
 
-/** Who is asking and where this app lives - see the contract above. */
-export type ChatContext = { userId?: string; appUrl?: string };
+/** Who is asking, where this app lives, and whether to voice the reply - see the contract above. */
+export type ChatContext = { userId?: string; appUrl?: string; speak?: boolean };
+
+/** What the brain said, and its voice if it was asked for one and could give it. */
+export interface BrainAnswer {
+  reply: string;
+  audio: ReplyAudio | null;
+}
 
 const BRAIN_URL = process.env.JARVIS_BRAIN_URL ?? "http://127.0.0.1:8000/chat";
 const VOICE_URL = process.env.JARVIS_VOICE_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/voice");
@@ -58,7 +73,7 @@ export async function askJarvis(
   message: string,
   history: ChatTurn[],
   context: ChatContext = {}
-): Promise<string> {
+): Promise<BrainAnswer> {
   let response: Response;
   try {
     response = await fetch(BRAIN_URL, {
@@ -70,6 +85,7 @@ export async function askJarvis(
         // Left out when unknown, so the brain keeps its voice-assistant defaults.
         ...(context.userId ? { user_id: context.userId } : {}),
         ...(context.appUrl ? { app_url: context.appUrl } : {}),
+        ...(context.speak ? { speak: true } : {}),
       }),
       cache: "no-store",
       signal: AbortSignal.timeout(BRAIN_TIMEOUT_MS),
@@ -87,10 +103,10 @@ export async function askJarvis(
     throw new JarvisBrainError(`Jarvis brain returned an error (${response.status}).`);
   }
 
-  const data: unknown = await response.json().catch(() => null);
-  const reply = replyAsText((data as { reply?: unknown } | null)?.reply);
+  const data = (await response.json().catch(() => null)) as { reply?: unknown; audio?: unknown } | null;
+  const reply = replyAsText(data?.reply);
   if (!reply) throw new JarvisBrainError("Jarvis brain sent an empty reply.");
-  return reply;
+  return { reply, audio: context.speak ? parseReplyAudio(data?.audio) : null };
 }
 
 /** A spoken turn that did not produce an answer. `message` is safe to show the person as it stands. */
@@ -111,6 +127,8 @@ export interface VoiceAnswer {
   reply: string;
   /** Who transcribed it: "openai" (the Whisper API) or "local" (faster-whisper on the brain's machine). */
   engine: string;
+  /** The answer voiced, when it was asked for and the brain could (see BrainAnswer). */
+  audio: ReplyAudio | null;
 }
 
 /** Transcribes `audio` and answers what it says, in one trip to the brain. */
@@ -124,6 +142,7 @@ export async function askJarvisByVoice(
   form.append("history", JSON.stringify(history));
   if (context.userId) form.append("user_id", context.userId);
   if (context.appUrl) form.append("app_url", context.appUrl);
+  if (context.speak) form.append("speak", "true");
 
   let response: Response;
   try {
@@ -158,7 +177,12 @@ export async function askJarvisByVoice(
   const transcript = typeof body.transcript === "string" ? body.transcript.trim() : "";
   const reply = replyAsText(body.reply);
   if (!transcript || !reply) throw new JarvisVoiceError("Jarvis brain sent an empty reply.", false, transcript || undefined);
-  return { transcript, reply, engine: typeof body.engine === "string" ? body.engine : "unknown" };
+  return {
+    transcript,
+    reply,
+    engine: typeof body.engine === "string" ? body.engine : "unknown",
+    audio: context.speak ? parseReplyAudio(body.audio) : null,
+  };
 }
 
 /**

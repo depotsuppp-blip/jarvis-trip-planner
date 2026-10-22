@@ -37,6 +37,10 @@ class RequestContext:
     # Origin of the TripPlanner_Web instance that sent the request, e.g.
     # "http://localhost:3000"; "" when not known.
     app_url: str = ""
+    # The person has voice replies on: a reply of at most rich_reply.VOICE_MAX_CHARS
+    # characters is read aloud to them (reply_audio.py), so the brain is asked to keep
+    # conversational answers that short.
+    voice_reply: bool = False
     # Widgets the tools asked the page to draw during THIS request (see rich_reply.py).
     # A mutable list on a frozen dataclass: the context is replaced per request, the list is
     # filled by tools and read once by the brain when it has the final reply.

@@ -1,4 +1,5 @@
 import type { ServerMessageLike } from "./messageContent";
+import type { ReplyAudio } from "./replyAudio";
 
 /**
  * The hub's only door to the server: five calls on `/api/chat`, each answering
@@ -8,8 +9,11 @@ import type { ServerMessageLike } from "./messageContent";
  *   GET  /api/chat                          the latest session's messages
  *   GET  /api/chat?conversationId=<id>      one session's messages
  *   GET  /api/chat/sessions                 the signed-in person's sessions, newest first
- *   POST /api/chat { message, conversationId?, newConversation? }   one typed turn
- *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?)   one spoken turn
+ *   POST /api/chat { message, conversationId?, newConversation?, speak? }   one typed turn
+ *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
+ *
+ * `speak: true` asks for the reply to come back with audio too (`audio` in the answer)
+ * when it is short enough to be read aloud - see replyAudio.ts.
  *
  * `message` / `content` come back as stored: the controller parses a reply into
  * text and widgets (`messageContent.ts`), this file only moves bytes.
@@ -47,6 +51,8 @@ export interface TurnData {
   conversationId: string;
   userMessage: ServerMessageLike;
   reply: ServerMessageLike;
+  /** The reply read aloud, when `speak` was asked for and the reply was short enough. Not stored: it is for this response only. */
+  audio?: ReplyAudio | null;
 }
 
 /** A spoken turn: the same answer as a typed one, plus the words that were heard. */
@@ -62,6 +68,8 @@ export interface TurnRequest {
   conversationId?: string;
   /** Start a new session instead of continuing the latest one. */
   newConversation?: boolean;
+  /** Also return the reply as audio (when it is short enough). */
+  speak?: boolean;
 }
 
 const READ_TIMEOUT_MS = 15_000;
@@ -132,6 +140,7 @@ export const chatApi = {
     form.append("audio", audio, `voice.${extensionFor(audio.type)}`);
     if (turn.conversationId) form.append("conversationId", turn.conversationId);
     else if (turn.newConversation) form.append("newConversation", "true");
+    if (turn.speak) form.append("speak", "true");
     return request<VoiceTurnData>("/api/chat/voice", { method: "POST", body: form });
   },
 };

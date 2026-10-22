@@ -30,7 +30,15 @@ pyaudio>=0.2.13
 #
 # Tier 2: Microsoft Edge's neural voices over a free web socket API.
 # Jarvis uses en-GB-RyanNeural. No account and no API key needed.
-edge-tts>=7.0.0
+#
+# Also speaks the web chat's short replies (reply_audio.py): api_server.py sends
+# the MP3 back in the chat response and the Trip Planner hub plays it.
+#
+# 7.3.1 is the floor on purpose: Microsoft's service answers 7.2.8 and older
+# with HTTP 403 ("Invalid response status") on every request, which silently
+# drops this tier to the robotic offline voice. After upgrading an old
+# environment, run: pip install -U edge-tts
+edge-tts>=7.3.1
 
 # Tier 3: local, offline text-to-speech. Drives SAPI5 on Windows,
 # NSSpeech on macOS, espeak on Linux. Pulls pywin32/comtypes on Windows.
@@ -219,3 +227,15 @@ pymupdf>=1.24.3
 # Word (.docx). 1.1.0 is the first release with Document.iter_inner_content(),
 # which mcp_filesystem.py uses to read paragraphs and tables in document order.
 python-docx>=1.1.0
+
+# --- Web search (mcp_websearch.py) --------------------------------------
+# The web_search MCP server, one of the two that start with Jarvis (see
+# mcp_client.py). The search is DuckDuckGo, through the "ddgs" package.
+#
+# ddgs IS duckduckgo-search UNDER ITS CURRENT NAME: the author renamed the
+# project and froze the old package at 8.1.1, which prints "has been renamed to
+# ddgs" and (checked 2026-10-22) returns no results at all. Do not switch back to
+# it. mcp_websearch.py still falls back to duckduckgo_search if that is all a
+# machine has; without either, the server starts and the tool says what to install.
+# Pulls primp (a small HTTP client), lxml and click.
+ddgs>=9.0.0
