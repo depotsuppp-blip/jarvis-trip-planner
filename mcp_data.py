@@ -452,6 +452,7 @@ def _unique(names: list[str]) -> list[str]:
     return result
 
 
+_UPLOAD_PREFIX = re.compile(r"^[0-9a-f]{16}-(?=.)")
 _INT = re.compile(r"^[+-]?\d+$")
 _THOUSANDS = re.compile(r"^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$")
 
@@ -680,7 +681,9 @@ def load_file(arguments: dict) -> str:
     if not width or not count:
         raise ToolError(f"'{label}' has no data rows to load.")
     requested = arguments.get("table")
-    stem = os.path.splitext(os.path.basename(real))[0]
+    # An attached file is stored as uploads/<16 hex>-sales.csv (the web app's storedFileName):
+    # its table is "sales", not "c_3f9a..._sales".
+    stem = _UPLOAD_PREFIX.sub("", os.path.splitext(os.path.basename(real))[0])
     table = _identifier(requested if isinstance(requested, str) and requested.strip() else stem, "data")
     if table.startswith("sqlite_"):
         table = "t_" + table

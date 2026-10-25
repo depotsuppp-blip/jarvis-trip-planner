@@ -232,16 +232,19 @@ def _answer(
     with _lock:
         # Attached files are pointed at, not pasted in: a line after the words says where each
         # file is and which tool reads it (attachments.py). Built under the lock because it asks
-        # the brain which tools it has right now.
-        tool = attachments.read_tool(brain.tool_names) if files or any(t.attachments for t in history) else None
+        # the brain which tools it has right now. A .csv/.tsv/.json/.jsonl file is pointed at
+        # the data tool (load it into a table, answer with SQL) when that server is connected.
+        attached = bool(files) or any(t.attachments for t in history)
+        tool = attachments.read_tool(brain.tool_names) if attached else None
+        data = attachments.data_tool(brain.tool_names) if attached else None
         if files:
-            print(f"[API] Attachments: {', '.join(f.path for f in files)} (reader: {tool or 'none'}).")
-            prompt = attachments.with_context(prompt, files, tool, current=True)
+            print(f"[API] Attachments: {', '.join(f.path for f in files)} (reader: {tool or 'none'}, data: {data or 'none'}).")
+            prompt = attachments.with_context(prompt, files, tool, current=True, data=data)
         # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
         turns = [
             (
                 "user",
-                attachments.with_context(t.content, t.attachments, tool) if t.attachments else t.content,
+                attachments.with_context(t.content, t.attachments, tool, data=data) if t.attachments else t.content,
             )
             if t.role == "user"
             else ("assistant", rich_reply.history_text(t.content))

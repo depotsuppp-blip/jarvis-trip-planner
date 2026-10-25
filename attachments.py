@@ -16,6 +16,19 @@ and the model reads the file itself with the filesystem tool server
 files, and pages long ones. The same line is added to the earlier turns that
 carried a file, so a follow-up ("and page 3?") still knows where it is.
 
+A data file - .csv, .tsv, .json, .jsonl - gets a different line when the data
+tool server (mcp_data.py) is connected:
+
+    [System Context: The user attached a data file named "sales.csv" located
+    at 'uploads/3f9a...-sales.csv'. Use the mcp__data__load_file tool to load,
+    query, and analyze this structured data.]
+
+Loaded into a table, its numbers are totalled and averaged with SQL instead of
+being read as text and added up in the model's head. On an earlier turn the line
+also says the file may be loaded already, so a follow-up queries that table
+instead of loading a second copy. Without the data server, a data file is read
+like any other text file.
+
 When the model could not read the file anyway - the path is not a file in
 uploads/ on this machine (the web app and the brain on different machines), or
 no read_file tool is connected (JARVIS_MCP=0) - the line says so instead and
@@ -43,6 +56,10 @@ UPLOADS_DIR = os.path.join(ROOT, UPLOADS_FOLDER)
 # The bundled filesystem server is "local_fs" (mcp_client.bundled_servers); a config
 # may run it under another name, so any MCP server's read_file is the fallback.
 READ_TOOL = "mcp__local_fs__read_file"
+# The bundled data server is "data"; likewise, any MCP server's load_file is the fallback.
+DATA_TOOL = "mcp__data__load_file"
+# What mcp_data.load_file reads that the web app also accepts (lib/jarvis/attachments.ts).
+DATA_EXTENSIONS = frozenset({".csv", ".tsv", ".json", ".jsonl"})
 
 # uploads/<one file name>: no folders below it, no drive letters, streams or control characters,
 # and nothing that could close the quotes or the brackets of the line it is quoted in.
@@ -62,6 +79,19 @@ def read_tool(tool_names: Iterable[str]) -> Optional[str]:
     if READ_TOOL in names:
         return READ_TOOL
     return next((n for n in names if n.startswith("mcp__") and n.endswith("__read_file")), None)
+
+
+def data_tool(tool_names: Iterable[str]) -> Optional[str]:
+    """The exposed name of the tool that loads data files into tables, or None when none is connected."""
+    names = list(tool_names)
+    if DATA_TOOL in names:
+        return DATA_TOOL
+    return next((n for n in names if n.startswith("mcp__") and n.endswith("__load_file")), None)
+
+
+def is_data_file(path: str) -> bool:
+    """True for a file the data tool should load (by the stored file's extension)."""
+    return isinstance(path, str) and os.path.splitext(path)[1].lower() in DATA_EXTENSIONS
 
 
 def resolve(path: str) -> Optional[str]:
@@ -84,8 +114,14 @@ def _quoted_name(name: str, path: str) -> str:
     return clean or path.rsplit("/", 1)[-1]
 
 
-def describe(attachment: AttachmentLike, tool: Optional[str]) -> str:
-    """The one line the brain reads about one attached file."""
+def describe(
+    attachment: AttachmentLike, tool: Optional[str], data: Optional[str] = None, *, earlier: bool = False
+) -> str:
+    """
+    The one line the brain reads about one attached file. `data` is the data
+    tool (data_tool()), which a .csv/.tsv/.json/.jsonl file is pointed at when it
+    is connected; `earlier` marks a file from a previous turn.
+    """
     path = attachment.path
     if resolve(path) is None:
         # Not quoted back: a path that is not one of ours says nothing useful, and may be made up.
@@ -95,6 +131,16 @@ def describe(attachment: AttachmentLike, tool: Optional[str]) -> str:
             "so it cannot be read. Tell the user you couldn't open it and ask them to attach it again.]"
         )
     name = _quoted_name(attachment.name, path)
+    if data is not None and is_data_file(path):
+        again = (
+            " It may have been loaded in an earlier turn already: check the existing tables before loading it again."
+            if earlier
+            else ""
+        )
+        return (
+            f"[System Context: The user attached a data file named \"{name}\" located at '{path}'. "
+            f"Use the {data} tool to load, query, and analyze this structured data.{again}]"
+        )
     if tool is None:
         return (
             f"[System Context: The user attached a file named \"{name}\" located at '{path}', but no "
@@ -106,17 +152,28 @@ def describe(attachment: AttachmentLike, tool: Optional[str]) -> str:
     )
 
 
-def with_context(text: str, attachments: Sequence[AttachmentLike], tool: Optional[str], *, current: bool = False) -> str:
+def with_context(
+    text: str,
+    attachments: Sequence[AttachmentLike],
+    tool: Optional[str],
+    *,
+    current: bool = False,
+    data: Optional[str] = None,
+) -> str:
     """
     `text` (the person's words) followed by one line per attached file. `current` is
     the message being answered now: a file sent with no words then gets a nudge to
-    say what it is, since there is no question to answer.
+    say what it is, since there is no question to answer. `data` is the data tool
+    for .csv/.tsv/.json/.jsonl files (see describe).
     """
     words = (text or "").strip()
     if not attachments:
         return words
-    lines = [describe(item, tool) for item in attachments]
-    readable = tool is not None and any(resolve(item.path) for item in attachments)
+    lines = [describe(item, tool, data, earlier=not current) for item in attachments]
+    readable = any(
+        resolve(item.path) and (tool is not None or (data is not None and is_data_file(item.path)))
+        for item in attachments
+    )
     if current and not words and readable:
         lines.append("[System Context: The user sent the file without a message. Read it and briefly say what it contains.]")
     return "\n\n".join([words, *lines]) if words else "\n\n".join(lines)
