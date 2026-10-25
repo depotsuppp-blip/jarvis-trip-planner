@@ -1,3 +1,4 @@
+import type { Attachment } from "@/lib/jarvis/attachments";
 import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 
 /**
@@ -6,9 +7,18 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *
  *   POST {JARVIS_BRAIN_URL}   default http://127.0.0.1:8000/chat
  *   body  { prompt: string,
- *           history: [{ role: "user" | "jarvis", content }],
- *           user_id?: string, app_url?: string, speak?: true }
+ *           history: [{ role: "user" | "jarvis", content, attachments? }],
+ *           user_id?: string, app_url?: string, speak?: true,
+ *           attachments?: [{ path, name, mime, size }] }
  *   reply { reply: string | object, audio?: { mime, base64 } | null }
+ *
+ *   attachments = files the person attached to this message, already saved under
+ *           the Jarvis project's uploads/ folder (lib/uploads.ts); `path` is
+ *           relative to that project ("uploads/3f...-report.pdf"). The brain adds a
+ *           line to the prompt that says where the file is and which tool reads it,
+ *           and the model reads it from there. `prompt` may be "" when a file came
+ *           with no words. A user turn in `history` carries its attachments the same
+ *           way, so a follow-up question can still find the file.
  *
  *   speak = the person has voice replies on: the brain also voices the reply
  *           (Edge-TTS) when its plain text is at most 200 characters, and sends
@@ -49,10 +59,13 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  * on the brain's own machine.
  */
 
-export type ChatTurn = { role: "user" | "jarvis"; content: string };
+export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };
 
 /** Who is asking, where this app lives, and whether to voice the reply - see the contract above. */
 export type ChatContext = { userId?: string; appUrl?: string; speak?: boolean };
+
+/** A typed turn's extras: the files attached to it (see `attachments` in the contract above). */
+export type AskContext = ChatContext & { attachments?: Attachment[] };
 
 /** What the brain said, and its voice if it was asked for one and could give it. */
 export interface BrainAnswer {
@@ -72,7 +85,7 @@ export class JarvisBrainError extends Error {}
 export async function askJarvis(
   message: string,
   history: ChatTurn[],
-  context: ChatContext = {}
+  context: AskContext = {}
 ): Promise<BrainAnswer> {
   let response: Response;
   try {
@@ -86,6 +99,7 @@ export async function askJarvis(
         ...(context.userId ? { user_id: context.userId } : {}),
         ...(context.appUrl ? { app_url: context.appUrl } : {}),
         ...(context.speak ? { speak: true } : {}),
+        ...(context.attachments?.length ? { attachments: context.attachments } : {}),
       }),
       cache: "no-store",
       signal: AbortSignal.timeout(BRAIN_TIMEOUT_MS),

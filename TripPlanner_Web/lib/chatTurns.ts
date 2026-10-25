@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import type { ChatTurn } from "@/lib/jarvisBrain";
+import { parseStoredUserMessage } from "@/lib/jarvis/attachments";
 
 /**
  * What the two ways of taking a chat turn have in common - typed
@@ -52,7 +53,11 @@ export function createConversation(userId: string, firstMessage: string): Promis
   });
 }
 
-/** The last HISTORY_TURNS turns of a session, oldest first - read before the turn being taken is added. */
+/**
+ * The last HISTORY_TURNS turns of a session, oldest first - read before the turn being taken is added.
+ * A message that carried a file goes to the brain as its text plus the file (lib/jarvis/attachments.ts),
+ * so "and what does page 3 say?" in a later turn still knows where the file is.
+ */
 export async function loadHistory(conversationId: string): Promise<ChatTurn[]> {
   const earlier = await prisma.message.findMany({
     where: { conversationId },
@@ -60,9 +65,15 @@ export async function loadHistory(conversationId: string): Promise<ChatTurn[]> {
     take: HISTORY_TURNS,
     select: { role: true, content: true },
   });
-  return earlier.reverse().map((m) => ({ role: toRole(m.role), content: m.content }));
+  return earlier.reverse().map((m): ChatTurn => {
+    const role = toRole(m.role);
+    if (role !== "user") return { role, content: m.content };
+    const { text, attachments } = parseStoredUserMessage(m.content);
+    return attachments.length > 0 ? { role, content: text, attachments } : { role, content: m.content };
+  });
 }
 
+/** `content` is the stored form: the text, or text plus attachments (storedUserMessage in lib/jarvis/attachments.ts). */
 export function saveUserMessage(conversationId: string, content: string) {
   return prisma.message.create({ data: { conversationId, role: "user", content }, select: messageFields });
 }

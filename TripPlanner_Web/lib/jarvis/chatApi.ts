@@ -10,6 +10,7 @@ import type { ReplyAudio } from "./replyAudio";
  *   GET  /api/chat?conversationId=<id>      one session's messages
  *   GET  /api/chat/sessions                 the signed-in person's sessions, newest first
  *   POST /api/chat { message, conversationId?, newConversation?, speak? }   one typed turn
+ *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?)   one typed turn with a file
  *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
  *
  * `speak: true` asks for the reply to come back with audio too (`audio` in the answer)
@@ -63,7 +64,10 @@ export interface VoiceTurnData extends TurnData {
 }
 
 export interface TurnRequest {
+  /** May be "" when a file is attached. */
   message: string;
+  /** A file the person attached (checked first: attachmentProblem in attachments.ts). Sends the turn as multipart. */
+  file?: File | null;
   /** Continue this session. */
   conversationId?: string;
   /** Start a new session instead of continuing the latest one. */
@@ -126,12 +130,23 @@ export const chatApi = {
     request<SessionsData>("/api/chat/sessions", { cache: "no-store", signal: AbortSignal.timeout(READ_TIMEOUT_MS) }),
 
   // No client timeout: the brain may run a whole trip plan (tens of seconds) and the server enforces its own limit.
-  send: (turn: TurnRequest) =>
-    request<TurnData>("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(turn),
-    }),
+  // With a file the turn goes as multipart (no Content-Type set, so the browser adds the boundary); without, as JSON.
+  send: ({ file, ...turn }: TurnRequest) => {
+    if (!file) {
+      return request<TurnData>("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(turn),
+      });
+    }
+    const form = new FormData();
+    form.append("message", turn.message);
+    form.append("file", file, file.name);
+    if (turn.conversationId) form.append("conversationId", turn.conversationId);
+    else if (turn.newConversation) form.append("newConversation", "true");
+    if (turn.speak) form.append("speak", "true");
+    return request<TurnData>("/api/chat", { method: "POST", body: form });
+  },
 
   // The recording goes as multipart, and no Content-Type is set so the browser adds the boundary.
   // No client timeout, for the same reason as `send`: transcription and then the brain's whole turn.

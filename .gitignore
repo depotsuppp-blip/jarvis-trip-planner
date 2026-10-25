@@ -18,6 +18,10 @@ venv/
 # Local session memory
 memory.json
 
+# Files people attach in the web hub's chat (saved by TripPlanner_Web/lib/uploads.ts, read by
+# the brain's filesystem tool). Personal documents: never commit them.
+uploads/
+
 # llm_budget.py's daily token usage record
 .data/
 

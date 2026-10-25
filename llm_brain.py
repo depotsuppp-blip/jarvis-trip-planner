@@ -762,6 +762,19 @@ def _asks_system_status(text: str) -> bool:
     return any(phrase in lowered for phrase in _STATUS_PHRASES)
 
 
+# A note the web API adds after the person's words - "[System Context: The user attached a
+# file ...]", attachments.py - is for the model, not part of the question. Routing reads the
+# person's own words only: the note alone is some 25 words, which would send every question
+# about an attached file to the reasoning tier, and a file's name ("architecture review.pdf")
+# must not pick the model either. The front door still sees the whole text.
+_SYSTEM_CONTEXT_NOTE = re.compile(r"\[System Context:[^\]]*\]")
+
+
+def _routing_text(text: str) -> str:
+    """`text` without the API's [System Context: ...] notes: what _classify_intent should read."""
+    return _SYSTEM_CONTEXT_NOTE.sub(" ", text).strip()
+
+
 def _classify_intent(text: str) -> tuple[str, str]:
     """
     (intent, reason) for one question. The reason is logged, not spoken.
@@ -3124,7 +3137,7 @@ class LLMBrain:
         # a cheaper model halfway through answering itself.
         self._dispatched_this_turn = []
 
-        intent, why = _classify_intent(user_text)
+        intent, why = _classify_intent(_routing_text(user_text))
         model, effort = self._route(intent)
         print(
             f"[Brain] Routing: {intent.upper()} ({why}) "

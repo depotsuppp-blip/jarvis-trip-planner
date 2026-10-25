@@ -43,7 +43,10 @@ export type MessageOrigin = "server" | "demo";
 export interface ChatMessage {
   id: string;
   role: MessageRole;
+  /** For the person's own message, `text` is null when they sent only a file. */
   content: MessageContent;
+  /** Files the person sent with this message (their names and sizes; see attachments.ts). */
+  attachments?: { name: string; size: number }[];
   /** Milliseconds since the epoch. */
   createdAt: number;
   origin: MessageOrigin;

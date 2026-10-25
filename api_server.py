@@ -1,14 +1,23 @@
 """
 HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
 
-    POST /chat   { "prompt": "...", "history": [{ "role": "user"|"jarvis", "content": "..." }],
-                   "user_id": "...", "app_url": "...", "speak": false }
+    POST /chat   { "prompt": "...", "history": [{ "role": "user"|"jarvis", "content": "...",
+                                                  "attachments": [...] }],
+                   "user_id": "...", "app_url": "...", "speak": false,
+                   "attachments": [{ "path": "uploads/...", "name": "report.pdf",
+                                     "mime": "application/pdf", "size": 48213 }] }
               -> { "reply": "...", "audio": null }
                  reply is a plain sentence, or - when a tool showed the person a widget -
                  a JSON string, see rich_reply.py. audio is {"mime": "audio/mpeg",
                  "base64": "..."} only when "speak" was true AND the reply's plain text is at
                  most 200 characters AND the voice worked (reply_audio.py, Edge-TTS); in every
                  other case it is null and the reply is just text.
+                 attachments are files the person attached in the web hub, which the web
+                 app has already saved in this folder's uploads/ (path is relative to this
+                 folder). The model is not sent the file: a line is added after the prompt
+                 saying where it is and which tool reads it (attachments.py), and the model
+                 reads it with the filesystem tool server. prompt may be "" when a file
+                 came with no words. User turns in history carry theirs the same way.
     POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
                    history (a JSON list shaped like /chat's), user_id, app_url, speak
               -> { "transcript": "...", "reply": "...", "engine": "openai"|"local", "audio": null }
@@ -66,8 +75,9 @@ from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
+import attachments
 import reply_audio
 import request_context
 import rich_reply
@@ -83,20 +93,40 @@ MAX_PROMPT_CHARS = 4000
 MAX_HISTORY_TURNS = 100
 # A minute of speech is well under 1 MB in any browser's codec; this is headroom, not a target.
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
+# Per message. The web hub attaches one; the limit is headroom.
+MAX_ATTACHMENTS = 5
+
+
+class Attachment(BaseModel):
+    """A file the web app saved in uploads/ for this message. Only `path` is acted on; see attachments.py."""
+
+    path: str = Field(max_length=300)
+    name: str = Field(default="", max_length=300)
+    mime: str = Field(default="", max_length=200)
+    size: int = Field(default=0, ge=0)
 
 
 class HistoryTurn(BaseModel):
     role: Literal["user", "jarvis", "assistant"]
     content: str = Field(max_length=MAX_PROMPT_CHARS * 2)
+    attachments: list[Attachment] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
 
 
 class ChatRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+    # May be empty only when a file came with it: the person sent just the file.
+    prompt: str = Field(default="", max_length=MAX_PROMPT_CHARS)
     history: list[HistoryTurn] = Field(default_factory=list, max_length=MAX_HISTORY_TURNS)
     user_id: str = Field(default="", max_length=128)
     app_url: str = Field(default="", max_length=300)
     # The person has voice replies on: also answer with audio when the reply is short enough.
     speak: bool = False
+    attachments: list[Attachment] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+
+    @model_validator(mode="after")
+    def _says_something(self) -> "ChatRequest":
+        if not self.prompt and not self.attachments:
+            raise ValueError("prompt is required (or attach a file).")
+        return self
 
 
 class ReplyAudio(BaseModel):
@@ -183,14 +213,15 @@ def health() -> dict:
 
 
 def _answer(
-    brain: LLMBrain, prompt: str, history: list[HistoryTurn], user_id: str, app_url: str, speak: bool = False
+    brain: LLMBrain,
+    prompt: str,
+    history: list[HistoryTurn],
+    user_id: str,
+    app_url: str,
+    speak: bool = False,
+    files: list[Attachment] | None = None,
 ) -> str:
     """One turn through the brain, as /chat and /voice both ask it. May return ''."""
-    # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
-    turns = [
-        ("user", t.content) if t.role == "user" else ("assistant", rich_reply.history_text(t.content))
-        for t in history
-    ]
     caller = request_context.RequestContext(
         channel=request_context.CHANNEL_WEB,
         user_id=user_id.strip(),
@@ -199,6 +230,23 @@ def _answer(
         voice_reply=speak and reply_audio.enabled(),
     )
     with _lock:
+        # Attached files are pointed at, not pasted in: a line after the words says where each
+        # file is and which tool reads it (attachments.py). Built under the lock because it asks
+        # the brain which tools it has right now.
+        tool = attachments.read_tool(brain.tool_names) if files or any(t.attachments for t in history) else None
+        if files:
+            print(f"[API] Attachments: {', '.join(f.path for f in files)} (reader: {tool or 'none'}).")
+            prompt = attachments.with_context(prompt, files, tool, current=True)
+        # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
+        turns = [
+            (
+                "user",
+                attachments.with_context(t.content, t.attachments, tool) if t.attachments else t.content,
+            )
+            if t.role == "user"
+            else ("assistant", rich_reply.history_text(t.content))
+            for t in history
+        ]
         brain.set_history(turns)
         # The context is current only while this request is being answered, on
         # this thread - see request_context.py.
@@ -234,7 +282,7 @@ def chat(body: ChatRequest) -> ChatResponse:
     if not brain.available:
         raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
 
-    reply = _answer(brain, body.prompt, body.history, body.user_id, body.app_url, body.speak)
+    reply = _answer(brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments)
     if not reply:
         raise HTTPException(status_code=502, detail="The brain returned an empty reply.")
     return ChatResponse(reply=reply, audio=_audio_for(reply, body.speak))

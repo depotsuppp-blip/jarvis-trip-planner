@@ -1,3 +1,4 @@
+import { parseStoredUserMessage } from "./attachments";
 import type { ChatMessage, MessageContent, MessageRole, WidgetPayload } from "./types";
 
 /**
@@ -144,10 +145,30 @@ function toTime(value: string | number | undefined): number {
   return Number.isFinite(time) ? time : Date.now();
 }
 
-/** A stored message, ready for the feed. Anything that is not "user" is Jarvis. */
+/**
+ * A stored message, ready for the feed. Anything that is not "user" is Jarvis.
+ * The person's message may be the stored form of text plus a file (attachments.ts):
+ * the file comes out as `attachments`, the words as the text.
+ */
 export function toChatMessage(message: ServerMessageLike): ChatMessage {
   const role: MessageRole = message.role === "user" ? "user" : "jarvis";
-  let content = parseMessageContent(String(message.content ?? ""), role);
+  const raw = String(message.content ?? "");
+
+  if (role === "user") {
+    const { text, attachments } = parseStoredUserMessage(raw);
+    if (attachments.length > 0) {
+      return {
+        id: String(message.id),
+        role,
+        content: { text: text.trim() ? text : null, widgets: [] },
+        attachments: attachments.map(({ name, size }) => ({ name, size })),
+        createdAt: toTime(message.createdAt),
+        origin: "server",
+      };
+    }
+  }
+
+  let content = parseMessageContent(raw, role);
 
   if (role === "jarvis" && (message.widget != null || message.widgets != null)) {
     const extra = readWidgets({ widget: message.widget, widgets: message.widgets });

@@ -81,8 +81,11 @@ const MICROPHONE_PROBLEM: Record<VoiceRecorderFailure, { message: string; detail
 };
 
 export interface ChatActions {
-  /** One typed turn. A message that is exactly a demo command (`/status`) is answered on this page instead. */
-  send(text: string): Promise<void>;
+  /**
+   * One typed turn, optionally with a file (already checked with attachmentProblem; the text may then be empty).
+   * A message that is exactly a demo command (`/status`) with no file is answered on this page instead.
+   */
+  send(text: string, file?: File | null): Promise<void>;
   selectSession(id: string): Promise<void>;
   /** Opens an empty session; it is saved by its first message. */
   newSession(): void;
@@ -156,7 +159,7 @@ export class ChatController {
 
   /** Stable for the life of the controller: pass them around freely, nothing re-renders because of them. */
   readonly actions: ChatActions = {
-    send: (text) => this.send(text),
+    send: (text, file) => this.send(text, file),
     selectSession: (id) => this.selectSession(id),
     newSession: () => this.newSession(),
     refreshSessions: () => this.refreshSessions(),
@@ -283,16 +286,21 @@ export class ChatController {
 
   // -------------------------------------------------------------------- turns
 
-  async send(raw: string): Promise<void> {
+  async send(raw: string, file: File | null = null): Promise<void> {
     const text = raw.trim();
-    if (!text || isFocalMode(this.orb.getState().mode)) return;
+    if ((!text && !file) || isFocalMode(this.orb.getState().mode)) return;
 
     this.clearTimers();
     const mine = ++this.turn;
     this.player.stop();
-    const demo = parseDemoCommand(text);
+    const demo = file ? null : parseDemoCommand(text);
 
-    this.append({ role: "user", content: { text, widgets: [] }, origin: demo ? "demo" : "server" });
+    this.append({
+      role: "user",
+      content: { text: text || null, widgets: [] },
+      origin: demo ? "demo" : "server",
+      ...(file ? { attachments: [{ name: file.name, size: file.size }] } : {}),
+    });
     this.orb.setState({ mode: "thinking", voice: false });
 
     if (demo) {
@@ -311,6 +319,7 @@ export class ChatController {
     const { activeSessionId } = this.chat.getState();
     const result = await chatApi.send({
       message: text,
+      ...(file ? { file } : {}),
       ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
       ...(this.speech.getState().enabled ? { speak: true } : {}),
     });
@@ -329,7 +338,13 @@ export class ChatController {
           messages: [...state.messages, reply],
           sessions: {
             status: "ready",
-            items: touchSession(state.sessions.items, conversationId, text.slice(0, TITLE_CHARS), reply.createdAt),
+            // A file sent with no words titles its session with its name, as the server does.
+            items: touchSession(
+              state.sessions.items,
+              conversationId,
+              (text || file?.name || "Attachment").slice(0, TITLE_CHARS),
+              reply.createdAt
+            ),
           },
         }));
       } else {
@@ -605,7 +620,9 @@ export class ChatController {
     if (this.turn === turn) this.orb.setState({ mode: "idle", voice: false });
   }
 
-  private append(message: Pick<ChatMessage, "role" | "origin"> & { content: MessageContent; tone?: "error" }): void {
+  private append(
+    message: Pick<ChatMessage, "role" | "origin" | "attachments"> & { content: MessageContent; tone?: "error" }
+  ): void {
     const next: ChatMessage = {
       id: `local-${this.nextId++}`,
       createdAt: Date.now(),

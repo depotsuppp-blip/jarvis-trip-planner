@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { formatMessageTime } from "@/lib/jarvis/sessions";
 import type { ChatMessage } from "@/lib/jarvis/types";
+import { AttachmentChip } from "./AttachmentChip";
 import { DynamicRenderer } from "./DynamicRenderer";
 import { SampleBadge } from "./widgets/SampleBadge";
 
@@ -14,7 +15,8 @@ import { SampleBadge } from "./widgets/SampleBadge";
  * frames.
  *
  * The person's text is always plain (never parsed for widgets); only Jarvis's
- * goes through DynamicRenderer.
+ * goes through DynamicRenderer. A file they sent shows as its chip above their
+ * words (or alone, when they sent only the file).
  */
 export const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMessage }) {
   const time = formatMessageTime(message.createdAt);
@@ -22,9 +24,14 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
   if (message.role === "user") {
     return (
       <li className="flex flex-col items-end gap-1.5">
-        <p className="max-w-[85%] whitespace-pre-line rounded-md bg-slate-900 px-4 py-2.5 text-[15px] leading-6 text-white [overflow-wrap:anywhere]">
-          {message.content.text}
-        </p>
+        {message.attachments?.map((file, index) => (
+          <AttachmentChip key={index} name={file.name} size={file.size} className="max-w-[85%]" />
+        ))}
+        {message.content.text && (
+          <p className="max-w-[85%] whitespace-pre-line rounded-md bg-slate-900 px-4 py-2.5 text-[15px] leading-6 text-white [overflow-wrap:anywhere]">
+            {message.content.text}
+          </p>
+        )}
         <p className="flex items-center gap-2 text-xs text-slate-600">
           {message.origin === "demo" && <SampleBadge />}
           <time className="tabular-nums" dateTime={new Date(message.createdAt).toISOString()}>
