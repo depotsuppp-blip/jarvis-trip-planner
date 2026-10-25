@@ -2714,6 +2714,10 @@ class LLMBrain:
     def tool_names(self) -> list[str]:
         return [tool.name for tool in self._active_tools()]
 
+    def mcp_servers(self) -> list[dict[str, Any]]:
+        """The MCP tool servers and whether each is connected (McpManager.servers); [] when none are configured."""
+        return self._mcp.servers() if self._mcp is not None else []
+
     def _active_tools(self) -> list[ToolSpec]:
         """Built-in tools, whatever is currently in plugins/, and the MCP servers' tools."""
         return list(self._tools) + list(self._plugin_tools) + list(self._mcp_tools)

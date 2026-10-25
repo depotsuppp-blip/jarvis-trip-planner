@@ -26,11 +26,16 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  exactly as a typed /chat prompt would be. 422 when nothing was heard.
     GET  /health -> { "ok": true, "provider": "...", "model": "...",
                       "stt": "openai"|"local", "stt_ready": true|false,
-                      "tts": true|false, "mcp_tools": ["mcp__web_search__web_search", ...] }
+                      "tts": true|false, "mcp_tools": ["mcp__web_search__web_search", ...],
+                      "mcp_servers": [{ "name": "web_search", "connected": true,
+                                        "tools": ["web_search"], "error": "" }, ...] }
                  stt_ready is false while the on-device model is still loading. tts says whether
                  replies can be spoken (Edge-TTS installed and not switched off). mcp_tools are
-                 the tool-server tools the brain has: the bundled filesystem and web search
-                 servers start with the brain, with nothing to configure (mcp_client.py).
+                 the tool-server tools the brain had at its last turn; mcp_servers is each tool
+                 server as it is right now (error says why one is not connected). The bundled
+                 servers - local_fs, web_search, fetch, memory, data - start with the brain, with
+                 nothing to configure (mcp_client.py). The web hub's sidebar lists them from here
+                 (TripPlanner_Web: GET /api/chat/tools).
 
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
@@ -209,6 +214,7 @@ def health() -> dict:
         "stt_ready": stt.is_ready(),
         "tts": reply_audio.enabled(),
         "mcp_tools": [name for name in brain.tool_names if name.startswith("mcp__")],
+        "mcp_servers": brain.mcp_servers(),
     }
 
 

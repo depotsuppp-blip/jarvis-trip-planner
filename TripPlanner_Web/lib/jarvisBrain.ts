@@ -57,6 +57,15 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  * `engine` says who did the listening: "openai" is the Whisper API (the brain has
  * an OPENAI_API_KEY and the recording left the machine); "local" is faster-whisper
  * on the brain's own machine.
+ *
+ * The status door (getJarvisStatus) is what the hub's sidebar shows as "Agents & tools":
+ *
+ *   GET {JARVIS_HEALTH_URL}   default: JARVIS_BRAIN_URL with its /chat swapped for /health
+ *   reply { ok: boolean, mcp_servers: [{ name, connected, tools: string[], error }], ... }
+ *
+ *   ok = the brain has a language model to answer with. mcp_servers = its tool
+ *   servers (web search, memory, ...) as they are right now; `error` is for the
+ *   logs, never the page.
  */
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };
@@ -75,6 +84,10 @@ export interface BrainAnswer {
 
 const BRAIN_URL = process.env.JARVIS_BRAIN_URL ?? "http://127.0.0.1:8000/chat";
 const VOICE_URL = process.env.JARVIS_VOICE_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/voice");
+const HEALTH_URL = process.env.JARVIS_HEALTH_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/health");
+// The brain answers /health at once, except while it is still starting (it connects its
+// tool servers first, up to ~15 s). A sidebar that waits longer than this just says "not checked".
+const HEALTH_TIMEOUT_MS = 8_000;
 // Tool calls and the reasoning tier can take a while - and "plan a trip" is a
 // tool call that itself runs a whole generation (two LLM calls, Places, Routes:
 // ~15-30s) between the model's turns. Past this the turn fails.
@@ -197,6 +210,49 @@ export async function askJarvisByVoice(
     engine: typeof body.engine === "string" ? body.engine : "unknown",
     audio: context.speak ? parseReplyAudio(body.audio) : null,
   };
+}
+
+/** One of the brain's tool servers, as the sidebar needs it. */
+export interface BrainToolServer {
+  /** The server's config name: "web_search", "memory", ... */
+  name: string;
+  connected: boolean;
+  /** How many tools it offers while connected. */
+  tools: number;
+}
+
+export interface BrainStatus {
+  /** The brain has a language model to answer with. */
+  ready: boolean;
+  servers: BrainToolServer[];
+}
+
+const SERVER_NAME = /^[a-z0-9_]{1,64}$/;
+
+/** The brain's GET /health, narrowed to what the hub shows. Throws JarvisBrainError when it cannot be read. */
+export async function getJarvisStatus(): Promise<BrainStatus> {
+  let response: Response;
+  try {
+    response = await fetch(HEALTH_URL, { cache: "no-store", signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
+  } catch (error) {
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+    throw new JarvisBrainError(timedOut ? "Jarvis brain is still starting." : "Jarvis brain is offline.");
+  }
+  if (!response.ok) throw new JarvisBrainError(`Jarvis brain returned an error (${response.status}).`);
+
+  const data: unknown = await response.json().catch(() => null);
+  const body = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
+  const listed = Array.isArray(body.mcp_servers) ? body.mcp_servers : [];
+  const servers: BrainToolServer[] = [];
+  for (const item of listed) {
+    if (!item || typeof item !== "object") continue;
+    const server = item as Record<string, unknown>;
+    // Names come from the brain's own config; anything odd is left out rather than shown.
+    if (typeof server.name !== "string" || !SERVER_NAME.test(server.name)) continue;
+    const connected = server.connected === true;
+    servers.push({ name: server.name, connected, tools: connected && Array.isArray(server.tools) ? server.tools.length : 0 });
+  }
+  return { ready: body.ok === true, servers };
 }
 
 /**

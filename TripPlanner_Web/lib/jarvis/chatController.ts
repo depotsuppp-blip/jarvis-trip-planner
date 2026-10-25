@@ -4,6 +4,7 @@ import { toChatMessage } from "./messageContent";
 import { canSpeak, type ReplyAudio } from "./replyAudio";
 import { createSpeechPlayer } from "./speechPlayer";
 import { createStore } from "./store";
+import { withStatus } from "./tools";
 import {
   isFocalMode,
   type AgentState,
@@ -26,7 +27,7 @@ import {
 /**
  * Everything the hub DOES, with no React in it: load and switch sessions, send
  * a typed turn, record and send a spoken one, keep the orb's mode and the
- * agents' status. Components read two stores (`chat`, `orb`) through selectors
+ * agents' status (the tool rows come from the brain - see tools.ts). Components read two stores (`chat`, `orb`) through selectors
  * and call `actions`; they hold no chat logic and no timers of their own.
  *
  * Two stores, not one, on purpose: the orb mode changes a few times a turn and
@@ -57,6 +58,9 @@ const MAX_RECORDING_MS = 60_000;
 const MIN_RECORDING_MS = 600;
 // What the Voice row says when nothing is happening (demo.ts's initialAgents starts it the same way).
 const VOICE_IDLE_DETAIL = "Tap Talk to speak";
+
+// How often the sidebar asks which tools the brain has connected (GET /api/chat/tools), while the tab is visible.
+const TOOLS_REFRESH_MS = 60_000;
 
 // The server titles a session with the start of its first message (app/api/chat/route.ts).
 const TITLE_CHARS = 60;
@@ -156,6 +160,8 @@ export class ChatController {
   private starting = false;
   private disposed = false;
   private bootstrapping: Promise<void> = Promise.resolve();
+  /** The tool-status refresh (see refreshTools); its own timer, because clearTimers runs on every turn. */
+  private toolsTimer: number | null = null;
 
   /** Stable for the life of the controller: pass them around freely, nothing re-renders because of them. */
   readonly actions: ChatActions = {
@@ -179,10 +185,16 @@ export class ChatController {
     this.disposed = false;
     this.loadSpeechPreference();
     this.bootstrapping = this.bootstrap();
+    void this.refreshTools();
+    this.stopToolsTimer();
+    this.toolsTimer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void this.refreshTools();
+    }, TOOLS_REFRESH_MS);
   }
 
   dispose(): void {
     this.disposed = true;
+    this.stopToolsTimer();
     this.abandonRecording();
     this.clearTimers();
     this.turn++;
@@ -224,6 +236,26 @@ export class ChatController {
       messages: [...latest.data.messages.map(toChatMessage), ...state.messages],
       epoch,
     }));
+  }
+
+  /**
+   * Asks the brain which tool servers it has connected and redraws the sidebar's
+   * tool rows (and the brain row, unless a turn is running). Signed out, or the
+   * page's own server failing, leaves the list as it is.
+   */
+  async refreshTools(): Promise<void> {
+    const result = await chatApi.tools();
+    if (this.disposed || !result.ok) return;
+    this.chat.setState((current) => {
+      const agents = withStatus(current.agents, result.data);
+      // Unchanged (the usual minute-to-minute answer): keep the same array, so nothing re-renders.
+      return JSON.stringify(agents) === JSON.stringify(current.agents) ? {} : { agents };
+    });
+  }
+
+  private stopToolsTimer(): void {
+    if (this.toolsTimer !== null) window.clearInterval(this.toolsTimer);
+    this.toolsTimer = null;
   }
 
   async refreshSessions(): Promise<void> {

@@ -71,16 +71,16 @@ export function demoReply(tool: DemoTool, now: number): MessageContent {
 }
 
 /**
- * The sidebar's agents and tools. `brain` and `voice` are live (the controller
- * moves them with each real turn); the rest say what they are without claiming
- * a health they cannot know - a backend that reports tool status will replace
- * this list.
+ * The sidebar's agents and tools as the page opens. `brain` and `voice` are live
+ * (the controller moves them with each real turn, and the brain row with each
+ * status check); Trip Planner says what it is. The brain's tool servers - web
+ * search, memory, data, ... - are added below these by the first status check
+ * (GET /api/chat/tools, see tools.ts), so only what is really connected is listed.
  */
 export function initialAgents(): AgentStatus[] {
   return [
     { id: "brain", name: "Jarvis brain", kind: "brain", state: "unknown" },
     { id: "trip-planner", name: "Trip Planner", kind: "tool", state: "idle", detail: "Plans trips from chat" },
     { id: "voice", name: "Voice", kind: "voice", state: "idle", detail: "Tap Talk to speak" },
-    { id: "calendar", name: "Calendar", kind: "tool", state: "unavailable", detail: "Not connected yet" },
   ];
 }

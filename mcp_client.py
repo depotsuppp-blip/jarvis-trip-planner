@@ -917,6 +917,24 @@ class McpManager:
                     parts.append(f"{name} (not connected)")
         return "MCP tool servers: " + ", ".join(parts) + "."
 
+    def servers(self) -> list[dict[str, Any]]:
+        """
+        Each configured server as it is right now - {name, connected, tools, error}
+        - for status displays (api_server.py's /health, the web hub's sidebar).
+        A plain read: unlike tools(), it never starts a repair.
+        """
+        snapshot: list[dict[str, Any]] = []
+        with self._lock:
+            for name, entry in self._entries.items():
+                connected = entry.conn is not None and entry.conn.alive
+                snapshot.append({
+                    "name": name,
+                    "connected": connected,
+                    "tools": list(entry.originals.values()) if connected else [],
+                    "error": "" if connected else (entry.error or ("starting" if entry.connecting else "not running")),
+                })
+        return snapshot
+
     def server_notes(self) -> list[tuple[str, str]]:
         """
         (server, what it is for) for each connected server that has tools: the

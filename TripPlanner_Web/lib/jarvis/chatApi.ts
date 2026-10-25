@@ -2,7 +2,7 @@ import type { ServerMessageLike } from "./messageContent";
 import type { ReplyAudio } from "./replyAudio";
 
 /**
- * The hub's only door to the server: five calls on `/api/chat`, each answering
+ * The hub's only door to the server: a handful of calls on `/api/chat`, each answering
  * `{ ok: true, data }` or `{ ok: false, kind, message }` and never throwing, so
  * the state layer (`chatController.ts`) reads results instead of catching.
  *
@@ -12,6 +12,7 @@ import type { ReplyAudio } from "./replyAudio";
  *   POST /api/chat { message, conversationId?, newConversation?, speak? }   one typed turn
  *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?)   one typed turn with a file
  *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
+ *   GET  /api/chat/tools                    the brain's tool servers and whether each is connected
  *
  * `speak: true` asks for the reply to come back with audio too (`audio` in the answer)
  * when it is short enough to be read aloud - see replyAudio.ts.
@@ -61,6 +62,16 @@ export interface VoiceTurnData extends TurnData {
   transcript: string;
   /** Who transcribed it: "openai" (the Whisper API) or "local" (faster-whisper on the brain's own machine). */
   engine: string;
+}
+
+/** What the sidebar's "Agents & tools" is built from (app/api/chat/tools/route.ts). */
+export interface ToolsData {
+  /** The brain answered at all. */
+  reachable: boolean;
+  /** It has a language model to answer with. */
+  ready: boolean;
+  /** Its tool servers: config name, connected or not, how many tools. */
+  servers: { name: string; connected: boolean; tools: number }[];
 }
 
 export interface TurnRequest {
@@ -128,6 +139,9 @@ export const chatApi = {
 
   sessions: () =>
     request<SessionsData>("/api/chat/sessions", { cache: "no-store", signal: AbortSignal.timeout(READ_TIMEOUT_MS) }),
+
+  tools: () =>
+    request<ToolsData>("/api/chat/tools", { cache: "no-store", signal: AbortSignal.timeout(READ_TIMEOUT_MS) }),
 
   // No client timeout: the brain may run a whole trip plan (tens of seconds) and the server enforces its own limit.
   // With a file the turn goes as multipart (no Content-Type set, so the browser adds the boundary); without, as JSON.
