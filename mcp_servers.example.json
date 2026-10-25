@@ -1,8 +1,31 @@
 {
   "mcpServers": {
+    "local_fs": {
+      "command": "python",
+      "args": ["mcp_filesystem.py"]
+    },
+    "web_search": {
+      "command": "python",
+      "args": ["mcp_websearch.py"]
+    },
+    "fetch": {
+      "command": "python",
+      "args": ["mcp_fetch.py"]
+    },
+    "memory": {
+      "command": "python",
+      "args": ["mcp_memory.py"],
+      "user_scoped": true
+    },
+    "data": {
+      "command": "python",
+      "args": ["mcp_data.py"],
+      "user_scoped": true
+    },
     "mock": {
       "command": "python",
-      "args": ["mock_mcp_server.py"]
+      "args": ["mock_mcp_server.py"],
+      "disabled": true
     }
   }
 }

@@ -76,15 +76,20 @@ Several things were added to this module beyond plain tool calling:
       prompt rule, because a prompt is only a request.
 
   MCP CLIENT  tools served by other programs over the Model Context
-      Protocol. mcp_client.py starts the bundled servers (local_fs and
-      web_search - no configuration needed) and those listed in
+      Protocol. mcp_client.py starts the bundled servers - local_fs,
+      web_search, fetch (read a URL), memory (long-term facts about the
+      person) and data (a SQLite workspace for CSV/JSON number crunching),
+      none of which needs a key or an account - and those listed in
       mcp_servers.json, asks each for its tools (tools/list) and returns
       them as ToolSpecs named mcp__<server>__<tool>; calling one forwards a
       tools/call and the text comes back to the model labelled as external
-      data. The snapshot is re-read every turn like plugins. A tool that
-      is not marked read-only asks for confirmation (the web server
-      declines those). JARVIS_MCP=0 turns it off, JARVIS_MCP_CORE=0 turns
-      off just the bundled ones.
+      data. memory and data keep one store per person (the voice assistant
+      and JARVIS_OWNER_USER_ID are the owner). The snapshot is re-read every
+      turn like plugins. A tool that is neither read-only nor marked as only
+      adding things asks for confirmation (the web server declines those).
+      The front door is told what each server is for, so it hands those
+      requests on. JARVIS_MCP=0 turns it off, JARVIS_MCP_CORE=0 turns off
+      just the bundled ones.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -720,7 +725,16 @@ _TOOL_WORDS: tuple[str, ...] = (
     "server", "servers", "backend", "frontend", "container", "containers",
     "spent", "spend", "paid", "bought", "subscription", "invoice", "expense",
     "trip", "trips", "itinerary", "poll",
+    # The bundled MCP servers: long-term memory, reading a URL, crunching a data file.
+    # "forget" costs "never mind, forget it" its cheap path; a "forget my address"
+    # answered by a tool-less model ("Done!") while nothing is deleted costs more.
+    "remember", "recall", "forget", "fetch", "url", "website", "webpage",
+    "csv", "spreadsheet", "dataset", "sql",
 )
+
+# Thai has no spaces between words, so these are matched as substrings, like
+# _TRIP_SUBSTRINGS below: remember / help me remember / forget / do you remember.
+_MEMORY_SUBSTRINGS: tuple[str, ...] = ("จำไว้", "ช่วยจำ", "ลืม", "จำได้")
 
 # A request about a trip - "plan a trip to Chiang Mai" - is a tool call to make
 # (generate_trip_plan_async), not a design question to reason about. But "plan"
@@ -834,6 +848,9 @@ def _classify_intent(text: str) -> tuple[str, str]:
 # small extra call before the supervisor takes over.
 
 _FRONT_DOOR_INTENTS = ("CHAT", "TRIP_PLANNING")
+
+# A web address in the utterance: "what does https://... say", "summarise www.example.com".
+_HAS_LINK = re.compile(r"\bhttps?://|\bwww\.[a-z0-9-]", re.IGNORECASE)
 _FRONT_DOOR_ROUTES = ("SELF", "ORCHESTRATOR")
 
 
@@ -912,6 +929,8 @@ def _looks_like_tool_command(text: str) -> bool:
     if any(lowered.lstrip().startswith(opener) for opener in _ALWAYS_FAST):
         return True
     if any(word in _TOOL_WORDS for word in lowered.split()):
+        return True
+    if any(fragment in text for fragment in _MEMORY_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
     return _mentions_trip(text) or _asks_system_status(text)
@@ -2736,15 +2755,28 @@ class LLMBrain:
         return any(token.startswith(word) for token in tokens for word in words)
 
     def _front_door_prompt(self) -> str:
-        """The router's instructions, plus a line saying external tools exist if any do."""
+        """
+        The router's instructions, plus what each connected tool server is for.
+
+        In the server's own words (the first sentence of its MCP instructions),
+        not a list of tool names: "recall on memory" does not tell a router that
+        "what's my sister's name?" belongs to the assistant behind it, and
+        "Long-term memory of the person you are talking to ..." does.
+        """
         if not self._mcp_tools:
             return FRONT_DOOR_PROMPT
-        names = ", ".join(t.label or t.name for t in self._mcp_tools[:12])
+        notes = self._mcp.server_notes() if self._mcp is not None else []
+        if not notes:
+            names = ", ".join(t.label or t.name for t in self._mcp_tools[:12])
+            notes = [("tools", names)]
+        servers = "\n".join(f"  - {name}: {note}" for name, note in notes)
         return (
             FRONT_DOOR_PROMPT
-            + "\n- External tool servers are also connected to the assistant behind you, with tools "
-            + f"such as: {names}. A request one of them could answer is route_to \"ORCHESTRATOR\" "
-            + "with response null."
+            + "\n- External tool servers are also connected to the assistant behind you:\n"
+            + servers
+            + "\n  A request one of them could answer - reading a link, a question about the user's "
+            + "own life, people or preferences that a memory could hold, asking to remember or forget "
+            + "something, numbers in a data file - is route_to \"ORCHESTRATOR\" with response null."
         )
 
     def _refresh_plugins(self, verbose: bool = False) -> None:
@@ -3029,6 +3061,8 @@ class LLMBrain:
             return "tool command"
         if self._mentions_mcp_tool(user_text):
             return "mentions an MCP tool"
+        if self._mcp_tools and _HAS_LINK.search(user_text):
+            return "contains a link"  # the fetch tool reads it; the front door can only guess
         if self._awaiting_answer():
             return "answer to Jarvis's own question"
         return ""

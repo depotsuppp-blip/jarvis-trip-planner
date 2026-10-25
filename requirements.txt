@@ -239,3 +239,13 @@ python-docx>=1.1.0
 # machine has; without either, the server starts and the tool says what to install.
 # Pulls primp (a small HTTP client), lxml and click.
 ddgs>=9.0.0
+
+# --- Reading web pages (mcp_fetch.py) -----------------------------------
+# The fetch MCP server turns a page's HTML into readable text with
+# BeautifulSoup (pure Python; it uses the lxml that ddgs brings when it is there).
+# The download itself is urllib3 + certifi, which come with requests. Without
+# it the server still starts, reads PDFs and text, and says what to install for HTML.
+beautifulsoup4>=4.12
+
+# memory (mcp_memory.py) and data (mcp_data.py) need nothing beyond the
+# standard library: both are SQLite through Python's own sqlite3 module.

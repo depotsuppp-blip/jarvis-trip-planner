@@ -23,15 +23,28 @@ the protocol subset used here is small enough to read in one sitting.
 
 BUNDLED SERVERS
 ---------------
-Two servers ship with Jarvis and start with it, with no configuration at all:
+Five servers ship with Jarvis and start with it, with no configuration, no API
+key and no account:
 
     local_fs     mcp_filesystem.py   read files and list folders in the project
     web_search   mcp_websearch.py    search the web (DuckDuckGo)
+    fetch        mcp_fetch.py        read a web page or PDF from its URL
+    memory       mcp_memory.py       long-term memory: facts about the person
+    data         mcp_data.py         a SQLite workspace: load CSV/JSON, query it
 
-mcp_servers.json is for everything else. An entry there with the same name as
-a bundled server replaces it (different arguments, `"confirm": "never"`, ...),
+mcp_servers.json lists them too, so they can be seen and changed in one place,
+and is where any other server goes. An entry there with the same name as a
+bundled server replaces it (different arguments, `"confirm": "never"`, ...),
 and `{"disabled": true}` switches that one off. JARVIS_MCP_CORE=0 starts none of
-the bundled ones; JARVIS_MCP=0 starts no MCP server at all.
+the bundled ones that the file does not name; JARVIS_MCP=0 starts no MCP server
+at all.
+
+ONE STORE PER PERSON. memory and data keep what they store per person: the web
+app serves everyone who signs in to it, and one person's facts or tables must
+never reach another. A server marked "user_scoped" gets the caller with every
+call, as a hidden "_scope" argument the model neither sees nor can set
+(caller_scope() below; mcp_stdio.py reads it): "owner" for the voice assistant
+and for the web user named in JARVIS_OWNER_USER_ID, "user:<id>" for everyone else.
 
 CONFIG
 ------
@@ -43,9 +56,11 @@ the format Claude Desktop uses:
 Optional per server: "env" (extra variables; ${NAME} is expanded from this
 process), "cwd", "timeout" (seconds per tool call, default 30),
 "confirm" ("destructive" - the default - asks first unless the tool says it
-is read-only; "always"; "never") and "disabled": true. JARVIS_MCP=0 turns
-the whole thing off. A broken or missing server is logged and skipped; it
-never stops Jarvis from starting.
+is read-only or only adds things, i.e. readOnlyHint or destructiveHint: false;
+"always"; "never"), "user_scoped" (see above; an entry that replaces a bundled
+server keeps the bundled setting unless it says otherwise) and "disabled": true.
+JARVIS_MCP=0 turns the whole thing off. A broken or missing server is logged and
+skipped; it never stops Jarvis from starting.
 
 NAMES
 -----
@@ -89,6 +104,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import request_context
 from tool_spec import ToolSpec
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -105,8 +121,11 @@ MAX_RESULT_CHARS = 8000      # a tool result longer than this is cut
 MAX_TOOLS_PER_SERVER = 64    # a runaway server must not flood the prompt
 MAX_NAME = 64                # Anthropic: ^[a-zA-Z0-9_-]{1,64}$
 MAX_DESCRIPTION = 1000
+MAX_INSTRUCTIONS = 600       # what is kept of a server's own "how to use me" text
 
 _CONFIG_NAME = "mcp_servers.json"
+# The hidden argument that carries the caller to a user-scoped server (mcp_stdio.SCOPE_ARG).
+_SCOPE_ARG = "_scope"
 
 # What a child process may inherit. Deliberately not os.environ: that holds
 # the Anthropic key, the database URL and the LINE tokens, and a tool server
@@ -149,6 +168,7 @@ class ServerConfig:
     cwd: Optional[str] = None
     timeout: float = DEFAULT_CALL_TIMEOUT
     confirm: str = "destructive"  # destructive | always | never
+    user_scoped: bool = False     # each call carries the caller (see caller_scope)
 
 
 def _slug(text: str) -> str:
@@ -172,24 +192,78 @@ def _env_off(name: str) -> bool:
     return os.environ.get(name, "1").strip().lower() in ("0", "false", "no", "off")
 
 
-# The servers that ship with Jarvis: (name, script next to this file). They run on
+@dataclass(frozen=True)
+class _Bundled:
+    name: str
+    script: str
+    # Variables of this process the server is given. A child's environment is
+    # minimal (_SAFE_ENV), so a setting from .env reaches it only if named here.
+    env: tuple[str, ...] = ()
+    user_scoped: bool = False
+
+
+# The servers that ship with Jarvis, each a script next to this file. They run on
 # the interpreter that runs Jarvis ("python" below stands for it, see _resolve_command)
 # with the project folder as their working directory - mcp_filesystem.py confines
-# itself to that folder.
+# itself to that folder, and mcp_data.py loads files through the same rules.
 _BUNDLED = (
-    ("local_fs", "mcp_filesystem.py"),
-    ("web_search", "mcp_websearch.py"),
+    _Bundled("local_fs", "mcp_filesystem.py"),
+    _Bundled("web_search", "mcp_websearch.py"),
+    _Bundled("fetch", "mcp_fetch.py", ("JARVIS_FETCH_ALLOW_PRIVATE", "JARVIS_FETCH_IGNORE_ROBOTS")),
+    _Bundled("memory", "mcp_memory.py", ("JARVIS_DATA_DIR",), user_scoped=True),
+    _Bundled("data", "mcp_data.py", ("JARVIS_DATA_DIR",), user_scoped=True),
 )
+_BUNDLED_BY_NAME = {b.name: b for b in _BUNDLED}
+
+
+def _passed_env(bundled: Optional[_Bundled]) -> dict[str, str]:
+    """The variables of this process that a bundled server is given (set ones only)."""
+    if bundled is None:
+        return {}
+    return {name: os.environ[name] for name in bundled.env if os.environ.get(name, "").strip()}
 
 
 def bundled_servers() -> list[ServerConfig]:
     """The servers that start with no configuration. A script that is not on disk is left out."""
     here = os.path.dirname(os.path.abspath(__file__))
     return [
-        ServerConfig(name, "python", [os.path.join(here, script)], {}, here)
-        for name, script in _BUNDLED
-        if os.path.isfile(os.path.join(here, script))
+        ServerConfig(
+            bundled.name,
+            "python",
+            [os.path.join(here, bundled.script)],
+            _passed_env(bundled),
+            here,
+            user_scoped=bundled.user_scoped,
+        )
+        for bundled in _BUNDLED
+        if os.path.isfile(os.path.join(here, bundled.script))
     ]
+
+
+def caller_scope() -> str:
+    """
+    Whom a user-scoped server (memory, data) works for in this call: "owner" for
+    the voice assistant - one person at a microphone - and for the web user
+    named in JARVIS_OWNER_USER_ID, so the owner has one memory whichever way
+    they talk to Jarvis; "user:<id>" for anyone else signed in to the web app;
+    "" for a web request that names nobody.
+
+    Read from request_context, which api_server.py sets for each request on the
+    thread that runs it. MCP tools always run on that thread (they are never
+    `background`), so the answer is about the request being served.
+    """
+    context = request_context.current()
+    if context is None or not context.is_web:
+        return "owner"
+    user = context.user_id.strip()
+    if not user:
+        return ""
+    owner = os.environ.get("JARVIS_OWNER_USER_ID", "").strip()
+    if owner and user == owner:
+        return "owner"
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", user):
+        user = "h-" + hashlib.sha256(user.encode("utf-8")).hexdigest()[:32]
+    return f"user:{user}"
 
 
 def load_config(path: Optional[str] = None, *, bundled: Optional[bool] = None) -> list[ServerConfig]:
@@ -250,10 +324,17 @@ def _read_config_file(path: str) -> tuple[list[ServerConfig], set[str]]:
         seen.add(name)
         claimed.add(name)
 
+        # An entry named like a bundled server starts from that server's settings:
+        # the variables it is given and whether it is user-scoped. Without that,
+        # listing "memory" here would quietly give every web user one shared memory.
+        bundled = _BUNDLED_BY_NAME.get(name)
         args = entry.get("args", [])
         args = [_expand(str(a)) for a in args] if isinstance(args, list) else []
         env_in = entry.get("env", {})
         env = {str(k): _expand(str(v)) for k, v in env_in.items()} if isinstance(env_in, dict) else {}
+        env = {**_passed_env(bundled), **env}
+        scoped = entry.get("user_scoped")
+        user_scoped = scoped if isinstance(scoped, bool) else bool(bundled and bundled.user_scoped)
         cwd = entry.get("cwd")
         cwd = os.path.normpath(os.path.join(base, _expand(str(cwd)))) if cwd else base
         try:
@@ -265,7 +346,7 @@ def _read_config_file(path: str) -> tuple[list[ServerConfig], set[str]]:
             _log(f"[MCP] {name}: unknown confirm mode {confirm!r}; using 'destructive'.")
             confirm = "destructive"
         configs.append(
-            ServerConfig(name, _expand(command.strip()), args, env, cwd, max(1.0, timeout), confirm)
+            ServerConfig(name, _expand(command.strip()), args, env, cwd, max(1.0, timeout), confirm, user_scoped)
         )
     return configs, claimed
 
@@ -304,6 +385,8 @@ class McpConnection:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
         self.server_info: dict[str, Any] = {}
+        # The server's own "when to use me" text (the initialize result's instructions).
+        self.instructions = ""
         self.tools_dirty = False  # the server said notifications/tools/list_changed
         self._proc: Optional[subprocess.Popen] = None
         self._ids = itertools.count(1)
@@ -356,6 +439,9 @@ class McpConnection:
             if version not in SUPPORTED_VERSIONS:
                 raise McpError(f"the server speaks protocol {version!r}; this client speaks {', '.join(SUPPORTED_VERSIONS)}")
             self.server_info = result.get("serverInfo") if isinstance(result.get("serverInfo"), dict) else {}
+            instructions = result.get("instructions")
+            if isinstance(instructions, str):
+                self.instructions = re.sub(r"\s+", " ", instructions).strip()[:MAX_INSTRUCTIONS]
             self.notify("notifications/initialized")
         except McpError:
             self.close()
@@ -713,9 +799,14 @@ class McpManager:
     def _spec(self, entry: _Entry, exposed: str, original: str, raw: dict[str, Any]) -> ToolSpec:
         server = entry.config.name
         annotations = raw.get("annotations") if isinstance(raw.get("annotations"), dict) else {}
+        # MCP: destructiveHint defaults to true and means something only when the
+        # tool is not read-only. False = it only adds (saving a fact, loading a
+        # file into a NEW table), which needs no "are you sure?". Like readOnlyHint
+        # it is the server's word, and the config is where that server was trusted.
         read_only = annotations.get("readOnlyHint") is True
+        additive = annotations.get("destructiveHint") is False
         mode = entry.config.confirm
-        needs_confirm = mode == "always" or (mode == "destructive" and not read_only)
+        needs_confirm = mode == "always" or (mode == "destructive" and not read_only and not additive)
 
         title = str(raw.get("description") or raw.get("title") or original).strip()
         description = f"{title} (External tool '{original}' from the MCP server '{server}'.)"
@@ -794,6 +885,17 @@ class McpManager:
         if conn is None or not conn.alive:
             raise McpError(f"the {owner.config.name} tool server is not running ({owner.error or 'it stopped'})")
 
+        if owner.config.user_scoped:
+            # Set here, never taken from the model: a "_scope" it wrote is overwritten.
+            scope = caller_scope()
+            if not scope:
+                raise McpToolError(_labelled(
+                    owner.config.name,
+                    "This tool keeps a separate store for each person, and this request did not say "
+                    "who is asking, so nothing was read or saved.",
+                ))
+            arguments = {**(arguments or {}), _SCOPE_ARG: scope}
+
         result = conn.call_tool(original, arguments)  # McpError on timeout / crash / protocol error
         text = result_text(result)
         if result.get("isError"):
@@ -814,6 +916,27 @@ class McpManager:
                 else:
                     parts.append(f"{name} (not connected)")
         return "MCP tool servers: " + ", ".join(parts) + "."
+
+    def server_notes(self) -> list[tuple[str, str]]:
+        """
+        (server, what it is for) for each connected server that has tools: the
+        first sentence of the server's own instructions, or else its tools'
+        names. For the front-door router, which has no tool list and must still
+        recognise a request that belongs to one of these servers.
+        """
+        notes: list[tuple[str, str]] = []
+        with self._lock:
+            for name, entry in self._entries.items():
+                conn = entry.conn
+                if conn is None or not conn.alive or not entry.tools:
+                    continue
+                first = re.split(r"(?<=[.!?])\s", conn.instructions, maxsplit=1)[0].strip()
+                if first:
+                    notes.append((name, first[:300]))
+                else:
+                    labels = ", ".join(original.replace("_", " ") for original in list(entry.originals.values())[:6])
+                    notes.append((name, f"tools: {labels}"))
+        return notes
 
     def tool_words(self) -> set[str]:
         """Words from the tools' own names ('server', 'time', 'file'), for routing."""
