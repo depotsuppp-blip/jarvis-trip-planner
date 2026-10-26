@@ -9,6 +9,7 @@
 !requirements.txt
 !*.py
 !plugins/
+!agents/
 
 # ...minus bytecode caches that happen to sit beside the sources
 **/__pycache__

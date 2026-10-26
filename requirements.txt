@@ -133,6 +133,19 @@ google-genai>=1.0.0
 # package announced it "will no longer be receiving updates or bug fixes."
 # There is exactly one Gemini SDK in this project's dependency tree now;
 # do not reintroduce google-generativeai without a specific reason.
+# (The agent team below runs its Gemini routes on google-genai too.)
+
+# --- The agent team (agents/) -------------------------------------------
+# Specialist agents the brain delegates to, each with a fixed fallback order
+# (agents/__init__.py). Gemini through google-genai above; these two add the
+# other providers. Without a key a provider is simply skipped, so installing
+# them costs nothing until OPENAI_API_KEY / GROQ_API_KEY is set.
+#
+# OpenAI SDK: the Head of Productivity's primary model (gpt-4o-mini).
+openai>=1.60.0
+# Groq SDK: the Head of Data & Documents' fallback (openai/gpt-oss-120b - Groq
+# retired its Llama 3.x models for free accounts on 2026-08-16).
+groq>=0.30.0
 
 # Schema validation for the Trip Planner Agent's itinerary output
 # (plugins/trip_planner.py's Itinerary model) - Gemini's response_schema

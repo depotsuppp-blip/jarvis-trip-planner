@@ -28,10 +28,18 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                       "stt": "openai"|"local", "stt_ready": true|false,
                       "tts": true|false, "mcp_tools": ["mcp__web_search__web_search", ...],
                       "mcp_servers": [{ "name": "web_search", "connected": true,
-                                        "tools": ["web_search"], "error": "" }, ...] }
+                                        "tools": ["web_search"], "error": "" }, ...],
+                      "agents": [{ "name": "data", "title": "Head of Data & Documents",
+                                   "tool": "delegate_to_data", "active": true,
+                                   "routes": [{ "role": "primary", "provider": "gemini",
+                                                "model": "gemini-pro-latest", "state": "ready" }, ...],
+                                   "tools": ["mcp__local_fs__read_file", ...] }, ...] }
                  stt_ready is false while the on-device model is still loading. tts says whether
                  replies can be spoken (Edge-TTS installed and not switched off). mcp_tools are
-                 the tool-server tools the brain had at its last turn; mcp_servers is each tool
+                 the tool-server tools Jarvis had at its last turn, the manager's and its agents'
+                 (agents/); agents is the team - a route's state is ready, resting (failed lately:
+                 out of credit or quota, rate limited), failed (until restart) or not configured
+                 (no key: "why" says which). mcp_servers is each tool
                  server as it is right now (error says why one is not connected). The bundled
                  servers - local_fs, web_search, fetch, memory, data - start with the brain, with
                  nothing to configure (mcp_client.py). The web hub's sidebar lists them from here
@@ -213,8 +221,10 @@ def health() -> dict:
         "stt": stt.engine(),
         "stt_ready": stt.is_ready(),
         "tts": reply_audio.enabled(),
-        "mcp_tools": [name for name in brain.tool_names if name.startswith("mcp__")],
+        # Every tool-server tool Jarvis has, whether the manager or one of its agents holds it.
+        "mcp_tools": [name for name in brain.all_tool_names if name.startswith("mcp__")],
         "mcp_servers": brain.mcp_servers(),
+        "agents": brain.team_status(),
     }
 
 

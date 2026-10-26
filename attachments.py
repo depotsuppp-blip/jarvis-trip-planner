@@ -35,6 +35,14 @@ no read_file tool is connected (JARVIS_MCP=0) - the line says so instead and
 tells the model to say it could not open the file, rather than answer as if it
 had read it.
 
+With the agent team on (agents/), the manager holds neither tool: both are the
+Head of Data & Documents', reached through delegate_to_data, and the line says to
+call that with the request and the file's exact path in the task:
+
+    [System Context: The user attached a file named "report.pdf" located at
+    'uploads/3f9a...-report.pdf'. To read it, call the delegate_to_data tool
+    with the user's request and this exact path in the task.]
+
 The line also keeps the turn away from the brain's front door (the cheap
 router with no tools, llm_brain.LLMBrain._front_door): "file" is a word from
 the read_file tool's own name, and a message that uses one goes straight to the
@@ -58,6 +66,9 @@ UPLOADS_DIR = os.path.join(ROOT, UPLOADS_FOLDER)
 READ_TOOL = "mcp__local_fs__read_file"
 # The bundled data server is "data"; likewise, any MCP server's load_file is the fallback.
 DATA_TOOL = "mcp__data__load_file"
+# The manager's tool for both when the agent team is on (agents/data_agent.py): the
+# Head of Data & Documents holds read_file and load_file, and gets the path in its task.
+DELEGATE_TOOL = "delegate_to_data"
 # What mcp_data.load_file reads that the web app also accepts (lib/jarvis/attachments.ts).
 DATA_EXTENSIONS = frozenset({".csv", ".tsv", ".json", ".jsonl"})
 
@@ -74,19 +85,25 @@ class AttachmentLike(Protocol):
 
 
 def read_tool(tool_names: Iterable[str]) -> Optional[str]:
-    """The exposed name of the tool that reads files, or None when none is connected."""
+    """
+    The exposed name of the tool that reads files, or None when none is connected.
+    With the agent team on (agents/) the manager has no reader of its own: then it
+    is DELEGATE_TOOL, and the Head of Data & Documents reads the file.
+    """
     names = list(tool_names)
     if READ_TOOL in names:
         return READ_TOOL
-    return next((n for n in names if n.startswith("mcp__") and n.endswith("__read_file")), None)
+    found = next((n for n in names if n.startswith("mcp__") and n.endswith("__read_file")), None)
+    return found or (DELEGATE_TOOL if DELEGATE_TOOL in names else None)
 
 
 def data_tool(tool_names: Iterable[str]) -> Optional[str]:
-    """The exposed name of the tool that loads data files into tables, or None when none is connected."""
+    """The exposed name of the tool that loads data files into tables (or DELEGATE_TOOL, as above), or None."""
     names = list(tool_names)
     if DATA_TOOL in names:
         return DATA_TOOL
-    return next((n for n in names if n.startswith("mcp__") and n.endswith("__load_file")), None)
+    found = next((n for n in names if n.startswith("mcp__") and n.endswith("__load_file")), None)
+    return found or (DELEGATE_TOOL if DELEGATE_TOOL in names else None)
 
 
 def is_data_file(path: str) -> bool:
@@ -131,6 +148,13 @@ def describe(
             "so it cannot be read. Tell the user you couldn't open it and ask them to attach it again.]"
         )
     name = _quoted_name(attachment.name, path)
+    if DELEGATE_TOOL in (tool, data):
+        # The team is on: the manager hands the file to the Head of Data & Documents.
+        kind, work = ("data file", "load it as a table and compute with SQL") if is_data_file(path) else ("file", "read it")
+        return (
+            f"[System Context: The user attached a {kind} named \"{name}\" located at '{path}'. "
+            f"To {work}, call the {DELEGATE_TOOL} tool with the user's request and this exact path in the task.]"
+        )
     if data is not None and is_data_file(path):
         again = (
             " It may have been loaded in an earlier turn already: check the existing tables before loading it again."

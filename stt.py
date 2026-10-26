@@ -27,6 +27,8 @@ Talk press does not wait for it.
 
 .env (all optional):
     OPENAI_API_KEY            enables the Whisper API
+    JARVIS_STT_ENGINE         "local" keeps recordings on this machine even with
+                              OPENAI_API_KEY set (it is also the productivity agent's key)
     OPENAI_BASE_URL           default https://api.openai.com/v1 (a proxy, or a
                               local stand-in for testing)
     JARVIS_OPENAI_STT_MODEL   default whisper-1
@@ -97,7 +99,14 @@ def file_name_for(content_type: str | None) -> str:
 
 
 def engine() -> str:
-    """Which engine a recording goes to right now."""
+    """
+    Which engine a recording goes to right now: the Whisper API when OPENAI_API_KEY is
+    set, unless JARVIS_STT_ENGINE=local keeps it on this machine (the key is also the
+    productivity agent's, agents/productivity_agent.py, and setting it for that should
+    not have to send recordings to OpenAI).
+    """
+    if _setting("JARVIS_STT_ENGINE").strip().lower() == ENGINE_LOCAL:
+        return ENGINE_LOCAL
     return ENGINE_OPENAI if _setting("OPENAI_API_KEY") else ENGINE_LOCAL
 
 

@@ -98,6 +98,19 @@ Several things were added to this module beyond plain tool calling:
       must search for anything real-time (weather, news, prices, places)
       instead of saying it has no tool for it (turn_context, REALTIME_RULE).
 
+  THE TEAM  specialist agents (agents/) that the brain - the manager -
+      delegates to, each on its own models with a fixed fallback order:
+      the Head of Data & Documents (Gemini Pro -> Groq; owns the local_fs
+      and data servers), the Head of Research (Gemini Flash; owns
+      web_search and fetch) and the Head of Productivity (GPT-4o-mini ->
+      Gemini Flash; schedules and to-dos as JSON drafts), each ending on
+      Jarvis's own Gemini model as a last resort. The manager holds
+      delegate_to_data / _research / _productivity instead of those tools,
+      writes each a self-contained task (they do not see the conversation)
+      and answers the user from their reports (TEAM_RULE). An agent with no
+      usable model, or whose servers are down, is left out and its tools
+      stay with the manager. JARVIS_AGENTS=0 turns the team off.
+
 -------------------------------------------------------------------
 PROVIDERS
 -------------------------------------------------------------------
@@ -663,13 +676,36 @@ def turn_context(now: Optional[datetime] = None) -> str:
 
 
 def realtime_rule(tools: list[ToolSpec]) -> str:
-    """REALTIME_RULE naming this turn's web search tool (and page reader), or "" when there is none."""
+    """
+    REALTIME_RULE naming this turn's web search tool (and page reader), or "" when
+    there is none. With the agent team on (agents/), the manager has no search tool
+    of its own: the rule then names delegate_to_research, which searches and reads
+    pages for it.
+    """
     search = next((t.name for t in tools if t.name == "web_search" or t.name.endswith("__web_search")), None)
     if search is None:
+        if any(t.name == DELEGATE_RESEARCH for t in tools):
+            return REALTIME_RULE.format(
+                search=f"the {DELEGATE_RESEARCH} tool (your Head of Research searches the web and reads pages for you)",
+                read="",
+            )
         return ""
     reader = next((t.name for t in tools if t.name.endswith("__fetch_url")), None)
     read = f" If a result's snippet is not enough, read that page with {reader}." if reader else ""
     return REALTIME_RULE.format(search=f"the {search} tool", read=read)
+
+
+# The specialist agents' delegation tools (agents/; LLMBrain._team_tools builds them).
+DELEGATE_RESEARCH = "delegate_to_research"
+
+# Added to the manager's per-turn context while it has a team (LLMBrain._call_provider).
+TEAM_RULE = (
+    "Your team: {members}. You cannot read files or search the web yourself - those tools "
+    "belong to them. Hand a task to the right one instead of guessing or saying you cannot. "
+    "They do not see this conversation, so each task must stand on its own: the question, "
+    "every file path or link, the place and dates, and what you need back. Their reports "
+    "are for you: answer the user yourself, in your own words."
+)
 
 # What the brain does when a reply holds a trip link or id that no tool returned
 # during this request (link_guard.py says which): it is not sent. The model gets
@@ -2270,12 +2306,15 @@ class _Provider:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
+        json_output: bool = False,
     ) -> Turn:
         """
         One model call. `system` is the persona - the same text on every call, so a
         provider can cache it; `context` is what changes from turn to turn (the
         date, the place, rules that depend on this turn's tools - see turn_context),
-        sent after it.
+        sent after it. `json_output` asks for one JSON object where the API has a
+        mode for it (a specialist agent's structured answer, agents/); a provider
+        without one ignores it and the prompt has to say so.
         """
         raise NotImplementedError
 
@@ -2385,6 +2424,7 @@ class AnthropicProvider(_Provider):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
+        json_output: bool = False,  # no JSON mode here; only the agents ask, and none runs on Claude
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Anthropic model isn't configured.")
@@ -2566,9 +2606,15 @@ class GeminiProvider(_Provider):
         model: Optional[str] = None,
         max_tokens: int = MAX_TOKENS,
         api_key: Optional[str] = None,
+        fallthrough: bool = True,
     ) -> None:
         self._model = model or _env("GEMINI_MODEL", GEMINI_MODEL)
         self._max_tokens = max_tokens
+        # True (Jarvis's standby): a busy, retired or quota-less model falls through to
+        # the default and then GEMINI_MODEL_LAST_RESORT within one call. False (a
+        # specialist agent's route, agents/base.py): exactly the model asked for, and a
+        # failure is raised so the agent's own fallback - another provider - is used.
+        self._fallthrough = fallthrough
         self._client = None
         self.unavailable_reason = ""
 
@@ -2672,6 +2718,7 @@ class GeminiProvider(_Provider):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
+        json_output: bool = False,
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Gemini model isn't configured.")
@@ -2680,6 +2727,8 @@ class GeminiProvider(_Provider):
             "system_instruction": f"{system}\n\n{context}" if context else system,
             "max_output_tokens": self._max_tokens,
         }
+        if json_output and not tools:
+            config_kwargs["response_mime_type"] = "application/json"
         if tools:
             config_kwargs["tools"] = [gemini_tool_declarations(tools)]
             # The SDK will otherwise try to invoke Python callables itself.
@@ -2694,6 +2743,8 @@ class GeminiProvider(_Provider):
         # last resort - rather than no answer at all.
         response = None
         targets = list(dict.fromkeys([model or self._model, self._model, GEMINI_MODEL_LAST_RESORT]))
+        if not self._fallthrough:
+            targets = targets[:1]
         for target in targets:
             try:
                 response = self._client.models.generate_content(
@@ -2865,6 +2916,12 @@ class LLMBrain:
         self._mcp_tools: list[ToolSpec] = []
         self._mcp = self._start_mcp()
 
+        # The specialist agents (agents/): each owns some of the MCP servers' tools,
+        # and the manager reaches them through a delegate_to_<agent> tool instead.
+        # Empty when JARVIS_AGENTS=0 - one model with every tool, as before.
+        self._team: dict[str, Any] = self._start_team()
+        self._delegation_specs: dict[str, ToolSpec] = {}
+
         # Feature 2 bookkeeping: what went to the background, so the same
         # side effect cannot be fired twice (see _execute).
         self._recent_dispatches: dict[str, float] = {}
@@ -2929,6 +2986,12 @@ class LLMBrain:
             print(f"[Brain] Standby provider: {standby.name} ({standby.model}).")
         else:
             print(f"[Brain] No standby provider ({standby.unavailable_reason}).")
+        for agent in self._team.values():
+            if agent.can_work(self._mcp_tools):
+                print(f"[Brain] Team: {agent.tool_name} -> {agent.describe_routes()}.")
+            else:
+                why = "no model configured" if not agent.available else "its tool servers are not connected"
+                print(f"[Brain] Team: {agent.name} agent off ({why}); its tools stay with the manager.")
 
     # -- capabilities --------------------------------------------------
 
@@ -2957,9 +3020,101 @@ class LLMBrain:
         """The MCP tool servers and whether each is connected (McpManager.servers); [] when none are configured."""
         return self._mcp.servers() if self._mcp is not None else []
 
+    @property
+    def all_tool_names(self) -> list[str]:
+        """The manager's tools and every working agent's, once each (for /health)."""
+        names = self.tool_names
+        for agent in self._working_agents():
+            names += [tool.name for tool in agent.tools_from(self._mcp_tools)]
+        return list(dict.fromkeys(names))
+
+    def team_status(self) -> list[dict[str, Any]]:
+        """Each specialist agent: whether it is working, its routes (provider, model, state) and its tools."""
+        return [agent.status(self._mcp_tools) for agent in self._team.values()]
+
     def _active_tools(self) -> list[ToolSpec]:
-        """Built-in tools, whatever is currently in plugins/, and the MCP servers' tools."""
-        return list(self._tools) + list(self._plugin_tools) + list(self._mcp_tools)
+        """
+        What the manager can call: the built-in tools, whatever is in plugins/, the MCP
+        tools no working agent owns, and one delegate_to_<agent> tool per working agent.
+        An agent that cannot work (no model, or its tool servers are down) is left out
+        and its tools stay here, so a missing key never takes a capability away.
+        """
+        working = self._working_agents()
+        mcp = [tool for tool in self._mcp_tools if not any(agent.owns(tool) for agent in working)]
+        return list(self._tools) + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working]
+
+    # -- the team (agents/) ----------------------------------------------
+
+    def _start_team(self) -> dict[str, Any]:
+        """The specialist agents, or {} when JARVIS_AGENTS=0 or they cannot be built. Never raises."""
+        if _env("JARVIS_AGENTS", "1").lower() in ("0", "false", "no", "off"):
+            print("[Brain] Agent team off (JARVIS_AGENTS=0): one model with every tool.")
+            return {}
+        try:
+            # Imported here, not at the top: the agents import this module.
+            import agents
+
+            return agents.build_team()
+        except Exception as exc:  # noqa: BLE001 - the team is an extra; the manager works without it
+            print(f"[Brain] Agent team could not start ({type(exc).__name__}: {exc}); one model with every tool.")
+            return {}
+
+    def _working_agents(self) -> list[Any]:
+        return [agent for agent in self._team.values() if agent.can_work(self._mcp_tools)]
+
+    def _delegation_tool(self, agent: Any) -> ToolSpec:
+        """The manager's delegate_to_<agent> tool: built once, the same object every turn (the tool list stays cacheable)."""
+        spec = self._delegation_specs.get(agent.name)
+        if spec is None:
+            spec = ToolSpec(
+                name=agent.tool_name,
+                description=agent.delegate_description,
+                input_schema={
+                    "type": "object",
+                    "properties": {"task": {"type": "string", "description": agent.task_description}},
+                    "required": ["task"],
+                },
+                handler=lambda task="", _agent=agent: self._delegate(_agent, task),
+                requires_confirmation=False,
+                # Foreground: the report IS what the answer is made of.
+                background=False,
+                label=f"the {agent.title}",
+                source="agent",
+            )
+            self._delegation_specs[agent.name] = spec
+        return spec
+
+    def _delegate(self, agent: Any, task: str = "") -> str:
+        """
+        Runs one task on `agent` with its own tools and returns its report for the
+        manager. An agent none of whose models answers raises agents.AgentUnavailable,
+        which _execute hands back as a tool error that says why, route by route.
+        """
+        task = str(task or "").strip()
+        if not task:
+            return "No task was given. Call again with the whole task in `task`."
+        tools = agent.tools_from(self._mcp_tools)
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        shown = task[:160].encode(encoding, errors="backslashreplace").decode(encoding)
+        print(f"[Brain] Delegating to the {agent.title}: {shown}")
+        report = agent.run(task, tools, lambda call: self._execute(call, tools))
+        if agent.json_output:
+            header = (
+                f"DRAFT FROM YOUR {agent.title.upper()} (JSON). It is NOT saved anywhere - there is no "
+                "calendar or LINE integration yet. Present it to the user in words and say it is a draft:"
+            )
+        else:
+            header = f"REPORT FROM YOUR {agent.title.upper()} (for you, not the user - answer the user yourself):"
+        return f"{header}\n{report}"
+
+    def _team_rule(self, tools: list[ToolSpec]) -> str:
+        """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
+        members = [
+            f"the {agent.title} ({agent.tool_name})"
+            for agent in self._team.values()
+            if any(tool.name == agent.tool_name for tool in tools)
+        ]
+        return TEAM_RULE.format(members="; ".join(members)) if members else ""
 
     def _start_mcp(self) -> Optional[mcp_client.McpManager]:
         """
@@ -3117,17 +3272,25 @@ class LLMBrain:
             return False
         return answer in ("y", "yes")
 
-    def _execute(self, call: ToolCall) -> ToolResult:
+    def _execute(self, call: ToolCall, tools: Optional[list[ToolSpec]] = None) -> ToolResult:
         """
         Runs one tool call. Never raises: a failure becomes a tool result
         the model can read and explain.
+
+        `tools` is a specialist agent's own set (agents/): its calls are looked up
+        there and nowhere else, so an agent can never reach the manager's tools
+        (LINE, webhooks, delegation). The confirmation gate and the logging are the
+        same for both.
         """
-        # Search the ACTIVE set, not just the built-ins: a plugin
-        # written last turn is a real tool this turn, and looking it up
-        # here is the difference between "unknown tool" and it working.
-        tool = next((t for t in self._active_tools() if t.name == call.name), None)
-        if tool is None:
-            tool = TOOLS_BY_NAME.get(call.name)
+        if tools is not None:
+            tool = next((t for t in tools if t.name == call.name), None)
+        else:
+            # Search the ACTIVE set, not just the built-ins: a plugin
+            # written last turn is a real tool this turn, and looking it up
+            # here is the difference between "unknown tool" and it working.
+            tool = next((t for t in self._active_tools() if t.name == call.name), None)
+            if tool is None:
+                tool = TOOLS_BY_NAME.get(call.name)
 
         if tool is None:
             print(f"[Brain] Tool call rejected: unknown tool {call.name!r}.")
@@ -3589,6 +3752,9 @@ class LLMBrain:
             rule = realtime_rule(tools)
             if rule:
                 context += "\n\n" + rule
+            team = self._team_rule(tools)
+            if team:
+                context += "\n\n" + team
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
@@ -3621,7 +3787,11 @@ class LLMBrain:
 
 
 if __name__ == "__main__":
-    brain = LLMBrain()
+    # Through the importable module, not this __main__ copy: the agents (agents/)
+    # import llm_brain, and two copies of its classes would not recognise each other.
+    from llm_brain import LLMBrain as _ImportedBrain
+
+    brain = _ImportedBrain()
     print(f"[Brain] available={brain.available}")
     if not brain.available:
         raise SystemExit(1)
