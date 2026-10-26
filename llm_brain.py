@@ -106,12 +106,28 @@ Two backends, tried in order:
     1. Anthropic Claude   (ANTHROPIC_API_KEY)
     2. Google Gemini      (GEMINI_API_KEY)
 
-Gemini is used when Anthropic has no key configured, and is also failed
-over to at runtime when Anthropic rejects the key or the model - the
-cases where retrying Anthropic could not possibly help. Transient
-failures (rate limits, network, 5xx) do NOT fail over: the SDK already
-retries those, and silently switching providers would hide a blip
-behind a different voice and a different bill.
+Gemini is used when Anthropic has no key configured, and is failed over
+to at runtime when Anthropic cannot answer:
+
+    rejected key or model             for good (until restart)
+    out of credit (400 "credit
+      balance is too low", 402)       for 15 minutes, then Anthropic is tried again
+    rate limited (429), overloaded
+      or failing (5xx, 529)           for 60 seconds, then Anthropic again
+
+The SDK has already retried a 429/5xx before it reaches this point. A
+network failure and a bad request do NOT fail over: Gemini would fail the
+same way. The switch happens at the failing call, so the question being
+asked is still answered - the transcript is provider-neutral (Turn), and
+a model name meant for the other provider is dropped, not sent.
+
+Gemini's models are chosen to answer NOW (GEMINI_MODEL below): pinned
+versions retire under us - gemini-1.5-flash is gone, and gemini-2.5-flash
+was closed to new API users - and a standby that 404s or times out is no
+standby. A model that is busy or out of quota on the key falls through to
+the next one within the same call, and Gemini 3's "thought signatures" go
+back with each tool call (ToolCall.signature) - without them every second
+step of a tool-using answer is a 400.
 
 -------------------------------------------------------------------
 MODEL CHOICE - READ THIS
@@ -156,7 +172,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable, Optional
 
@@ -208,8 +224,26 @@ MODEL_DEEP = "claude-opus-5"        # reasoning tier, for heavy requests
 # Gemini's equivalents, for the failover provider. Flash covers both
 # lower tiers: Gemini prices them close enough together that a third
 # name would buy nothing and be one more model ID to keep alive.
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_MODEL_DEEP = "gemini-2.5-pro"
+# Aliases where possible: "-latest" always names Google's current model, so a
+# retirement cannot break the standby (checked 2026-10-26: 1.5-flash is gone,
+# 2.5-flash answers 404 "no longer available to new users"). Chosen by a
+# measurement the same day, three tool calls each with a 20 s limit:
+#     gemini-flash-lite-latest   0.7-1.2 s, 3 of 3
+#     gemini-3.5-flash           5-7 s, 2 of 3 (one 504)
+#     gemini-flash-latest        504 DEADLINE_EXCEEDED, 0 of 3
+#     gemini-pro-latest          429: no quota on this (free) key
+# A standby must answer now, so the default is Flash-Lite; the deep tier asks
+# Flash first and drops down when it is busy (GeminiProvider.complete).
+# GEMINI_MODEL in .env pins another default.
+GEMINI_MODEL = "gemini-flash-lite-latest"
+GEMINI_MODEL_DEEP = "gemini-flash-latest"
+# Tried when the model asked for and the default are both busy or out of quota.
+GEMINI_MODEL_LAST_RESORT = "gemini-3.5-flash"
+# Per attempt (milliseconds). A busy model answers 504 after ~18 s anyway.
+GEMINI_TIMEOUT_MS = 20_000
+# The placeholder signature Google documents for a function call the model did
+# not make itself (see ToolCall.signature): it skips the signature check.
+GEMINI_FOREIGN_CALL_SIGNATURE = b"skip_thought_signature_validator"
 
 # Thinking depth / token spend: low | medium | high | xhigh | max.
 # "low" is the right setting for latency-sensitive conversational work;
@@ -321,6 +355,39 @@ THINKING_TOOLS = {"type": "adaptive"}
 # How many past turns (1 turn = 1 user message + 1 reply) to resend.
 # The context window is large; this is about cost and latency, not limits.
 MAX_HISTORY_TURNS = 12
+
+# ...and how much text they may be. A turn count alone let a long chat - pasted
+# text, long answers, search results written out - resend tens of thousands of
+# tokens with every call, and a tool loop makes several calls per question.
+# Earlier messages are cut to a size (the newest exchange less, since "and the
+# second one?" needs it), then the oldest are dropped until the whole fits.
+# A file's "[System Context: ...]" line is never cut: it is how a follow-up
+# finds the file again - the model re-reads what it needs with its tools
+# instead of carrying the document from turn to turn.
+HISTORY_CHAR_BUDGET = 16_000   # all earlier turns together, about 4k tokens
+HISTORY_MESSAGE_CHARS = 2_000  # one earlier message
+HISTORY_LAST_CHARS = 6_000     # each message of the newest exchange
+
+# How long a failover that should pass lasts before Anthropic is tried again
+# (see LLMBrain._maybe_fail_back). Kinds not listed hold until restart.
+FAILBACK_SECONDS = {"billing": 15 * 60, "rate_limit": 60, "server": 60}
+
+# Notes the brain itself adds to a message, kept whole when the message is cut:
+# where an attached file is (api_server.py / attachments.py) and what already
+# ran in the background (LLMBrain.ask).
+_KEPT_NOTES = re.compile(r"\[(?:System Context|Already dispatched)[^\]]*\]")
+
+
+def _shorten(text: str, limit: int) -> str:
+    """`text` cut to about `limit` characters, its kept notes intact and the cut said."""
+    if len(text) <= limit:
+        return text
+    notes = _KEPT_NOTES.findall(text)
+    body = _KEPT_NOTES.sub(" ", text).strip()
+    room = max(200, limit - sum(len(note) + 2 for note in notes))
+    if len(body) > room:
+        body = f"{body[:room].rstrip()} [... {len(body) - room} more characters left out of the history]"
+    return "\n\n".join(part for part in (body, *notes) if part)
 
 # How many tool round trips one question may take before the supervisor
 # gives up. Each step is a full API call, so this is a latency ceiling
@@ -558,6 +625,8 @@ REALTIME_RULE = (
     "call {search} straight away, adding the location above to the query whenever the "
     "answer depends on place. Never say you lack a weather, news or maps tool, and never "
     "tell the user to check for themselves: search, then answer from what you found.{read} "
+    "Answer from the first useful results - two searches at most - instead of searching again "
+    "for a perfect one: every extra search makes the answer slower and dearer. "
     "If the search fails or finds nothing useful, say so in one sentence instead of guessing."
 )
 
@@ -2093,6 +2162,10 @@ class ToolCall:
     id: str
     name: str
     args: dict[str, Any]
+    # Gemini 3 models sign each function call ("thought signature") and refuse the
+    # next request - 400 - unless the call goes back with its signature. Opaque
+    # bytes, carried for Gemini only; None for calls from any other provider.
+    signature: Optional[bytes] = None
 
 
 @dataclass
@@ -2136,13 +2209,39 @@ class ProviderError(Exception):
     @property
     def is_fatal_for_provider(self) -> bool:
         """
-        True when retrying this provider cannot help.
-
-        Only these justify switching providers. Rate limits, 5xx, and
-        connection errors are transient - the SDK already retries them,
-        and failing over would hide a blip behind a different bill.
+        True when retrying this provider cannot help: a rejected key or
+        model, no SDK, or an account out of credit.
         """
-        return self.kind in ("auth", "permission", "not_found", "no_key", "no_sdk")
+        return self.kind in ("auth", "permission", "not_found", "no_key", "no_sdk", "billing")
+
+    @property
+    def standby_can_help(self) -> bool:
+        """
+        True when the other provider may answer what this one could not:
+        every fatal kind, plus the limits on this provider's side that pass
+        by themselves (a rate limit, an overload, a 5xx). Not a bad request
+        or a lost network - the standby would fail those the same way.
+        """
+        return self.is_fatal_for_provider or self.kind in ("rate_limit", "server")
+
+
+def _out_of_credit(exc: Exception) -> bool:
+    """
+    True for an Anthropic error that means the account has no credit left.
+    Anthropic sends that as a 400 invalid_request_error ("Your credit balance
+    is too low ...", seen 2026-10-26), or as 402 / billing_error. Matched on
+    those exact signals, not the word "billing": a tool schema with a
+    `billing_cycle` field can appear in an ordinary 400's message.
+    """
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    kind = error.get("type") if isinstance(error, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return (
+        getattr(exc, "status_code", None) == 402
+        or kind == "billing_error"
+        or "credit balance" in str(message or exc).lower()
+    )
 
 
 # =====================================================================
@@ -2438,6 +2537,9 @@ class AnthropicProvider(_Provider):
             return ProviderError(
                 "rate_limit", "I'm being rate limited. Give me a moment and ask again."
             )
+        if _out_of_credit(exc):
+            # Before BadRequestError: Anthropic reports an empty balance as a 400.
+            return ProviderError("billing", "My Anthropic account is out of credit.")
         if isinstance(exc, anthropic.BadRequestError):
             return ProviderError(
                 "bad_request", "That request was rejected as invalid. See the console."
@@ -2481,7 +2583,16 @@ class GeminiProvider(_Provider):
             return
 
         try:
-            self._client = genai.Client(api_key=key)
+            # The SDK's own retry backs off for minutes on a busy model (a single
+            # "hi" took 218 s on 2026-10-26). A standby has to answer now: no
+            # SDK retry, a bounded wait, and the next model is the retry (complete()).
+            self._client = genai.Client(
+                api_key=key,
+                http_options=genai_types.HttpOptions(
+                    timeout=GEMINI_TIMEOUT_MS,
+                    retry_options=genai_types.HttpRetryOptions(attempts=1),
+                ),
+            )
         except Exception as exc:  # noqa: BLE001
             self.unavailable_reason = f"could not create the Gemini client: {exc}"
 
@@ -2523,7 +2634,11 @@ class GeminiProvider(_Provider):
                     genai_types.Part(
                         function_call=genai_types.FunctionCall(
                             name=call.name, args=call.args
-                        )
+                        ),
+                        # Gemini 3 wants each call back with its signature. A call
+                        # it did not make (Claude's, before a failover in the same
+                        # question) gets the placeholder Google documents for that.
+                        thought_signature=call.signature or GEMINI_FOREIGN_CALL_SIGNATURE,
                     )
                     for call in turn.calls
                 )
@@ -2574,14 +2689,26 @@ class GeminiProvider(_Provider):
                 genai_types.AutomaticFunctionCallingConfig(disable=True)
             )
 
-        try:
-            response = self._client.models.generate_content(
-                model=model or self._model,
-                contents=self._to_contents(transcript),
-                config=genai_types.GenerateContentConfig(**config_kwargs),
-            )
-        except Exception as exc:  # noqa: BLE001 - classified immediately below
-            raise self._classify(exc) from exc
+        # The asked-for model first; if it is out of quota (a free key has no Pro),
+        # withdrawn or overloaded (503 "high demand", 504), the default, then the
+        # last resort - rather than no answer at all.
+        response = None
+        targets = list(dict.fromkeys([model or self._model, self._model, GEMINI_MODEL_LAST_RESORT]))
+        for target in targets:
+            try:
+                response = self._client.models.generate_content(
+                    model=target,
+                    contents=self._to_contents(transcript),
+                    config=genai_types.GenerateContentConfig(**config_kwargs),
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - classified immediately below
+                error = self._classify(exc)
+                if target == targets[-1] or error.kind not in ("rate_limit", "not_found", "server"):
+                    raise error from exc
+                following = targets[targets.index(target) + 1]
+                print(f"[Brain] Gemini {target} unavailable ({error.kind}); trying {following}.")
+        assert response is not None
 
         usage = getattr(response, "usage_metadata", None)
         if usage is not None:
@@ -2611,6 +2738,7 @@ class GeminiProvider(_Provider):
                             id=f"gemini_{index}_{len(calls)}_{call.name}",
                             name=call.name,
                             args=dict(call.args or {}),
+                            signature=getattr(part, "thought_signature", None),
                         )
                     )
             break  # only the first candidate is ever used
@@ -2724,6 +2852,9 @@ class LLMBrain:
         # Set once the provider is chosen and again on failover, because
         # sending "claude-opus-5" to Gemini is a 404.
         self._route_key = "anthropic"
+        # When a failover that should pass (credit, rate limit - FAILBACK_SECONDS)
+        # gives Anthropic another try: a time.monotonic() value, or None.
+        self._failback_at: Optional[float] = None
 
         # Feature 5: plugins are loaded now and re-scanned every turn.
         self._plugin_tools: list[ToolSpec] = []
@@ -2908,17 +3039,26 @@ class LLMBrain:
 
     def _trim_history(self) -> None:
         """
-        Keeps the most recent turns.
+        Keeps the most recent turns, within HISTORY_* characters.
 
-        Both providers require the transcript to open on a user turn, so
-        trim to that boundary rather than slicing blindly.
+        At most MAX_HISTORY_TURNS turns; each earlier message cut to
+        HISTORY_MESSAGE_CHARS (the newest exchange to HISTORY_LAST_CHARS);
+        then the oldest messages dropped until the whole is within
+        HISTORY_CHAR_BUDGET. Both providers require the transcript to open
+        on a user turn, so trimming ends on that boundary.
         """
         max_messages = self._max_history_turns * 2
-        if len(self._history) <= max_messages:
-            return
-        self._history = self._history[-max_messages:]
-        while self._history and self._history[0].kind != "user":
-            self._history.pop(0)
+        history = self._history[-max_messages:]
+        newest = len(history) - 2
+        history = [
+            replace(turn, text=_shorten(turn.text, HISTORY_LAST_CHARS if index >= newest else HISTORY_MESSAGE_CHARS))
+            for index, turn in enumerate(history)
+        ]
+        while len(history) > 2 and sum(len(turn.text) for turn in history) > HISTORY_CHAR_BUDGET:
+            history.pop(0)
+        while history and history[0].kind != "user":
+            history.pop(0)
+        self._history = history
 
     def reset(self) -> None:
         """Clears conversation memory - a fresh topic, same session."""
@@ -3112,22 +3252,51 @@ class LLMBrain:
             )
         return f"{question} The code is printed in the console."
 
-    def _failover(self) -> bool:
+    def _failover(self, kind: str = "") -> bool:
         """
         Switches to the standby provider. Returns False if there isn't one.
+
+        `kind` (why the active provider failed) sets how long the switch
+        lasts: an out-of-credit or rate-limited Anthropic is tried again
+        after FAILBACK_SECONDS (see _maybe_fail_back); anything else holds
+        until restart.
         """
         standby = self._secondary if self._provider is self._primary else self._primary
         if not standby.available:
             return False
+        if standby is self._primary and self._failback_at is not None and time.monotonic() < self._failback_at:
+            # Anthropic is in its timeout (no credit, rate limited) - sending this
+            # back there only turns a busy Gemini into a certain failure.
+            return False
 
         previous = self._provider.name if self._provider else "none"
-        self._provider = standby
-        # Vision follows the active provider, and so does the route table.
-        global _VISION_PROVIDER
-        _VISION_PROVIDER = standby
-        self._route_key = "anthropic" if standby is self._primary else "gemini"
-        print(f"[Brain] FAILOVER: {previous} -> {standby.name} ({standby.model}).")
+        self._use(standby)
+        wait = FAILBACK_SECONDS.get(kind) if standby is self._secondary else None
+        self._failback_at = time.monotonic() + wait if wait else None
+        later = f"; trying {previous} again in {wait // 60 or 1} min" if wait else ""
+        print(f"[Brain] FAILOVER: {previous} -> {standby.name} ({standby.model}){later}.")
         return True
+
+    def _use(self, provider: _Provider) -> None:
+        """Makes `provider` the active one. Vision follows it, and so does the route table."""
+        global _VISION_PROVIDER
+        self._provider = provider
+        _VISION_PROVIDER = provider
+        self._route_key = "anthropic" if provider is self._primary else "gemini"
+
+    def _maybe_fail_back(self) -> None:
+        """
+        Back to Anthropic once a temporary failover has run its time. Called
+        once per question, before it is routed, so a question is never split
+        between providers by the clock. If Anthropic still cannot answer,
+        the next call simply fails over again.
+        """
+        if self._failback_at is None or time.monotonic() < self._failback_at:
+            return
+        self._failback_at = None
+        if self._provider is not self._primary and self._primary.available:
+            print(f"[Brain] Trying {self._primary.name} again after a temporary failover.")
+            self._use(self._primary)
 
     # -- the supervisor loop -------------------------------------------
 
@@ -3272,6 +3441,10 @@ class LLMBrain:
                 "My language model isn't configured. Add an Anthropic or Gemini "
                 "API key to the .env file and restart me. The console has the steps."
             )
+
+        # A temporary failover (no credit, rate limited) that has run its time:
+        # this question goes to Anthropic again.
+        self._maybe_fail_back()
 
         # Feature 5: pick up any tool written during the previous turn.
         self._refresh_plugins()
@@ -3427,17 +3600,23 @@ class LLMBrain:
         else:
             prompt = system
 
+        # The model was chosen when the question was routed (_route), maybe on the
+        # other provider - a failover earlier in this same question. A name meant
+        # for the other provider is dropped ("claude-opus-5" sent to Gemini is a 404),
+        # which leaves this provider's default model.
+        if model is not None and model.startswith("gemini") != (self._provider.name == "gemini"):
+            model = None
+
         try:
             return self._provider.complete(prompt, working, tools, model, effort, context)
         except ProviderError as exc:
-            if not exc.is_fatal_for_provider:
+            if not exc.standby_can_help:
                 raise
-            print(f"[Brain] {self._provider.name} is unusable ({exc.kind}): {exc.spoken}")
-            if not self._failover():
+            print(f"[Brain] {self._provider.name} cannot answer ({exc.kind}): {exc.spoken}")
+            if not self._failover(exc.kind):
                 raise
             # The standby provider names its models differently, so the
-            # Anthropic-flavoured override is dropped rather than sent
-            # somewhere it means nothing.
+            # override is dropped rather than sent somewhere it means nothing.
             return self._provider.complete(prompt, working, tools, None, effort, context)
 
 
