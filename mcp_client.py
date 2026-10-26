@@ -123,6 +123,11 @@ MAX_NAME = 64                # Anthropic: ^[a-zA-Z0-9_-]{1,64}$
 MAX_DESCRIPTION = 1000
 MAX_INSTRUCTIONS = 600       # what is kept of a server's own "how to use me" text
 
+# A server's stderr is its own business (the last lines are kept for when it dies),
+# except a line that says ERROR or WARNING: that is printed on the console, so a tool
+# that is failing - web search refused, a search that found nothing - shows up there.
+_LOUD_STDERR = re.compile(r"\b(ERROR|WARNING)\b")
+
 _CONFIG_NAME = "mcp_servers.json"
 # The hidden argument that carries the caller to a user-scoped server (mcp_stdio.SCOPE_ARG).
 _SCOPE_ARG = "_scope"
@@ -516,6 +521,11 @@ class McpConnection:
                 text = raw.decode("utf-8", errors="replace").rstrip()
                 if text:
                     self._stderr_tail = (self._stderr_tail + [text])[-5:]
+                    if _LOUD_STDERR.search(text):
+                        try:
+                            _log(f"[MCP] {self.config.name}: {text[:1000]}")
+                        except Exception:  # noqa: BLE001 - printing must never stop this thread draining the pipe
+                            pass
         except (OSError, ValueError):
             pass
         finally:

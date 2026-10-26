@@ -34,10 +34,33 @@ not the page. Results are cut to a fixed size so a long one cannot swamp the
 conversation, and mcp_client.py labels everything this returns as external data
 (a web page can contain text that tries to give the assistant orders).
 
-Failures (no network, DuckDuckGo refusing a burst of requests, a timeout) come
-back as a tool result with isError set, so the model can say so; they never
-crash the server. Logging goes to stderr; stdout carries protocol messages and
-nothing else.
+WHEN IT FINDS NOTHING OR FAILS. Every such answer tells the model in so many words
+not to search again and what to tell the person - "Do not retry the search tool".
+An answer that said "try again" was taken literally: the model searched again and
+again until the brain's step limit ended the turn with "I went back and forth on
+that too many times". The cases:
+
+    no results      a normal tool result ("returned no results ... do not retry"),
+                    given only after the server itself has tried once more (ddgs
+                    is empty now and then for a query that has results, _search).
+                    ddgs raises instead of returning an empty list, and the error
+                    it raises is whichever engine failed last - with the region
+                    "wt-wt" its Wikipedia lookup always fails (wt.wikipedia.org
+                    does not exist) - so "found nothing" and "nothing answered"
+                    look alike there; both are reported as no results for this
+                    query, and the same words are not searched again for
+                    EMPTY_REPEAT_SECONDS.
+    rate limited,   isError, "the search is currently unavailable". The search then
+    timed out,      stays off for a cooldown (COOLDOWN_SECONDS, longer after a rate
+    no connection   limit): a retry within it is answered at once, without asking
+                    DuckDuckGo - more requests during a rate limit only make it
+                    last longer. The first search that works ends it.
+    not installed   isError, with the pip command.
+
+None of them crash the server. Logging goes to stderr; stdout carries protocol
+messages and nothing else. Lines that say ERROR or WARNING - every failure and
+every empty search - are also printed on the Jarvis console by mcp_client.py
+(it keeps the rest of a server's stderr to itself).
 """
 
 from __future__ import annotations
@@ -46,11 +69,12 @@ import json
 import re
 import sys
 import threading
+import time
 import warnings
 from typing import Any, Callable, Optional
 
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "jarvis-websearch", "version": "1.0.0"}
+SERVER_INFO = {"name": "jarvis-websearch", "version": "1.1.0"}
 
 DEFAULT_RESULTS = 5
 MAX_RESULTS = 10
@@ -65,6 +89,25 @@ MAX_REPLY_CHARS = 7000
 REQUEST_TIMEOUT = 10
 DEADLINE_SECONDS = 22.0
 DEFAULT_REGION = "wt-wt"
+# After a failure the search stays off this long (see WHEN IT FINDS NOTHING above).
+COOLDOWN_SECONDS = 45.0
+RATELIMIT_COOLDOWN_SECONDS = 120.0
+# The same words that just found nothing are not searched again within this window.
+EMPTY_REPEAT_SECONDS = 300.0
+MAX_REMEMBERED_EMPTY = 100
+# An empty answer is tried once more (see _search) only if this much of the deadline is left.
+RETRY_MIN_SECONDS = 8.0
+
+# Live run 2026-10-26: told only "do not retry", the model still searched again with
+# other words, so the sentence says that too.
+DO_NOT_RETRY = "Do not retry the search tool for this question, not even with different words."
+# Why a search failed, as the model is told it (and the person, in its words).
+_FAILURE_REASONS = {
+    "ratelimit": "DuckDuckGo is refusing searches for now (rate limit)",
+    "timeout": "the search took too long to answer",
+    "unavailable": "no connection, or the search service did not answer",
+    "missing": "web search is not installed on this machine (pip install ddgs)",
+}
 
 _TIME_RANGES = {"day": "d", "week": "w", "month": "m", "year": "y"}
 _REGION = re.compile(r"^[a-z]{2}-[a-z]{2}$")
@@ -111,6 +154,11 @@ def log(message: str) -> None:
     print(f"[mcp-websearch] {message}", file=sys.stderr, flush=True)
 
 
+def log_problem(level: str, message: str) -> None:
+    """An ERROR or WARNING line: mcp_client.py shows these on the Jarvis console."""
+    log(f"{level}: {message}")
+
+
 def text_result(text: str, *, is_error: bool = False) -> dict:
     result: dict = {"content": [{"type": "text", "text": text}]}
     if is_error:
@@ -119,7 +167,38 @@ def text_result(text: str, *, is_error: bool = False) -> dict:
 
 
 class SearchError(Exception):
-    """A failure the model should hear about, worded for it."""
+    """
+    A search that produced no answer. `kind` decides what the model is told: "empty"
+    (nothing found), "nothing" (no engine gave a result and one failed - see the module
+    docstring), "ratelimit", "timeout", "unavailable" or "missing". `detail` is the
+    underlying error, for the log only.
+    """
+
+    def __init__(self, kind: str, detail: str = "") -> None:
+        super().__init__(detail or kind)
+        self.kind = kind
+        self.detail = detail
+
+
+def _classify(exc: BaseException) -> SearchError:
+    """What a library or network exception means for the person asking."""
+    if isinstance(exc, SearchError):
+        return exc
+    name = type(exc).__name__.lower()
+    text = str(exc)
+    lowered = text.lower()
+    detail = f"{type(exc).__name__}: {text}"[:500]
+    if "ratelimit" in name or "ratelimit" in lowered or "rate limit" in lowered:
+        return SearchError("ratelimit", detail)
+    if "timeout" in name or "timed out" in lowered:
+        return SearchError("timeout", detail)
+    if "no results found" in lowered:
+        return SearchError("empty", detail)
+    # ddgs's own exception, raised when no engine returned anything and at least one
+    # failed: it carries the last engine's error, which says nothing about the others.
+    if name == "ddgsexception":
+        return SearchError("nothing", detail)
+    return SearchError("unavailable", detail)
 
 
 # =====================================================================
@@ -142,9 +221,7 @@ def _load_ddgs() -> Any:
 
         return DDGS
     except ImportError:
-        raise SearchError(
-            "Web search is not installed on this machine. Install it with: pip install ddgs"
-        ) from None
+        raise SearchError("missing", "neither ddgs nor duckduckgo_search is installed") from None
 
 
 def _fetch(query: str, count: int, region: str, timelimit: Optional[str]) -> list[dict[str, Any]]:
@@ -152,16 +229,8 @@ def _fetch(query: str, count: int, region: str, timelimit: Optional[str]) -> lis
     try:
         client = DDGS(timeout=REQUEST_TIMEOUT)
         return list(client.text(query, region=region, safesearch="moderate", timelimit=timelimit, max_results=count))
-    except SearchError:
-        raise
     except Exception as exc:  # noqa: BLE001 - the library raises its own and the network's errors
-        name = type(exc).__name__
-        if "ratelimit" in name.lower() or "rate limit" in str(exc).lower():
-            raise SearchError("DuckDuckGo is limiting searches right now. Try again in a minute.") from None
-        if "timeout" in name.lower() or "timed out" in str(exc).lower():
-            raise SearchError("The search timed out. Try again.") from None
-        log(f"search failed: {name}: {exc}")
-        raise SearchError("The search failed (no connection, or DuckDuckGo did not answer). Try again.") from None
+        raise _classify(exc) from None
 
 
 def _search_with_deadline(
@@ -170,8 +239,10 @@ def _search_with_deadline(
     region: str,
     timelimit: Optional[str],
     fetch: Callable[[str, int, str, Optional[str]], list[dict[str, Any]]],
+    seconds: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """Runs `fetch` on its own thread so a hung connection cannot hold the server past the deadline."""
+    seconds = DEADLINE_SECONDS if seconds is None else seconds
     box: dict[str, Any] = {}
 
     def run() -> None:
@@ -182,12 +253,97 @@ def _search_with_deadline(
 
     worker = threading.Thread(target=run, name="websearch", daemon=True)
     worker.start()
-    worker.join(DEADLINE_SECONDS)
+    worker.join(seconds)
     if worker.is_alive():
-        raise SearchError("The search timed out. Try again.")
+        raise SearchError("timeout", f"no answer within {seconds:.0f} seconds")
     if "error" in box:
-        raise box["error"]
+        raise _classify(box["error"])
     return box["results"]
+
+
+def _search(
+    query: str,
+    count: int,
+    region: str,
+    timelimit: Optional[str],
+    fetch: Callable[[str, int, str, Optional[str]], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """
+    One search as the model sees it: up to two tries, within one DEADLINE_SECONDS.
+
+    ddgs comes back empty now and then for a query that has plenty of results - it asks
+    a shuffled set of engines, and the ones it reached returned nothing (measured
+    2026-10-26: "latest news thailand" empty in about one run in three, whatever the
+    region). So an empty answer is tried once more here, where it costs a few seconds,
+    instead of being handed to the model, which would either say there is nothing or
+    search again itself. A failure (rate limit, timeout, no connection) is not retried.
+    """
+    started = time.perf_counter()
+    for attempt in (1, 2):
+        remaining = DEADLINE_SECONDS - (time.perf_counter() - started)
+        try:
+            results = _search_with_deadline(query, count, region, timelimit, fetch, remaining)
+        except SearchError as exc:
+            if exc.kind not in ("empty", "nothing"):
+                raise
+            results, why = [], exc.detail or exc.kind
+        else:
+            why = f"{len(results)} result(s), none with a usable link"
+        if _entries(results):
+            return results
+        left = DEADLINE_SECONDS - (time.perf_counter() - started)
+        if attempt == 2 or left < RETRY_MIN_SECONDS:
+            raise SearchError("nothing" if results == [] else "empty", why)
+        log(f"nothing on the first try ({why[:160]}); trying once more")
+    raise SearchError("empty")  # not reached
+
+
+# =====================================================================
+# Not asking again: the cooldown after a failure, and searches that found nothing
+# =====================================================================
+
+# Only the main thread (the stdio loop) reads and writes these.
+_cooldown: dict[str, Any] = {}  # {"until": monotonic time, "kind": ..., "at": monotonic time}
+_recent_empty: dict[tuple, float] = {}
+
+
+def _cooling_down(now: float) -> Optional[dict[str, Any]]:
+    return _cooldown if _cooldown and now < _cooldown["until"] else None
+
+
+def _start_cooldown(kind: str, now: float) -> None:
+    seconds = RATELIMIT_COOLDOWN_SECONDS if kind == "ratelimit" else COOLDOWN_SECONDS
+    _cooldown.update({"until": now + seconds, "kind": kind, "at": now})
+
+
+def _remember_empty(key: tuple, now: float) -> None:
+    for old in [k for k, at in _recent_empty.items() if now - at >= EMPTY_REPEAT_SECONDS]:
+        del _recent_empty[old]
+    while len(_recent_empty) >= MAX_REMEMBERED_EMPTY:
+        del _recent_empty[next(iter(_recent_empty))]
+    _recent_empty[key] = now
+
+
+def _no_results(query: str, why: str = "") -> dict:
+    """Nothing found: a plain result, so the model reports it rather than treating it as a fault to work round."""
+    return text_result(
+        f"Web search returned no results for \"{_clean(query, 80)}\"{why}. {DO_NOT_RETRY} "
+        "Tell the user the search found nothing for it; if you can answer from what you "
+        "already know, do, and say that it is not from a live search."
+    )
+
+
+def _unavailable(kind: str, *, earlier: Optional[float] = None) -> dict:
+    reason = _FAILURE_REASONS.get(kind, _FAILURE_REASONS["unavailable"])
+    later = " and to try again in a few minutes" if kind == "ratelimit" else ""
+    if earlier is None:
+        opening = f"Web search failed: {reason}."
+    else:
+        opening = f"Web search is unavailable right now: it failed {earlier:.0f} seconds ago ({reason})."
+    return text_result(
+        f"{opening} {DO_NOT_RETRY} Tell the user the search is currently unavailable{later}.",
+        is_error=True,
+    )
 
 
 def _clean(value: Any, limit: int) -> str:
@@ -196,24 +352,27 @@ def _clean(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def format_results(query: str, results: list[dict[str, Any]]) -> str:
-    """The numbered list the model reads. Results without a usable http(s) link are dropped."""
+def _entries(results: list[dict[str, Any]]) -> list[str]:
+    """One numbered entry per result. Results without a usable http(s) link are dropped."""
     lines: list[str] = []
-    kept = 0
     for item in results:
         if not isinstance(item, dict):
             continue
         url = _clean(item.get("href") or item.get("url"), MAX_URL_CHARS)
         if not re.match(r"^https?://", url, re.IGNORECASE):
             continue
-        kept += 1
         title = _clean(item.get("title"), MAX_TITLE_CHARS) or url
         snippet = _clean(item.get("body") or item.get("snippet"), MAX_SNIPPET_CHARS)
-        lines.append(f"{kept}. {title}\n   {url}" + (f"\n   {snippet}" if snippet else ""))
+        lines.append(f"{len(lines) + 1}. {title}\n   {url}" + (f"\n   {snippet}" if snippet else ""))
+    return lines
 
-    if not kept:
+
+def format_results(query: str, results: list[dict[str, Any]]) -> str:
+    """The numbered list the model reads (web_search answers an empty one with _no_results instead)."""
+    lines = _entries(results)
+    if not lines:
         return f"No results for \"{_clean(query, 80)}\"."
-    text = f"Web search results for \"{_clean(query, 80)}\" ({kept}):\n\n" + "\n\n".join(lines)
+    text = f"Web search results for \"{_clean(query, 80)}\" ({len(lines)}):\n\n" + "\n\n".join(lines)
     return text if len(text) <= MAX_REPLY_CHARS else text[: MAX_REPLY_CHARS - 1].rstrip() + "…"
 
 
@@ -242,15 +401,44 @@ def web_search(arguments: dict, fetch: Callable[..., list[dict[str, Any]]] = _fe
         if timelimit is None:
             return text_result(f"'{time_range}' is not a time range. Use day, week, month or year.", is_error=True)
 
-    log(f"search {json.dumps(query, ensure_ascii=False)} (n={count}, region={region}, range={time_range or 'any'})")
+    shown = json.dumps(query, ensure_ascii=False)
+    now = time.monotonic()
+
+    # A retry while the search is off, or the same words that just found nothing, are
+    # answered from memory: no request goes out (see WHEN IT FINDS NOTHING at the top).
+    blocked = _cooling_down(now)
+    if blocked:
+        log_problem("WARNING", f"search {shown} not sent: still cooling down after a {blocked['kind']} failure")
+        return _unavailable(blocked["kind"], earlier=now - blocked["at"])
+    key = (query.casefold(), region, timelimit)
+    searched = _recent_empty.get(key)
+    if searched is not None and now - searched < EMPTY_REPEAT_SECONDS:
+        log_problem("WARNING", f"search {shown} not sent: it found nothing {now - searched:.0f}s ago")
+        return _no_results(query, f" (searched {now - searched:.0f} seconds ago)")
+
+    log(f"search {shown} (n={count}, region={region}, range={time_range or 'any'})")
     try:
-        results = _search_with_deadline(query, count, region, timelimit, fetch)
+        results = _search(query, count, region, timelimit, fetch)
     except SearchError as exc:
-        return text_result(str(exc), is_error=True)
+        return _failed(exc, query, shown, key)
     except Exception as exc:  # noqa: BLE001 - a tool answers; it does not raise
-        log(f"search crashed: {type(exc).__name__}: {exc}")
-        return text_result("The search failed unexpectedly. Try again.", is_error=True)
+        return _failed(SearchError("unavailable", f"{type(exc).__name__}: {exc}"[:500]), query, shown, key)
+
+    _cooldown.clear()  # it works again
     return text_result(format_results(query, results))
+
+
+def _failed(exc: SearchError, query: str, shown: str, key: tuple) -> dict:
+    """Logs a search that gave no answer and words it for the model (see the top of the file)."""
+    now = time.monotonic()
+    if exc.kind in ("empty", "nothing"):
+        log_problem("WARNING", f"no results for {shown} ({exc.detail or exc.kind})")
+        _remember_empty(key, now)
+        return _no_results(query)
+    log_problem("ERROR", f"search {shown} failed ({exc.kind}): {exc.detail or exc.kind}")
+    if exc.kind != "missing":  # a missing package does not come back by waiting
+        _start_cooldown(exc.kind, now)
+    return _unavailable(exc.kind)
 
 
 HANDLERS = {"web_search": web_search}
@@ -304,8 +492,15 @@ def handle(message: dict) -> None:
         try:
             respond(request_id, result=handler(arguments))
         except Exception as exc:  # noqa: BLE001 - a bug in a tool must not take the server down
-            log(f"{name} crashed: {type(exc).__name__}: {exc}")
-            respond(request_id, result=text_result("The search tool hit an internal error.", is_error=True))
+            log_problem("ERROR", f"{name} crashed: {type(exc).__name__}: {exc}")
+            respond(
+                request_id,
+                result=text_result(
+                    f"The search tool hit an internal error. {DO_NOT_RETRY} "
+                    "Tell the user the search is currently unavailable.",
+                    is_error=True,
+                ),
+            )
     else:
         respond(request_id, error={"code": -32601, "message": f"Method not found: {method}"})
 
