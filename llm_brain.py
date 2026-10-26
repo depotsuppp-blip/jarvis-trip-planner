@@ -91,6 +91,13 @@ Several things were added to this module beyond plain tool calling:
       requests on. JARVIS_MCP=0 turns it off, JARVIS_MCP_CORE=0 turns off
       just the bundled ones.
 
+  WHEN AND WHERE  every call tells the model the date, the time and the
+      user's location (Bangkok, Thailand unless JARVIS_LOCATION and
+      JARVIS_TIMEZONE say otherwise) in a short system block after the
+      cached persona - and, when a web search tool is connected, that it
+      must search for anything real-time (weather, news, prices, places)
+      instead of saying it has no tool for it (turn_context, REALTIME_RULE).
+
 -------------------------------------------------------------------
 PROVIDERS
 -------------------------------------------------------------------
@@ -150,6 +157,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable, Optional
 
 import link_guard
@@ -390,8 +398,9 @@ Use the tools like this:
 
 - Decide first whether a tool is actually needed. Most questions are \
 just questions; reach for a tool only when the answer depends on the \
-current state of one of those systems, or when the user is asking for \
-something to be run or logged.
+current state of one of those systems, on real-time information (see the \
+real-time rule at the end), or when the user is asking for something to \
+be run or logged.
 - When you log something, extract every field the user actually said \
 and leave out the ones they did not. Never invent an amount, a date, \
 or a category to fill a slot - an unset field is fine, a wrong one is \
@@ -521,6 +530,77 @@ within 200 characters, in plain words that sound natural spoken. That limit \
 is for conversation only: when the task needs more (search results, a plan, \
 what is in a file) write what it needs - it is shown on screen and not read \
 aloud."""
+
+# ---------------------------------------------------------------------
+# Where and when: told to the model on every turn
+# ---------------------------------------------------------------------
+# A model knows neither today's date nor where its user is, so "what's the weather?"
+# got "where are you?" or "I have no weather tool" instead of an answer. Every call
+# now carries one short block that says both (turn_context), and - when a web search
+# tool is connected - the rule to search for anything real-time (REALTIME_RULE).
+#
+# That block goes AFTER the persona as a separate system block (see the providers'
+# `context`), never into it: the persona carries the prompt-cache breakpoint, and a
+# clock inside it would make every turn a cache miss.
+#
+# JARVIS_LOCATION and JARVIS_TIMEZONE (an IANA name) change the defaults.
+DEFAULT_LOCATION = "Bangkok, Thailand"
+DEFAULT_TIMEZONE = "Asia/Bangkok"
+# Thailand has had no daylight saving since 1920, so a fixed offset is exact. It is the
+# fallback when the IANA database is missing - Windows has none unless the `tzdata`
+# package is installed, and slim Docker images may lack it too.
+_FIXED_ZONES = {"Asia/Bangkok": timezone(timedelta(hours=7), "ICT")}
+
+REALTIME_RULE = (
+    "Real-time information: when the user asks about anything that changes or that you "
+    "cannot know from training - the weather or a forecast, news and current events, prices "
+    "and exchange rates, opening hours, places nearby, sports results, traffic - you MUST "
+    "call {search} straight away, adding the location above to the query whenever the "
+    "answer depends on place. Never say you lack a weather, news or maps tool, and never "
+    "tell the user to check for themselves: search, then answer from what you found.{read} "
+    "If the search fails or finds nothing useful, say so in one sentence instead of guessing."
+)
+
+
+def _zone(name: str) -> tzinfo:
+    """The IANA zone `name`, its fixed-offset stand-in, or this machine's own zone."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError, a bad name, no database
+        fixed = _FIXED_ZONES.get(name)
+        if fixed is not None:
+            return fixed
+        local = datetime.now().astimezone().tzinfo
+        return local if local is not None else timezone.utc
+
+
+def turn_context(now: Optional[datetime] = None) -> str:
+    """One sentence pair: what time it is where the user is, and where that is."""
+    location = os.environ.get("JARVIS_LOCATION", "").strip() or DEFAULT_LOCATION
+    zone_name = os.environ.get("JARVIS_TIMEZONE", "").strip() or DEFAULT_TIMEZONE
+    moment = (now or datetime.now(timezone.utc)).astimezone(_zone(zone_name))
+    offset = moment.strftime("%z") or "+0000"
+    stamp = (
+        f"{moment:%A} {moment.day} {moment:%B %Y}, {moment:%H:%M} "
+        f"({zone_name}, UTC{offset[:3]}:{offset[3:]})"
+    )
+    return (
+        f"Right now it is {stamp}. The user is in {location} unless they say otherwise: "
+        "use that for anything that depends on place - the weather, local news, opening "
+        "hours, places nearby, travel times - and do not ask where they are."
+    )
+
+
+def realtime_rule(tools: list[ToolSpec]) -> str:
+    """REALTIME_RULE naming this turn's web search tool (and page reader), or "" when there is none."""
+    search = next((t.name for t in tools if t.name == "web_search" or t.name.endswith("__web_search")), None)
+    if search is None:
+        return ""
+    reader = next((t.name for t in tools if t.name.endswith("__fetch_url")), None)
+    read = f" If a result's snippet is not enough, read that page with {reader}." if reader else ""
+    return REALTIME_RULE.format(search=f"the {search} tool", read=read)
 
 # What the brain does when a reply holds a trip link or id that no tool returned
 # during this request (link_guard.py says which): it is not sent. The model gets
@@ -730,7 +810,14 @@ _TOOL_WORDS: tuple[str, ...] = (
     # answered by a tool-less model ("Done!") while nothing is deleted costs more.
     "remember", "recall", "forget", "fetch", "url", "website", "webpage",
     "csv", "spreadsheet", "dataset", "sql",
+    # Real-time questions: the web search tool answers them (REALTIME_RULE), the
+    # tool-less front door cannot.
+    "weather", "forecast", "news", "headlines",
 )
+
+# The same for Thai, as substrings: weather / news / forecast. ("อากาศ" is also in
+# "air conditioner"; a tool-capable model answering that costs nothing.)
+_REALTIME_SUBSTRINGS: tuple[str, ...] = ("อากาศ", "ข่าว", "พยากรณ์")
 
 # Thai has no spaces between words, so these are matched as substrings, like
 # _TRIP_SUBSTRINGS below: remember / help me remember / forget / do you remember.
@@ -849,6 +936,15 @@ def _classify_intent(text: str) -> tuple[str, str]:
 
 _FRONT_DOOR_INTENTS = ("CHAT", "TRIP_PLANNING")
 
+# Added to the router's prompt when the assistant behind it can search the web: without
+# it the cheap model answered "what's the weather?" itself - "I don't have a weather tool".
+_FRONT_DOOR_REALTIME = (
+    "\n- Real-time information - the weather, news, prices, opening hours, places nearby, "
+    "anything that changes - is found by a web search the assistant behind you can do: "
+    "route_to \"ORCHESTRATOR\" with response null. Never answer it from memory, and never "
+    "say that no tool can do it."
+)
+
 # A web address in the utterance: "what does https://... say", "summarise www.example.com".
 _HAS_LINK = re.compile(r"\bhttps?://|\bwww\.[a-z0-9-]", re.IGNORECASE)
 _FRONT_DOOR_ROUTES = ("SELF", "ORCHESTRATOR")
@@ -930,7 +1026,7 @@ def _looks_like_tool_command(text: str) -> bool:
         return True
     if any(word in _TOOL_WORDS for word in lowered.split()):
         return True
-    if any(fragment in text for fragment in _MEMORY_SUBSTRINGS):
+    if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
     return _mentions_trip(text) or _asks_system_status(text)
@@ -2074,7 +2170,14 @@ class _Provider:
         tools: list[ToolSpec],
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        context: str = "",
     ) -> Turn:
+        """
+        One model call. `system` is the persona - the same text on every call, so a
+        provider can cache it; `context` is what changes from turn to turn (the
+        date, the place, rules that depend on this turn's tools - see turn_context),
+        sent after it.
+        """
         raise NotImplementedError
 
     def describe_image(self, question: str, image_b64: str, media_type: str) -> str:
@@ -2182,6 +2285,7 @@ class AnthropicProvider(_Provider):
         tools: list[ToolSpec],
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        context: str = "",
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Anthropic model isn't configured.")
@@ -2201,7 +2305,10 @@ class AnthropicProvider(_Provider):
             # so it costs nothing to always set.
             "system": [
                 {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
-            ],
+            ]
+            # The per-turn block (date, place, ...) goes after the breakpoint, so the
+            # cached prefix - tools and persona - stays byte-identical turn after turn.
+            + ([{"type": "text", "text": context}] if context else []),
             "thinking": THINKING_TOOLS if tools else THINKING_PLAIN,
             "output_config": {"effort": effort or self._effort},
             "messages": self._to_messages(transcript),
@@ -2449,12 +2556,13 @@ class GeminiProvider(_Provider):
         tools: list[ToolSpec],
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        context: str = "",
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Gemini model isn't configured.")
 
         config_kwargs: dict[str, Any] = {
-            "system_instruction": system,
+            "system_instruction": f"{system}\n\n{context}" if context else system,
             "max_output_tokens": self._max_tokens,
         }
         if tools:
@@ -2781,6 +2889,7 @@ class LLMBrain:
             + "\n  A request one of them could answer - reading a link, a question about the user's "
             + "own life, people or preferences that a memory could hold, asking to remember or forget "
             + "something, numbers in a data file - is route_to \"ORCHESTRATOR\" with response null."
+            + (_FRONT_DOOR_REALTIME if any(t.name.endswith("__web_search") for t in self._mcp_tools) else "")
         )
 
     def _refresh_plugins(self, verbose: bool = False) -> None:
@@ -3299,7 +3408,14 @@ class LLMBrain:
         """
         assert self._provider is not None
         tools = self._active_tools() if tools is None else tools
+        # When and where, on every call - the front door's too, which is what answers
+        # "what day is it?" - plus, for the persona, the real-time rule when this
+        # call can search the web.
+        context = turn_context()
         if system is None:
+            rule = realtime_rule(tools)
+            if rule:
+                context += "\n\n" + rule
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
@@ -3312,7 +3428,7 @@ class LLMBrain:
             prompt = system
 
         try:
-            return self._provider.complete(prompt, working, tools, model, effort)
+            return self._provider.complete(prompt, working, tools, model, effort, context)
         except ProviderError as exc:
             if not exc.is_fatal_for_provider:
                 raise
@@ -3322,7 +3438,7 @@ class LLMBrain:
             # The standby provider names its models differently, so the
             # Anthropic-flavoured override is dropped rather than sent
             # somewhere it means nothing.
-            return self._provider.complete(prompt, working, tools, None, effort)
+            return self._provider.complete(prompt, working, tools, None, effort, context)
 
 
 if __name__ == "__main__":
