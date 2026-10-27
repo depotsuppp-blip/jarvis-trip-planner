@@ -61,11 +61,18 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  * The status door (getJarvisStatus) is what the hub's sidebar shows as "Agents & tools":
  *
  *   GET {JARVIS_HEALTH_URL}   default: JARVIS_BRAIN_URL with its /chat swapped for /health
- *   reply { ok: boolean, mcp_servers: [{ name, connected, tools: string[], error }], ... }
+ *   reply { ok: boolean, mcp_servers: [{ name, connected, tools: string[], error }],
+ *           manager: { provider, model, on_standby, primary: { provider, model, state, last_error?, back_in? } },
+ *           agents: [{ name, title, tool, active, routes: [{ role, provider, model, state, why?, last_error? }],
+ *                      tools: string[] }], ... }
  *
  *   ok = the brain has a language model to answer with. mcp_servers = its tool
  *   servers (web search, memory, ...) as they are right now; `error` is for the
- *   logs, never the page.
+ *   logs, never the page. manager = the brain's own model (Claude, or the Gemini
+ *   standby and why); agents = the specialist agents it delegates to (Python
+ *   agents/), each with its routes in order and the MCP tools it holds. A brain
+ *   from before the agents sends neither, and the sidebar then shows none.
+ *   Free text (`why`, `error`) never leaves this file: it can hold local paths.
  */
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };
@@ -221,13 +228,117 @@ export interface BrainToolServer {
   tools: number;
 }
 
+/** How one model route is: answering, resting after a failure (credit, quota, rate limit), failed until restart, or without a key. */
+export type BrainRouteState = "ready" | "resting" | "failed" | "not configured";
+
+export interface BrainRoute {
+  role: "primary" | "fallback" | "last resort";
+  /** "anthropic", "gemini", "openai", "groq". */
+  provider: string;
+  model: string;
+  state: BrainRouteState;
+  /** Why it last failed, as a kind ("billing", "quota", "rate_limit", ...). */
+  lastError?: string;
+}
+
+/** One specialist agent (Python agents/). */
+export interface BrainAgent {
+  /** "data", "research", "productivity". */
+  name: string;
+  title: string;
+  /** It is taking tasks; when false the manager does its work itself. */
+  active: boolean;
+  routes: BrainRoute[];
+  /** The tool servers whose tools it holds. */
+  servers: string[];
+}
+
+/** The manager's own model: Claude, or the Gemini standby and why. */
+export interface BrainManager {
+  provider: string;
+  model: string;
+  onStandby: boolean;
+  primary: { provider: string; model: string; state: BrainRouteState; lastError?: string; backInSeconds?: number };
+}
+
 export interface BrainStatus {
   /** The brain has a language model to answer with. */
   ready: boolean;
   servers: BrainToolServer[];
+  /** Null from a brain that does not report it. */
+  manager: BrainManager | null;
+  /** Empty with the team off, or from a brain without one. */
+  agents: BrainAgent[];
 }
 
 const SERVER_NAME = /^[a-z0-9_]{1,64}$/;
+const PROVIDER = /^[a-z0-9_-]{1,32}$/;
+const MODEL = /^[A-Za-z0-9._:/-]{1,80}$/;
+const ERROR_KIND = /^[a-z_]{1,32}$/;
+const ROLES = ["primary", "fallback", "last resort"] as const;
+const ROUTE_STATES: readonly BrainRouteState[] = ["ready", "resting", "failed", "not configured"];
+const MCP_TOOL = /^mcp__([a-z0-9_]{1,64})__/;
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function routeState(value: unknown): BrainRouteState | null {
+  return ROUTE_STATES.includes(value as BrainRouteState) ? (value as BrainRouteState) : null;
+}
+
+function errorKind(value: unknown): string | undefined {
+  return typeof value === "string" && ERROR_KIND.test(value) ? value : undefined;
+}
+
+function readRoute(value: unknown): BrainRoute | null {
+  const route = record(value);
+  if (!route) return null;
+  const role = ROLES.find((candidate) => candidate === route.role);
+  const state = routeState(route.state);
+  if (!role || !state || typeof route.provider !== "string" || !PROVIDER.test(route.provider)) return null;
+  if (typeof route.model !== "string" || !MODEL.test(route.model)) return null;
+  const lastError = errorKind(route.last_error);
+  return { role, provider: route.provider, model: route.model, state, ...(lastError ? { lastError } : {}) };
+}
+
+function readAgent(value: unknown): BrainAgent | null {
+  const agent = record(value);
+  if (!agent || typeof agent.name !== "string" || !SERVER_NAME.test(agent.name)) return null;
+  const routes = (Array.isArray(agent.routes) ? agent.routes : []).map(readRoute);
+  if (routes.length === 0 || routes.some((route) => route === null)) return null;
+  const servers = new Set<string>();
+  for (const tool of Array.isArray(agent.tools) ? agent.tools : []) {
+    const match = typeof tool === "string" ? MCP_TOOL.exec(tool) : null;
+    if (match) servers.add(match[1]);
+  }
+  const title = typeof agent.title === "string" ? agent.title.trim().slice(0, 80) : "";
+  return { name: agent.name, title: title || agent.name, active: agent.active === true, routes: routes as BrainRoute[], servers: [...servers] };
+}
+
+function readManager(value: unknown): BrainManager | null {
+  const manager = record(value);
+  const primary = record(manager?.primary);
+  if (!manager || !primary) return null;
+  const state = routeState(primary.state);
+  const named = (provider: unknown, model: unknown) =>
+    typeof provider === "string" && PROVIDER.test(provider) && typeof model === "string" && MODEL.test(model);
+  if (!state || !named(manager.provider, manager.model) || !named(primary.provider, primary.model)) return null;
+  const lastError = errorKind(primary.last_error);
+  const backIn = typeof primary.back_in === "number" && Number.isFinite(primary.back_in) && primary.back_in >= 0 ? Math.round(primary.back_in) : undefined;
+  return {
+    provider: manager.provider as string,
+    model: manager.model as string,
+    onStandby: manager.on_standby === true,
+    primary: {
+      provider: primary.provider as string,
+      model: primary.model as string,
+      state,
+      ...(lastError ? { lastError } : {}),
+      ...(backIn !== undefined ? { backInSeconds: backIn } : {}),
+    },
+  };
+}
 
 /** The brain's GET /health, narrowed to what the hub shows. Throws JarvisBrainError when it cannot be read. */
 export async function getJarvisStatus(): Promise<BrainStatus> {
@@ -252,7 +363,11 @@ export async function getJarvisStatus(): Promise<BrainStatus> {
     const connected = server.connected === true;
     servers.push({ name: server.name, connected, tools: connected && Array.isArray(server.tools) ? server.tools.length : 0 });
   }
-  return { ready: body.ok === true, servers };
+  const agents = (Array.isArray(body.agents) ? body.agents : [])
+    .map(readAgent)
+    .filter((agent): agent is BrainAgent => agent !== null)
+    .slice(0, 12);
+  return { ready: body.ok === true, servers, manager: readManager(body.manager), agents };
 }
 
 /**

@@ -29,6 +29,11 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                       "tts": true|false, "mcp_tools": ["mcp__web_search__web_search", ...],
                       "mcp_servers": [{ "name": "web_search", "connected": true,
                                         "tools": ["web_search"], "error": "" }, ...],
+                      "manager": { "provider": "gemini", "model": "gemini-flash-lite-latest",
+                                   "on_standby": true,
+                                   "primary": { "provider": "anthropic", "model": "claude-sonnet-5",
+                                                "state": "resting", "last_error": "billing",
+                                                "back_in": 512 } },
                       "agents": [{ "name": "data", "title": "Head of Data & Documents",
                                    "tool": "delegate_to_data", "active": true,
                                    "routes": [{ "role": "primary", "provider": "gemini",
@@ -37,7 +42,8 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  stt_ready is false while the on-device model is still loading. tts says whether
                  replies can be spoken (Edge-TTS installed and not switched off). mcp_tools are
                  the tool-server tools Jarvis had at its last turn, the manager's and its agents'
-                 (agents/); agents is the team - a route's state is ready, resting (failed lately:
+                 (agents/); manager is the brain's own route (LLMBrain.manager_status: on the
+                 Gemini standby or not, and why); agents is the team - a route's state is ready, resting (failed lately:
                  out of credit or quota, rate limited), failed (until restart) or not configured
                  (no key: "why" says which). mcp_servers is each tool
                  server as it is right now (error says why one is not connected). The bundled
@@ -224,6 +230,7 @@ def health() -> dict:
         # Every tool-server tool Jarvis has, whether the manager or one of its agents holds it.
         "mcp_tools": [name for name in brain.all_tool_names if name.startswith("mcp__")],
         "mcp_servers": brain.mcp_servers(),
+        "manager": brain.manager_status(),
         "agents": brain.team_status(),
     }
 

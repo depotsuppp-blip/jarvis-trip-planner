@@ -64,17 +64,29 @@ export interface SessionSummary {
 /**
  * How an agent or tool is doing, in the words the sidebar uses:
  * unknown "Not checked", idle "Idle", working "Working", ready "Ready" (its last
- * run worked), offline "Offline", unavailable "Not connected".
+ * run worked), degraded "On fallback" (answering, but not on its primary model),
+ * offline "Offline", unavailable "Not connected".
  */
-export type AgentState = "unknown" | "idle" | "working" | "ready" | "offline" | "unavailable";
+export type AgentState = "unknown" | "idle" | "working" | "ready" | "degraded" | "offline" | "unavailable";
+
+/**
+ * Which group of the sidebar a row is in: "brain" is the executive manager (Jarvis
+ * itself), "agent" a specialist it delegates to, "tool" and "voice" the tools and
+ * services under them.
+ */
+export type AgentKind = "brain" | "agent" | "tool" | "voice";
 
 export interface AgentStatus {
   id: string;
   name: string;
-  kind: "brain" | "tool" | "voice";
+  kind: AgentKind;
   state: AgentState;
-  /** One short line shown under the name: why it is offline, what it needs. */
+  /** One short line shown under the name: what it does, why it is offline, what it needs. */
   detail?: string;
+  /** The model it is on right now, and why when that is not its primary ("Gemini Flash-Lite · Gemini Pro out of quota"). */
+  model?: string;
+  /** Its model routes in order, for the row's hover text ("Gemini Pro → gpt-oss-120b on Groq → Gemini Flash-Lite"). */
+  routes?: string;
 }
 
 export type LoadState = "loading" | "ready" | "error";

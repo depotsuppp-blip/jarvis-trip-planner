@@ -12,7 +12,7 @@ import type { ReplyAudio } from "./replyAudio";
  *   POST /api/chat { message, conversationId?, newConversation?, speak? }   one typed turn
  *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?)   one typed turn with a file
  *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
- *   GET  /api/chat/tools                    the brain's tool servers and whether each is connected
+ *   GET  /api/chat/tools                    the manager's model, the specialist agents and the tool servers
  *
  * `speak: true` asks for the reply to come back with audio too (`audio` in the answer)
  * when it is short enough to be read aloud - see replyAudio.ts.
@@ -64,14 +64,34 @@ export interface VoiceTurnData extends TurnData {
   engine: string;
 }
 
+/** How one model route is (see BrainRouteState in lib/jarvisBrain.ts). */
+export type RouteState = "ready" | "resting" | "failed" | "not configured";
+
+export interface ModelRoute {
+  role: "primary" | "fallback" | "last resort";
+  provider: string;
+  model: string;
+  state: RouteState;
+  lastError?: string;
+}
+
 /** What the sidebar's "Agents & tools" is built from (app/api/chat/tools/route.ts). */
 export interface ToolsData {
   /** The brain answered at all. */
   reachable: boolean;
   /** It has a language model to answer with. */
   ready: boolean;
-  /** Its tool servers: config name, connected or not, how many tools. */
-  servers: { name: string; connected: boolean; tools: number }[];
+  /** The executive manager's model; null from a brain that does not say (or is unreachable). */
+  manager?: {
+    provider: string;
+    model: string;
+    onStandby: boolean;
+    primary: { provider: string; model: string; state: RouteState; lastError?: string; backInSeconds?: number };
+  } | null;
+  /** The specialist agents: name, title, whether taking tasks, model routes in order, servers held. */
+  agents?: { name: string; title: string; active: boolean; routes: ModelRoute[]; servers: string[] }[];
+  /** Its tool servers: config name, connected or not, how many tools, and the agent that uses it (null = the manager). */
+  servers: { name: string; connected: boolean; tools: number; agent?: string | null }[];
 }
 
 export interface TurnRequest {

@@ -2906,6 +2906,8 @@ class LLMBrain:
         # When a failover that should pass (credit, rate limit - FAILBACK_SECONDS)
         # gives Anthropic another try: a time.monotonic() value, or None.
         self._failback_at: Optional[float] = None
+        # Why the last failover happened (ProviderError.kind), for manager_status; "" when on the primary.
+        self._failover_kind = ""
 
         # Feature 5: plugins are loaded now and re-scanned every turn.
         self._plugin_tools: list[ToolSpec] = []
@@ -3027,6 +3029,40 @@ class LLMBrain:
         for agent in self._working_agents():
             names += [tool.name for tool in agent.tools_from(self._mcp_tools)]
         return list(dict.fromkeys(names))
+
+    def manager_status(self) -> dict[str, Any]:
+        """
+        The manager's own route, for /health: the provider and model answering now,
+        whether that is the standby, and how the primary (Anthropic) is - "ready",
+        "resting" (out of credit or rate limited; tried again at back_in seconds),
+        "failed" (a rejected key or model: until restart) or "not configured".
+        last_error is why it failed over (ProviderError.kind) while on the standby.
+        """
+        active = self._provider
+        primary = self._primary
+        on_standby = active is not None and active is not primary
+        now = time.monotonic()
+        if not primary.available:
+            state = "not configured"
+        elif not on_standby:
+            state = "ready"
+        elif self._failback_at is not None:
+            state = "resting" if now < self._failback_at else "ready"  # tried again on the next question
+        else:
+            state = "failed"
+        back_in = max(0, round(self._failback_at - now)) if on_standby and self._failback_at is not None else None
+        return {
+            "provider": active.name if active else "none",
+            "model": active.model if active else "none",
+            "on_standby": on_standby,
+            "primary": {
+                "provider": primary.name,
+                "model": primary.model,
+                "state": state,
+                **({"last_error": self._failover_kind} if on_standby and self._failover_kind else {}),
+                **({"back_in": back_in} if back_in is not None else {}),
+            },
+        }
 
     def team_status(self) -> list[dict[str, Any]]:
         """Each specialist agent: whether it is working, its routes (provider, model, state) and its tools."""
@@ -3434,6 +3470,7 @@ class LLMBrain:
 
         previous = self._provider.name if self._provider else "none"
         self._use(standby)
+        self._failover_kind = kind if standby is self._secondary else ""
         wait = FAILBACK_SECONDS.get(kind) if standby is self._secondary else None
         self._failback_at = time.monotonic() + wait if wait else None
         later = f"; trying {previous} again in {wait // 60 or 1} min" if wait else ""
@@ -3460,6 +3497,7 @@ class LLMBrain:
         if self._provider is not self._primary and self._primary.available:
             print(f"[Brain] Trying {self._primary.name} again after a temporary failover.")
             self._use(self._primary)
+            self._failover_kind = ""
 
     # -- the supervisor loop -------------------------------------------
 
