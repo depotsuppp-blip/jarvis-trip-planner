@@ -52,4 +52,5 @@ def build(last_resort: Route | None = None) -> SpecialistAgent:
         max_steps=5,
         delegate_description=DELEGATE_DESCRIPTION,
         task_description="The whole question, self-contained: with the place, dates and any link it depends on.",
+        skills="searches the web and reads web pages",
     )

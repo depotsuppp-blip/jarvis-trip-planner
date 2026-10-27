@@ -75,12 +75,16 @@ Things that differ from the voice assistant, deliberately:
 * One LLMBrain, one request at a time. The brain keeps per-turn state
   (history, background-dispatch bookkeeping) and is not thread-safe, so
   requests queue on a lock instead of interleaving.
-* Tools that ask for spoken confirmation (n8n webhooks, LINE messages,
-  starting/stopping servers, creating tools) are DECLINED. There is no
-  human at a microphone here, and a web request must never be able to
-  trigger an outward side effect or run new code on this machine by
-  itself. The model is told they were declined and says so. Wiring a
-  real confirm step through the web UI is a separate piece of work.
+* Tools that ask for spoken confirmation (n8n webhooks, the manager's own
+  send_line_notification, starting/stopping servers, creating tools) are
+  DECLINED. There is no human at a microphone here, and a web request must
+  never be able to trigger an outward side effect or run new code on this
+  machine by itself. The model is told they were declined and says so.
+  Wiring a real confirm step through the web UI is a separate piece of work.
+  The one exception is the Head of Productivity's push_line_notification
+  (agents/productivity_agent.py): it asks no one, because it can only
+  message the owner's own LINE (LINE_TARGET_USER_ID) and sending the daily
+  briefing there is its job - and it is capped per task.
 * Bound to loopback with no authentication: anything on this machine can
   call it, so do not expose the port.
 """

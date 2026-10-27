@@ -3,6 +3,8 @@
 # .env.example is the safe, checked-in template.
 .env
 *.key
+# Credential files such as the Google service account key (GOOGLE_SERVICE_ACCOUNT_FILE in .env)
+.secrets/
 
 # --- Python -------------------------------------------------------------
 __pycache__/

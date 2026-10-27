@@ -29,6 +29,13 @@ THE LOOP. An agent gets one task from the manager (LLMBrain, through its
 delegate_to_<agent> tool), works on it with its own tools - and only those - for at
 most `max_steps` model calls, and returns a report for the manager, never for the
 user. It does not see the conversation: everything it needs is in the task.
+
+ITS TOOLS. The tools of the MCP servers it owns (`servers`), plus `own_tools`: tools
+that exist only on this agent (the productivity agent's calendar and LINE). While the
+agent works, the manager has neither, nor the built-ins the agent `replaces`. A tool
+that changes something outside Jarvis records what happened in `actions`, in the
+tool's own words, and the manager is told that alongside the report - so "sent" in a
+reply comes from the tool, not from the agent saying so.
 """
 
 from __future__ import annotations
@@ -136,6 +143,16 @@ class SpecialistAgent:
     # The delegation tool the manager sees.
     delegate_description: str = ""
     task_description: str = "The whole task, self-contained: what to do and everything needed to do it."
+    # Tools that exist only on this agent, not on an MCP server (see ITS TOOLS above).
+    own_tools: tuple[ToolSpec, ...] = ()
+    # The manager's built-in tools this agent takes over while it works: the manager loses them.
+    replaces: tuple[str, ...] = ()
+    # What only it can do, in a few words, for the manager's TEAM_RULE.
+    skills: str = ""
+    # Told to the manager after a task in which none of its tools recorded an action.
+    no_actions_note: str = ""
+    # What its tools changed outside Jarvis during the current task, in their own words (reset by run()).
+    actions: list[str] = field(default_factory=list, repr=False, init=False)
     _failed_this_run: set[int] = field(default_factory=set, repr=False, init=False)
 
     # -- what the manager sees ---------------------------------------------
@@ -153,7 +170,12 @@ class SpecialistAgent:
         return tool.source.startswith("mcp:") and tool.source[4:] in self.servers
 
     def tools_from(self, mcp_tools: list[ToolSpec]) -> list[ToolSpec]:
+        """The MCP tools this agent owns (its servers' tools)."""
         return [tool for tool in mcp_tools if self.owns(tool)]
+
+    def toolkit(self, mcp_tools: list[ToolSpec]) -> list[ToolSpec]:
+        """Everything it works with: its servers' tools and its own."""
+        return self.tools_from(mcp_tools) + list(self.own_tools)
 
     def can_work(self, mcp_tools: list[ToolSpec]) -> bool:
         """Has a model, and - for an agent built around tool servers - at least one of their tools."""
@@ -167,8 +189,14 @@ class SpecialistAgent:
             "tool": self.tool_name,
             "active": self.can_work(mcp_tools),
             "routes": [route.status(now) for route in self.routes],
-            "tools": [tool.name for tool in self.tools_from(mcp_tools)],
+            "tools": [tool.name for tool in self.toolkit(mcp_tools)],
         }
+
+    def actions_note(self) -> str:
+        """What its tools did during the last task, for the manager; "" for an agent whose tools change nothing."""
+        if self.actions:
+            return "\n".join(f"- {action}" for action in self.actions)
+        return self.no_actions_note
 
     def describe_routes(self) -> str:
         parts = []
@@ -182,6 +210,7 @@ class SpecialistAgent:
     def run(self, task: str, tools: list[ToolSpec], execute: Callable[[ToolCall], ToolResult]) -> str:
         """Does `task` with `tools` and returns the report. Raises AgentUnavailable when no model answers."""
         self._failed_this_run = set()
+        self.actions.clear()
         context = turn_context()
         transcript: list[Turn] = [Turn(kind="user", text=task.strip())]
         started = time.monotonic()
@@ -198,7 +227,8 @@ class SpecialistAgent:
 
         print(f"[Agent:{self.name}] Hit its {self.max_steps}-step ceiling; asking for what it has.")
         transcript.append(Turn(kind="user", text=CEILING_NOTE))
-        turn = self._complete(transcript, [], context)
+        # A plain-words summary, even from an agent whose answers are JSON drafts.
+        turn = self._complete(transcript, [], context, json_ok=False)
         return _cut(turn.text.strip() or "The agent ran out of steps without a result.")
 
     def _final(self, text: str, transcript: list[Turn], context: str) -> str:
@@ -216,7 +246,7 @@ class SpecialistAgent:
             again = self._complete(retry, [], context)
             return self.finish(again.text)  # a second ValueError reaches the manager as a tool error
 
-    def _complete(self, transcript: list[Turn], tools: list[ToolSpec], context: str) -> Turn:
+    def _complete(self, transcript: list[Turn], tools: list[ToolSpec], context: str, json_ok: bool = True) -> Turn:
         """One model call on the first route that can take it (see ROUTES at the top)."""
         now = time.monotonic()
         tried: list[str] = []
@@ -234,7 +264,7 @@ class SpecialistAgent:
                     route.model,
                     None,
                     context,
-                    json_output=self.json_output and not tools,
+                    json_output=self.json_output and json_ok and not tools,
                 )
             except ProviderError as exc:
                 kind = _skip_kind(exc)

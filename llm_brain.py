@@ -103,13 +103,17 @@ Several things were added to this module beyond plain tool calling:
       the Head of Data & Documents (Gemini Pro -> Groq; owns the local_fs
       and data servers), the Head of Research (Gemini Flash; owns
       web_search and fetch) and the Head of Productivity (GPT-4o-mini ->
-      Gemini Flash; schedules and to-dos as JSON drafts), each ending on
+      Gemini Flash; the only one with Google Calendar and LINE: reads
+      today's agenda and sends the user a daily briefing on LINE, sends
+      LINE messages, drafts schedules and to-dos as JSON), each ending on
       Jarvis's own Gemini model as a last resort. The manager holds
-      delegate_to_data / _research / _productivity instead of those tools,
-      writes each a self-contained task (they do not see the conversation)
-      and answers the user from their reports (TEAM_RULE). An agent with no
-      usable model, or whose servers are down, is left out and its tools
-      stay with the manager. JARVIS_AGENTS=0 turns the team off.
+      delegate_to_data / _research / _productivity instead of those tools
+      (and, while the productivity agent works, without its own
+      send_line_notification), writes each a self-contained task (they do
+      not see the conversation) and answers the user from their reports
+      (TEAM_RULE), told by the tools themselves what was sent. An agent
+      with no usable model, or whose servers are down, is left out and its
+      server tools stay with the manager. JARVIS_AGENTS=0 turns the team off.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -339,7 +343,7 @@ How this deployment reads your output:
 - Reply with the JSON object and nothing else: no code fence, no commentary before or after it.
 - Use route_to "SELF" only with intent_type "CHAT" and a real answer in response. Every other case is route_to "ORCHESTRATOR" with response null.
 - intent_type says what the input is about and route_to says who answers it, so they are separate decisions. "TRIP_PLANNING" is only for input about a trip: planning one, its group poll, voting, or finalizing the plan. Every other input is "CHAT", including a request that needs a tool, which is "CHAT" with route_to "ORCHESTRATOR".
-- The assistant behind you has tools that you do not. It logs and reads Subtrack expenses and records, runs n8n workflows, looks at the user's screen, sends LINE messages, starts and stops apps and servers, plans trips and trip polls, and reports what it can do and what is still running. A request that needs one of those, or live information about the user's own systems, is never yours to answer: route it to "ORCHESTRATOR" with response null. Never say or imply that you have done, started, or checked anything.
+- The assistant behind you has tools that you do not. It logs and reads Subtrack expenses and records, runs n8n workflows, looks at the user's screen, reads the user's Google Calendar for today, sends LINE messages, starts and stops apps and servers, plans trips and trip polls, and reports what it can do and what is still running. A request that needs one of those, or live information about the user's own systems, is never yours to answer: route it to "ORCHESTRATOR" with response null. Never say or imply that you have done, started, or checked anything.
 - If the input answers a question the assistant just asked, or accepts or declines something it offered, route it to "ORCHESTRATOR".
 - Never write a trip link or a trip id, and never say a trip was created or is ready: you cannot make one, and a link from earlier in the conversation belongs to an earlier trip. Anything about planning, creating or finding a trip, a poll or a link is route_to "ORCHESTRATOR" with response null.
 
@@ -700,11 +704,12 @@ DELEGATE_RESEARCH = "delegate_to_research"
 
 # Added to the manager's per-turn context while it has a team (LLMBrain._call_provider).
 TEAM_RULE = (
-    "Your team: {members}. You cannot read files or search the web yourself - those tools "
-    "belong to them. Hand a task to the right one instead of guessing or saying you cannot. "
-    "They do not see this conversation, so each task must stand on its own: the question, "
-    "every file path or link, the place and dates, and what you need back. Their reports "
-    "are for you: answer the user yourself, in your own words."
+    "Your team, and what only they can do: {members}. You cannot do those things yourself - "
+    "the tools belong to them. Hand a task to the right one instead of guessing or saying you "
+    "cannot. They do not see this conversation, so each task must stand on its own: the "
+    "question, every file path or link, the place and dates, the exact text to send, and what "
+    "you need back. Their reports are for you: answer the user yourself, in your own words, and "
+    "say something was sent only when the report's tool lines say it was."
 )
 
 # What the brain does when a reply holds a trip link or id that no tool returned
@@ -918,7 +923,14 @@ _TOOL_WORDS: tuple[str, ...] = (
     # Real-time questions: the web search tool answers them (REALTIME_RULE), the
     # tool-less front door cannot.
     "weather", "forecast", "news", "headlines",
+    # Today's agenda: the productivity agent reads the calendar; the front door would
+    # answer "I can't see your calendar".
+    "calendar", "agenda", "schedule", "briefing",
 )
+
+# The same for Thai, as substrings: calendar / work schedule / appointment schedule /
+# appointment / LINE (the app).
+_AGENDA_SUBSTRINGS: tuple[str, ...] = ("ปฏิทิน", "ตารางงาน", "ตารางนัด", "นัดหมาย", "ไลน์")
 
 # The same for Thai, as substrings: weather / news / forecast. ("อากาศ" is also in
 # "air conditioner"; a tool-capable model answering that costs nothing.)
@@ -1131,7 +1143,7 @@ def _looks_like_tool_command(text: str) -> bool:
         return True
     if any(word in _TOOL_WORDS for word in lowered.split()):
         return True
-    if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS):
+    if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS + _AGENDA_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
     return _mentions_trip(text) or _asks_system_status(text)
@@ -1421,12 +1433,16 @@ def _tool_send_line_notification(message: str = "") -> str:
     Pushes a LINE message to the configured user.
 
     Same shape as the orchestrator tools: the work lives in
-    plugins/line_notifier.py and is imported lazily, so a missing or
+    utils/line_notifier.py and is imported lazily, so a missing or
     broken module degrades to one spoken sentence rather than stopping
     the brain from starting.
+
+    The manager has this tool only while the Head of Productivity is not
+    working (agents/productivity_agent.py replaces it with its own
+    push_line_notification, which asks no one first).
     """
     try:
-        from plugins import line_notifier
+        from utils import line_notifier
     except Exception as exc:  # noqa: BLE001 - report it, never crash the loop
         return (
             f"ERROR: the LINE notifier module could not be loaded "
@@ -3027,7 +3043,7 @@ class LLMBrain:
         """The manager's tools and every working agent's, once each (for /health)."""
         names = self.tool_names
         for agent in self._working_agents():
-            names += [tool.name for tool in agent.tools_from(self._mcp_tools)]
+            names += [tool.name for tool in agent.toolkit(self._mcp_tools)]
         return list(dict.fromkeys(names))
 
     def manager_status(self) -> dict[str, Any]:
@@ -3070,14 +3086,22 @@ class LLMBrain:
 
     def _active_tools(self) -> list[ToolSpec]:
         """
-        What the manager can call: the built-in tools, whatever is in plugins/, the MCP
-        tools no working agent owns, and one delegate_to_<agent> tool per working agent.
-        An agent that cannot work (no model, or its tool servers are down) is left out
-        and its tools stay here, so a missing key never takes a capability away.
+        What the manager can call: the built-in tools no working agent took over, whatever
+        is in plugins/, the MCP tools no working agent owns, and one delegate_to_<agent>
+        tool per working agent. An agent that cannot work (no model, or its tool servers
+        are down) is left out and its server tools stay here, so a missing key never takes
+        a capability away. An agent's own tools (the calendar, LINE) are never here.
         """
         working = self._working_agents()
+        replaced = self._replaced_tool_names(working)
+        builtins = [tool for tool in self._tools if tool.name not in replaced]
         mcp = [tool for tool in self._mcp_tools if not any(agent.owns(tool) for agent in working)]
-        return list(self._tools) + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working]
+        return builtins + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working]
+
+    def _replaced_tool_names(self, working: Optional[list[Any]] = None) -> set[str]:
+        """The built-in tools working agents have taken over (the productivity agent: send_line_notification)."""
+        agents_now = self._working_agents() if working is None else working
+        return {name for agent in agents_now for name in getattr(agent, "replaces", ())}
 
     # -- the team (agents/) ----------------------------------------------
 
@@ -3125,28 +3149,43 @@ class LLMBrain:
         Runs one task on `agent` with its own tools and returns its report for the
         manager. An agent none of whose models answers raises agents.AgentUnavailable,
         which _execute hands back as a tool error that says why, route by route.
+
+        After the report come its tools' own lines on what they changed outside Jarvis
+        (SpecialistAgent.actions: "push_line_notification (...): The LINE notification was
+        sent."), or the agent's note that nothing was - so whether a message went out is
+        the tool's word, not the agent's. They are added to a failure too: a message can be
+        sent before the agent's model gives out.
         """
         task = str(task or "").strip()
         if not task:
             return "No task was given. Call again with the whole task in `task`."
-        tools = agent.tools_from(self._mcp_tools)
+        tools = agent.toolkit(self._mcp_tools)
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
         shown = task[:160].encode(encoding, errors="backslashreplace").decode(encoding)
         print(f"[Brain] Delegating to the {agent.title}: {shown}")
-        report = agent.run(task, tools, lambda call: self._execute(call, tools))
-        if agent.json_output:
+        try:
+            report = agent.run(task, tools, lambda call: self._execute(call, tools))
+        except Exception as exc:
+            if not agent.actions:
+                raise
+            raise RuntimeError(
+                f"{type(exc).__name__}: {exc}\nWHAT ITS TOOLS DID BEFORE THAT:\n{agent.actions_note()}"
+            ) from exc
+        if agent.json_output and report.startswith("{") and '"status": "draft"' in report:
             header = (
-                f"DRAFT FROM YOUR {agent.title.upper()} (JSON). It is NOT saved anywhere - there is no "
-                "calendar or LINE integration yet. Present it to the user in words and say it is a draft:"
+                f"DRAFT FROM YOUR {agent.title.upper()} (JSON). It is a draft, not saved anywhere: nothing "
+                "is added to the calendar (that is read-only). Present it to the user in words and say it is a draft:"
             )
         else:
             header = f"REPORT FROM YOUR {agent.title.upper()} (for you, not the user - answer the user yourself):"
-        return f"{header}\n{report}"
+        done = agent.actions_note()
+        footer = f"\nWHAT ITS TOOLS DID (from the tools themselves, not the agent's words):\n{done}" if done else ""
+        return f"{header}\n{report}{footer}"
 
     def _team_rule(self, tools: list[ToolSpec]) -> str:
         """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
         members = [
-            f"the {agent.title} ({agent.tool_name})"
+            f"the {agent.title} ({agent.tool_name})" + (f": {agent.skills}" if getattr(agent, "skills", "") else "")
             for agent in self._team.values()
             if any(tool.name == agent.tool_name for tool in tools)
         ]
@@ -3325,7 +3364,9 @@ class LLMBrain:
             # written last turn is a real tool this turn, and looking it up
             # here is the difference between "unknown tool" and it working.
             tool = next((t for t in self._active_tools() if t.name == call.name), None)
-            if tool is None:
+            if tool is None and call.name not in self._replaced_tool_names():
+                # Not a built-in a working agent has taken over (LINE goes through the
+                # productivity agent while it works).
                 tool = TOOLS_BY_NAME.get(call.name)
 
         if tool is None:

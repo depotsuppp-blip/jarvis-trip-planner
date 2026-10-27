@@ -162,6 +162,15 @@ pydantic>=2.0.0
 # speech *out* now has cloud tiers (see Module 3). Set
 # JARVIS_TTS_OFFLINE_ONLY=1 in .env to force the mouth offline too.
 
+# --- Google Calendar (utils/calendar_reader.py) -------------------------
+# The Head of Productivity's get_todays_agenda signs in as a service account
+# (the JSON key in GOOGLE_SERVICE_ACCOUNT_FILE) and calls the Calendar API's
+# REST endpoint through google-auth's AuthorizedSession, on the requests
+# declared below - no Google API client library. google-genai already pulls
+# google-auth in; declared here because calendar_reader imports it directly.
+# Without it the tool says what to install and everything else runs.
+google-auth>=2.20.0
+
 # --- Automation bridge (Module 6) ---------------------------------------
 # HTTP client used by n8n_trigger.py to POST to n8n Production Webhooks.
 # Timeouts are always passed explicitly; requests has no default one, and

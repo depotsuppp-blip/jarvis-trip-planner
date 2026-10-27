@@ -69,4 +69,5 @@ def build(last_resort: Route | None = None) -> SpecialistAgent:
         max_steps=6,
         delegate_description=DELEGATE_DESCRIPTION,
         task_description="The whole task, self-contained: what to find or compute, every file path, and what to report back.",
+        skills="reads files, PDFs and Word documents, and works on data files with SQL",
     )
