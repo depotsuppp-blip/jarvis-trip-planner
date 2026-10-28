@@ -35,7 +35,7 @@ const KNOWN_SERVERS: { name: string; label: string; detail: string }[] = [
 const KNOWN_AGENTS: { name: string; label: string; detail: string }[] = [
   { name: "data", label: "Data & Documents", detail: "Reads files and crunches data" },
   { name: "research", label: "Research", detail: "Searches and reads the web" },
-  { name: "productivity", label: "Productivity", detail: "Drafts schedules and to-dos" },
+  { name: "productivity", label: "Productivity", detail: "Calendar, schedules and LINE alerts" },
 ];
 
 export const TOOL_OFFLINE_DETAIL = "Not running right now";

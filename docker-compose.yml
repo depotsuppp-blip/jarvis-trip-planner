@@ -8,6 +8,8 @@
 # TripPlanner_Web/.env.example for what goes in them):
 #     .env                        read by backend
 #     TripPlanner_Web/.env.local  read by frontend, and at build time for NEXT_PUBLIC_*
+# and, only for the Google Calendar agenda, a key file in .secrets/ (mounted
+# into backend read-only - see its volumes below).
 #
 #   docker compose up -d --build     start everything (and rebuild what changed)
 #   docker compose logs -f backend   follow one service
@@ -45,6 +47,16 @@ services:
       - jarvis_models:/app/.models
       # llm_budget.py's daily token record.
       - jarvis_data:/app/.data
+      # Credential files, read-only: the Google service account key the
+      # Head of Productivity reads the calendar with (.env.example, 4a).
+      # Mounted, never copied into the image (.dockerignore is an allowlist
+      # and leaves .secrets/ out; git ignores it too). Set the variable as a
+      # path relative to the repo folder, e.g.
+      #     GOOGLE_SERVICE_ACCOUNT_FILE=.secrets/google-calendar.json
+      # and the same .env line works on this PC and in here (/app/.secrets/).
+      # An absolute Windows path (C:\...) cannot be opened in the container.
+      # Docker creates an empty .secrets/ on first start if there is none.
+      - ./.secrets:/app/.secrets:ro
     # Measured with faster-whisper "small" (int8, CPU): ~1.15 GB idle once the
     # model is loaded, ~1.4 GB while a clip is being decoded. 3 GB is about 2x
     # that - room for PDF/DOCX reads and longer clips - without letting a

@@ -27,10 +27,12 @@ library is needed.
 
 CONFIGURATION (.env)
 ---------------------
-    GOOGLE_SERVICE_ACCOUNT_FILE  path to the service account's JSON key - keep it
-                                 outside the repo, or in .secrets/ (git ignores
-                                 it); a relative path is read from the Jarvis
-                                 folder
+    GOOGLE_SERVICE_ACCOUNT_FILE  path to the service account's JSON key, best in
+                                 .secrets/ (git ignores it) as a relative path,
+                                 e.g. .secrets/google-calendar.json: a relative
+                                 path is read from the Jarvis folder, which in
+                                 Docker is /app, where docker-compose.yml mounts
+                                 .secrets/ read-only
     GOOGLE_CALENDAR_ID           which calendar: your Gmail address for your main
                                  calendar (Settings -> Integrate calendar ->
                                  Calendar ID)
