@@ -5,13 +5,15 @@ import { PanelLeftClose, PanelLeftOpen, Plus, X } from "lucide-react";
 import { useChatActions, useShell, useShellActions } from "@/lib/jarvis/JarvisProvider";
 import { AccountRow } from "./AccountRow";
 import { AgentRail, AgentStatusList } from "./AgentStatusList";
+import { ManagerOrb } from "./JarvisOrb";
 import { SessionList } from "./SessionList";
 import { TestBench } from "./TestBench";
 import { focusRing, iconButton, thinScroll } from "./styles";
 
 /**
- * The left rail of the hub: sessions and history, which agents and tools are
- * doing what, and - folded away at the foot - the test bench and the account.
+ * The left rail of the hub: Jarvis's face (the Signal Orb, JarvisOrb.tsx), sessions
+ * and history, which agents and tools are doing what, and - folded away at the
+ * foot - the test bench and the account.
  *
  * Three shapes of one element:
  *   - desktop, expanded: a 288px column on Desk Mist, ruled from the conversation;
@@ -98,6 +100,9 @@ export const Sidebar = memo(function Sidebar() {
               <X className="size-5" aria-hidden="true" />
             </button>
           </div>
+
+          {/* Jarvis's face: the Signal Orb, following the executive manager. Stays put while the list scrolls. */}
+          <ManagerOrb />
 
           <div className={`min-h-0 flex-1 overflow-y-auto px-3 py-4 ${thinScroll}`}>
             <button
