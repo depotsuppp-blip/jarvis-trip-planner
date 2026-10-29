@@ -118,11 +118,13 @@ Several things were added to this module beyond plain tool calling:
   IMAGES  delegate_to_creative(image_description) hands a picture request to
       the Head of Creative (agents/creative_agent.py): one call to OpenAI's
       image model (gpt-image-2, then gpt-image-1 - DALL-E 3 was retired on
-      2026-05-12), saved as artifacts/image_YYYYMMDD_HHMMSS.png, and the
-      file's absolute path comes back for the reply (CREATIVE_RULE: written
-      out in the web chat, the folder and file name by voice). Not a model
-      loop and not part of the team, so it works with JARVIS_AGENTS=0 too;
-      there only when OPENAI_API_KEY is set, JARVIS_CREATIVE=0 turns it off.
+      2026-05-12), saved as artifacts/image_YYYYMMDD_HHMMSS.png. By voice the
+      reply names the folder and the file; in the web chat it carries the
+      picture as a Markdown image, ![Generated Image](/artifacts/<file>),
+      which api_server.py serves and the web app draws (CREATIVE_RULE,
+      _create_image, _with_images). Not a model loop and not part of the
+      team, so it works with JARVIS_AGENTS=0 too; there only when
+      OPENAI_API_KEY is set, JARVIS_CREATIVE=0 turns it off.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -734,15 +736,20 @@ CREATIVE_RULE = (
     "in Thai) plus the subject, setting, composition, style, colours and mood that suit it - because "
     "your Head of Creative does not see this conversation. Never say you cannot make images, and never "
     "describe an image in words instead of making it. One call makes one image: make one per request "
-    "unless the user asks for more. The tool saves the image as a file on this computer and returns "
-    "its absolute path. {share} Say an image was made only when the tool's result starts with SUCCESS; "
-    "when it starts with ERROR, tell the user in one sentence what went wrong and do not call the tool "
-    "again for the same request."
+    "unless the user asks for more. The tool saves the image as a file on this computer. {share} Say an "
+    "image was made only when the tool's result starts with SUCCESS; when it starts with ERROR, tell the "
+    "user in one sentence what went wrong and do not call the tool again for the same request."
 )
-CREATIVE_SHARE_WEB = "Give the user that path exactly as the tool wrote it, on its own line after one short sentence."
+# The web chat cannot open a file on this computer: there the result's Image line is a Markdown
+# image at /artifacts/<file> (LLMBrain._create_image), which the page draws as the picture.
+CREATIVE_SHARE_WEB = (
+    "Its result's Image line is a Markdown image that the chat shows as the picture itself: put that "
+    "line in your reply exactly as written, on its own line after one short sentence. It is the one "
+    "exception to the no-markdown rule. Do not write the file's path on this computer."
+)
 CREATIVE_SHARE_VOICE = (
-    "Tell the user it is saved in the artifacts folder of the Jarvis project and say the file name; do "
-    "not read out the rest of the path."
+    "Its result gives the file's absolute path: tell the user it is saved in the artifacts folder of the "
+    "Jarvis project and say the file name; do not read out the rest of the path."
 )
 
 
@@ -3025,6 +3032,8 @@ class LLMBrain:
         # Image generation (agents/creative_agent.py): delegate_to_creative while it has a key.
         self._creative: Any = self._start_creative()
         self._creative_spec: Optional[ToolSpec] = None
+        # The Markdown image lines made during the current web request (see _with_images).
+        self._images_this_turn: list[str] = []
 
         # Feature 2 bookkeeping: what went to the background, so the same
         # side effect cannot be fired twice (see _execute).
@@ -3298,8 +3307,8 @@ class LLMBrain:
                     "image with OpenAI's image model and saves it as a PNG file on this computer. Use it "
                     "whenever the user asks you to draw, create, generate, design or make a picture, a photo-"
                     "like image, an illustration, a logo, a poster, an icon or any other artwork. One call "
-                    "makes one image (it takes up to a minute). Returns SUCCESS with the absolute path of the "
-                    "saved file, or ERROR with what went wrong."
+                    "makes one image (it takes up to a minute). Returns SUCCESS with where the image is - the "
+                    "saved file's path, or in the web chat a Markdown image line - or ERROR with what went wrong."
                 ),
                 input_schema={
                     "type": "object",
@@ -3325,11 +3334,46 @@ class LLMBrain:
         return self._creative_spec
 
     def _create_image(self, image_description: str = "") -> str:
-        """Runs one image request on the Head of Creative; its SUCCESS/ERROR text goes back to the model."""
+        """
+        Runs one image request on the Head of Creative; its SUCCESS/ERROR text goes back to
+        the model. In the web chat a SUCCESS's "Path: <file on this computer>" becomes
+        "Image: ![Generated Image](/artifacts/<file>)" - the picture as the page draws it
+        (api_server.py serves the folder, the web app passes it on) - and the line is
+        remembered so the reply is sure to carry it (_with_images). By voice the result is
+        the agent's own, path and all.
+        """
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
         shown = str(image_description or "")[:160].encode(encoding, errors="backslashreplace").decode(encoding)
         print(f"[Brain] Delegating to the Head of Creative: {shown}")
-        return self._creative.generate_image(image_description)
+        result = self._creative.generate_image(image_description)
+        caller = request_context.current()
+        if caller is None or not caller.is_web or not result.startswith("SUCCESS"):
+            return result
+
+        from agents.creative_agent import markdown_image  # the agents package imports this module
+
+        lines = []
+        for line in result.splitlines():
+            if line.startswith("Path: "):
+                image = markdown_image(line[len("Path: "):].strip())
+                if image not in self._images_this_turn:
+                    self._images_this_turn.append(image)
+                line = f"Image: {image}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _with_images(self, reply: str) -> str:
+        """
+        `reply` with every image made during this web request in it, as its Markdown line:
+        the model's own copy when it wrote one (found by its /artifacts/ address), else the
+        line added at the end - a picture that was made and paid for is never lost to a
+        reply that only talked about it.
+        """
+        for image in self._images_this_turn:
+            address = image[image.index("](") :]  # "](/artifacts/image_....png)"
+            if address not in reply:
+                reply = f"{reply.rstrip()}\n\n{image}"
+        return reply
 
     def _team_rule(self, tools: list[ToolSpec]) -> str:
         """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
@@ -3850,6 +3894,7 @@ class LLMBrain:
         # round trips, so a heavy request does not silently drop back to
         # a cheaper model halfway through answering itself.
         self._dispatched_this_turn = []
+        self._images_this_turn = []
 
         intent, why = _classify_intent(_routing_text(user_text))
         model, effort = self._route(intent)
@@ -3913,6 +3958,10 @@ class LLMBrain:
                         )
                         continue
                     reply = LINK_FALLBACK
+
+                # Web chat: the pictures made for this request are in the reply, as the
+                # Markdown lines the page draws (see _create_image).
+                reply = self._with_images(reply)
 
                 # The transcript keeps the question and the answer, not
                 # the tool scaffolding - so a backgrounded action would

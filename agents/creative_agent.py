@@ -10,6 +10,10 @@ generation through OpenAI's Images API.
         -> saved as artifacts/image_YYYYMMDD_HHMMSS.png
         <- "SUCCESS: ... Path: <absolute path>"   or   "ERROR: <what happened>"
 
+In the web chat the brain swaps the Path line for the picture itself, a Markdown image
+at /artifacts/<file name> (markdown_image): api_server.py serves this folder at that
+path, and the web app passes it on to the page (TripPlanner_Web/app/artifacts/[name]).
+
 NOT A LANGUAGE-MODEL LOOP. The other agents (base.SpecialistAgent) are models with
 tools. This one has nothing to reason about - the manager writes the description and
 one API call makes the picture - so it is a plain class and spends no tokens.
@@ -72,6 +76,9 @@ except ImportError:  # pragma: no cover - requests is in requirements.txt
 ROOT = Path(__file__).resolve().parent.parent
 # Everything Jarvis makes. Tracked as a folder, its contents ignored (artifacts/.gitignore).
 ARTIFACTS_DIR = ROOT / "artifacts"
+# Where a browser finds them: api_server.py serves the folder at this path, and the web
+# app answers the same path for the page (TripPlanner_Web/app/artifacts/[name]/route.ts).
+ARTIFACTS_URL_PATH = "/artifacts"
 
 DEFAULT_MODEL = "gpt-image-2"
 DEFAULT_FALLBACK_MODEL = "gpt-image-1"
@@ -438,6 +445,16 @@ class CreativeAgent:
         except OSError as exc:
             lines.append(f"  folder: {self.artifacts_dir} is NOT writable ({exc})")
         return lines
+
+
+def web_url(path: Path | str) -> str:
+    """The saved file's address for the web chat: /artifacts/<file name>."""
+    return f"{ARTIFACTS_URL_PATH}/{Path(path).name}"
+
+
+def markdown_image(path: Path | str, alt: str = "Generated Image") -> str:
+    """The Markdown line the web chat draws as the picture: ![Generated Image](/artifacts/<file name>)."""
+    return f"![{alt}]({web_url(path)})"
 
 
 def _decode(b64: str) -> bytes:

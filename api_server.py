@@ -50,6 +50,12 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  servers - local_fs, web_search, fetch, memory, data - start with the brain, with
                  nothing to configure (mcp_client.py). The web hub's sidebar lists them from here
                  (TripPlanner_Web: GET /api/chat/tools).
+    GET  /artifacts/<file> -> the file itself: what Jarvis made and saved in artifacts/ - the
+                 images from agents/creative_agent.py (image_YYYYMMDD_HHMMSS.png). A web chat
+                 reply shows one as ![Generated Image](/artifacts/<file>); the web app answers
+                 that address for the browser by fetching it from here
+                 (TripPlanner_Web/app/artifacts/[name]/route.ts), for the signed-in person
+                 whose chat it is in. 404 for a file that is not there.
 
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
@@ -98,6 +104,7 @@ from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
 import attachments
@@ -105,6 +112,7 @@ import reply_audio
 import request_context
 import rich_reply
 import stt
+from agents.creative_agent import ARTIFACTS_DIR, ARTIFACTS_URL_PATH
 from llm_brain import LLMBrain
 
 HOST = "127.0.0.1"
@@ -204,6 +212,16 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+# GET /artifacts/<file>: the folder Jarvis saves what it makes in (agents/creative_agent.py).
+# StaticFiles keeps requests inside it (no ../), and answers 404 for anything missing. The
+# folder is made here when it is not there yet - a fresh clone has it, a Docker volume may
+# not - and a folder that cannot be made only costs the images, never the server's start.
+try:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as exc:
+    print(f"[API] The artifacts folder {ARTIFACTS_DIR} could not be made ({exc}); images will not be served.")
+app.mount(ARTIFACTS_URL_PATH, StaticFiles(directory=ARTIFACTS_DIR, check_dir=False), name="artifacts")
 
 _brain: LLMBrain | None = None
 _lock = threading.Lock()

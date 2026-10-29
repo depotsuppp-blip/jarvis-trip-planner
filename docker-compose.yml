@@ -57,6 +57,14 @@ services:
       # An absolute Windows path (C:\...) cannot be opened in the container.
       # Docker creates an empty .secrets/ on first start if there is none.
       - ./.secrets:/app/.secrets:ro
+      # What Jarvis makes - the images from agents/creative_agent.py - is saved in
+      # this repo's artifacts/ folder, so it survives a rebuild or `down`, and is the
+      # same folder as when the brain runs outside Docker. The web app shows them
+      # through the brain's GET /artifacts/<file>. Docker Desktop (Windows, macOS)
+      # lets the container's user write here; on a Linux host the folder must be
+      # writable by uid 10001 (the image's `jarvis` user), or a new image comes back
+      # "could not be saved".
+      - ./artifacts:/app/artifacts
     # Measured with faster-whisper "small" (int8, CPU): ~1.15 GB idle once the
     # model is loaded, ~1.4 GB while a clip is being decoded. 3 GB is about 2x
     # that - room for PDF/DOCX reads and longer clips - without letting a

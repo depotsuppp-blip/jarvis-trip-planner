@@ -135,6 +135,9 @@ def _widgets_in(envelope: dict[str, Any]) -> list[dict[str, Any]]:
 # brain that ignored it still could not make the page read an essay aloud.
 VOICE_MAX_CHARS = 200
 
+# A picture in the reply (an image Jarvis made, ![Generated Image](/artifacts/...)): the
+# page shows it, so the voice says nothing for it - not even its alt text.
+_MD_IMAGE = re.compile(r"!\[[^\]\n]*\]\([^)\n]*\)")
 _MD_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
 _URL = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 _MD_BLOCK = re.compile(r"^\s{0,3}(?:#{1,6}|>|[-+*]|\d+[.)])\s+", re.MULTILINE)
@@ -159,13 +162,15 @@ def speech_for(reply: str, limit: int = VOICE_MAX_CHARS) -> Optional[str]:
     What to read aloud for `reply`, or None when it should not be spoken: there is
     no text, or the text is longer than `limit` characters (counted on the text as
     the person reads it, before anything is stripped for the voice). A link, or
-    markdown a voice would pronounce as symbols, is taken out of what is spoken.
+    markdown a voice would pronounce as symbols, is taken out of what is spoken, and a
+    Markdown image (a picture Jarvis made) is left out entirely, alt text included.
     """
     text = spoken_text(reply)
     if not text or len(text) > limit:
         return None
 
-    cleaned = _MD_LINK.sub(r"\1", text)
+    cleaned = _MD_IMAGE.sub(" ", text)
+    cleaned = _MD_LINK.sub(r"\1", cleaned)
     cleaned = _URL.sub(" ", cleaned)
     cleaned = _MD_BLOCK.sub("", cleaned)
     cleaned = _MD_MARKS.sub("", cleaned)

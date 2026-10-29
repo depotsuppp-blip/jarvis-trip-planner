@@ -73,6 +73,13 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *   agents/), each with its routes in order and the MCP tools it holds. A brain
  *   from before the agents sends neither, and the sidebar then shows none.
  *   Free text (`why`, `error`) never leaves this file: it can hold local paths.
+ *
+ * The artifacts door (fetchArtifact) is where a picture Jarvis made comes from. A reply
+ * shows one as `![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)`; the browser
+ * asks THIS app for that address (app/artifacts/[name]/route.ts), which fetches it from:
+ *
+ *   GET {JARVIS_ARTIFACTS_URL}/<name>   default: JARVIS_BRAIN_URL with its /chat swapped for /artifacts
+ *   reply the image file (image/png, image/jpeg or image/webp); 404 when there is none
  */
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };
@@ -92,6 +99,9 @@ export interface BrainAnswer {
 const BRAIN_URL = process.env.JARVIS_BRAIN_URL ?? "http://127.0.0.1:8000/chat";
 const VOICE_URL = process.env.JARVIS_VOICE_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/voice");
 const HEALTH_URL = process.env.JARVIS_HEALTH_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/health");
+const ARTIFACTS_URL = process.env.JARVIS_ARTIFACTS_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/artifacts");
+// A file on the brain's own disk: a picture of a few MB arrives in well under a second.
+const ARTIFACT_TIMEOUT_MS = 15_000;
 // The brain answers /health at once, except while it is still starting (it connects its
 // tool servers first, up to ~15 s). A sidebar that waits longer than this just says "not checked".
 const HEALTH_TIMEOUT_MS = 8_000;
@@ -368,6 +378,23 @@ export async function getJarvisStatus(): Promise<BrainStatus> {
     .filter((agent): agent is BrainAgent => agent !== null)
     .slice(0, 12);
   return { ready: body.ok === true, servers, manager: readManager(body.manager), agents };
+}
+
+/**
+ * The brain's GET /artifacts/<name>: one picture Jarvis made, as the brain answers it
+ * (any status - the caller decides what a 404 means). `name` must already be checked
+ * (lib/jarvis/artifacts.ts). Throws JarvisBrainError when the brain cannot be reached.
+ */
+export async function fetchArtifact(name: string): Promise<Response> {
+  try {
+    return await fetch(`${ARTIFACTS_URL}/${encodeURIComponent(name)}`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(ARTIFACT_TIMEOUT_MS),
+    });
+  } catch (error) {
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+    throw new JarvisBrainError(timedOut ? "Jarvis brain took too long to send the image." : "Jarvis brain is offline.");
+  }
 }
 
 /**
