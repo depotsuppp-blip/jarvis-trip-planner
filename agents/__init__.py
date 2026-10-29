@@ -17,8 +17,13 @@ it; while it works the manager also loses its own send_line_notification, and wh
 it does not, the manager keeps that one (it asks before sending). JARVIS_AGENTS=0
 turns the team off: one model with every built-in tool, as before (no calendar).
 
+Not in the team, though it lives here: the Head of Creative (creative_agent.py), which
+makes images. It is no model loop - one OpenAI Images API call per picture, saved in
+artifacts/ - so the manager holds its delegate_to_creative itself (LLMBrain._creative_tool),
+with or without the team, whenever OPENAI_API_KEY is set.
+
 Keys (.env): GEMINI_API_KEY (data, research, productivity fallback, last resort),
-GROQ_API_KEY (data fallback), OPENAI_API_KEY (productivity primary);
+GROQ_API_KEY (data fallback), OPENAI_API_KEY (productivity primary, images);
 LINE_CHANNEL_ACCESS_TOKEN + LINE_TARGET_USER_ID (LINE), GOOGLE_SERVICE_ACCOUNT_FILE +
 GOOGLE_CALENDAR_ID (the calendar).
 """

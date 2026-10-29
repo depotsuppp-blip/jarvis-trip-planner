@@ -141,7 +141,10 @@ google-genai>=1.0.0
 # other providers. Without a key a provider is simply skipped, so installing
 # them costs nothing until OPENAI_API_KEY / GROQ_API_KEY is set.
 #
-# OpenAI SDK: the Head of Productivity's primary model (gpt-4o-mini).
+# OpenAI SDK: the Head of Productivity's primary model (gpt-4o-mini), and the
+# Images API behind agents/creative_agent.py (gpt-image-2 -> gpt-image-1; the
+# pictures are saved in artifacts/, a link-only model's file is fetched with the
+# requests declared below).
 openai>=1.60.0
 # Groq SDK: the Head of Data & Documents' fallback (openai/gpt-oss-120b - Groq
 # retired its Llama 3.x models for free accounts on 2026-08-16).

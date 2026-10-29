@@ -1,0 +1,5 @@
+# Jarvis's Artifact Manager: what Jarvis makes is saved here - today the images from
+# agents/creative_agent.py (image_YYYYMMDD_HHMMSS.png). The folder is tracked so it
+# exists after a clone; what lands in it is personal output and stays out of git.
+*
+!.gitignore

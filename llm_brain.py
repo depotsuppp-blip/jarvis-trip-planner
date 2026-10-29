@@ -115,6 +115,15 @@ Several things were added to this module beyond plain tool calling:
       with no usable model, or whose servers are down, is left out and its
       server tools stay with the manager. JARVIS_AGENTS=0 turns the team off.
 
+  IMAGES  delegate_to_creative(image_description) hands a picture request to
+      the Head of Creative (agents/creative_agent.py): one call to OpenAI's
+      image model (gpt-image-2, then gpt-image-1 - DALL-E 3 was retired on
+      2026-05-12), saved as artifacts/image_YYYYMMDD_HHMMSS.png, and the
+      file's absolute path comes back for the reply (CREATIVE_RULE: written
+      out in the web chat, the folder and file name by voice). Not a model
+      loop and not part of the team, so it works with JARVIS_AGENTS=0 too;
+      there only when OPENAI_API_KEY is set, JARVIS_CREATIVE=0 turns it off.
+
 -------------------------------------------------------------------
 PROVIDERS
 -------------------------------------------------------------------
@@ -712,6 +721,38 @@ TEAM_RULE = (
     "say something was sent only when the report's tool lines say it was."
 )
 
+# Image generation (agents/creative_agent.py): a tool of the manager's own, not a team member.
+DELEGATE_CREATIVE = "delegate_to_creative"
+
+# Added to the per-turn context while the manager has that tool (creative_rule), in the
+# uncached block like TEAM_RULE: the tool is there only when OPENAI_API_KEY is set, and a
+# persona that always promised pictures would promise them without it.
+CREATIVE_RULE = (
+    "Images: you can create original, high-quality images. When the user asks you to draw, create, "
+    "generate or design a picture, an illustration, a logo, a poster, an icon or any other image, call "
+    "{tool} with a complete description in English - every detail they gave (translated if they wrote "
+    "in Thai) plus the subject, setting, composition, style, colours and mood that suit it - because "
+    "your Head of Creative does not see this conversation. Never say you cannot make images, and never "
+    "describe an image in words instead of making it. One call makes one image: make one per request "
+    "unless the user asks for more. The tool saves the image as a file on this computer and returns "
+    "its absolute path. {share} Say an image was made only when the tool's result starts with SUCCESS; "
+    "when it starts with ERROR, tell the user in one sentence what went wrong and do not call the tool "
+    "again for the same request."
+)
+CREATIVE_SHARE_WEB = "Give the user that path exactly as the tool wrote it, on its own line after one short sentence."
+CREATIVE_SHARE_VOICE = (
+    "Tell the user it is saved in the artifacts folder of the Jarvis project and say the file name; do "
+    "not read out the rest of the path."
+)
+
+
+def creative_rule(tools: list[ToolSpec], web: bool) -> str:
+    """CREATIVE_RULE when this call can make images, for a chat (path written out) or a voice call; else ""."""
+    if not any(tool.name == DELEGATE_CREATIVE for tool in tools):
+        return ""
+    return CREATIVE_RULE.format(tool=DELEGATE_CREATIVE, share=CREATIVE_SHARE_WEB if web else CREATIVE_SHARE_VOICE)
+
+
 # What the brain does when a reply holds a trip link or id that no tool returned
 # during this request (link_guard.py says which): it is not sent. The model gets
 # one chance to fix it - the likeliest cause is a plain request to plan a trip
@@ -963,6 +1004,34 @@ def _mentions_trip(text: str) -> bool:
     return any(fragment in raw for fragment in _TRIP_SUBSTRINGS)
 
 
+# A request for a picture is a tool call (delegate_to_creative), like a trip request: not a
+# design question for the reasoning tier ("design a logo" holds "design"), and not small
+# talk for the tool-less front door ("draw me a cat" holds no tool word). A drawing verb
+# on its own counts; a making verb needs an image noun with it ("make a poster", not
+# "make sense of this"). Thai, as substrings: draw a picture / make a picture / generate
+# a picture / make a logo / design a logo / illustration.
+_IMAGE_VERBS = frozenset({"draw", "paint", "illustrate"})
+_IMAGE_MAKE_VERBS = frozenset({"create", "generate", "make", "design", "render", "produce", "sketch"})
+_IMAGE_NOUNS = frozenset({
+    "image", "images", "picture", "pictures", "pic", "pics", "photo", "illustration", "illustrations",
+    "logo", "logos", "poster", "posters", "icon", "icons", "artwork", "drawing", "painting",
+    "wallpaper", "banner",
+})
+_IMAGE_SUBSTRINGS: tuple[str, ...] = (
+    "วาดรูป", "วาดภาพ", "สร้างรูป", "สร้างภาพ", "เจนรูป", "เจนภาพ", "ทำรูป", "ทำภาพ",
+    "ทำโลโก้", "ออกแบบโลโก้", "ภาพประกอบ",
+)
+
+
+def _asks_for_image(text: str) -> bool:
+    """True when the utterance asks for a picture to be made."""
+    words = set(re.sub(r"[^\w\s]", " ", text.lower()).split())
+    if words & _IMAGE_VERBS or (words & _IMAGE_MAKE_VERBS and words & _IMAGE_NOUNS):
+        return True
+    raw = text.lower()
+    return any(fragment in raw for fragment in _IMAGE_SUBSTRINGS)
+
+
 # "How is the system doing?" is a tool call (get_system_status), not conversation: the front
 # door has no tools and would answer it from nothing. Whole words, like the lists above.
 _STATUS_WORDS: tuple[str, ...] = ("cpu", "ram", "memory", "uptime", "telemetry")
@@ -1015,6 +1084,10 @@ def _classify_intent(text: str) -> tuple[str, str]:
     if _mentions_trip(text):
         return INTENT_STANDARD, "a trip request"
 
+    # The same for "design a logo": one tool call, not a design question.
+    if _asks_for_image(text):
+        return INTENT_STANDARD, "an image request"
+
     for marker in _DEEP_MARKERS:
         if f" {marker} " in lowered:
             return INTENT_COMPLEX, f"matched {marker!r}"
@@ -1060,6 +1133,15 @@ _FRONT_DOOR_REALTIME = (
     "anything that changes - is found by a web search the assistant behind you can do: "
     "route_to \"ORCHESTRATOR\" with response null. Never answer it from memory, and never "
     "say that no tool can do it."
+)
+
+# Added to the router's prompt while the assistant behind it can make images
+# (delegate_to_creative): the cheap model would otherwise answer "draw me a cat" itself.
+_FRONT_DOOR_CREATIVE = (
+    "\n- The assistant behind you can also create original images - a picture, a drawing, an "
+    "illustration, a logo, a poster - and save them as files: a request to draw, create, generate "
+    "or design any image is route_to \"ORCHESTRATOR\" with response null. Never say that you "
+    "cannot make images."
 )
 
 # A web address in the utterance: "what does https://... say", "summarise www.example.com".
@@ -1146,7 +1228,7 @@ def _looks_like_tool_command(text: str) -> bool:
     if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS + _AGENDA_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
-    return _mentions_trip(text) or _asks_system_status(text)
+    return _mentions_trip(text) or _asks_system_status(text) or _asks_for_image(text)
 
 
 # -- tool implementations ---------------------------------------------
@@ -2940,6 +3022,10 @@ class LLMBrain:
         self._team: dict[str, Any] = self._start_team()
         self._delegation_specs: dict[str, ToolSpec] = {}
 
+        # Image generation (agents/creative_agent.py): delegate_to_creative while it has a key.
+        self._creative: Any = self._start_creative()
+        self._creative_spec: Optional[ToolSpec] = None
+
         # Feature 2 bookkeeping: what went to the background, so the same
         # side effect cannot be fired twice (see _execute).
         self._recent_dispatches: dict[str, float] = {}
@@ -3010,6 +3096,8 @@ class LLMBrain:
             else:
                 why = "no model configured" if not agent.available else "its tool servers are not connected"
                 print(f"[Brain] Team: {agent.name} agent off ({why}); its tools stay with the manager.")
+        if self._creative is not None:
+            print(f"[Brain] Images: {DELEGATE_CREATIVE} -> {self._creative.describe()}.")
 
     # -- capabilities --------------------------------------------------
 
@@ -3091,12 +3179,14 @@ class LLMBrain:
         tool per working agent. An agent that cannot work (no model, or its tool servers
         are down) is left out and its server tools stay here, so a missing key never takes
         a capability away. An agent's own tools (the calendar, LINE) are never here.
+        Last, delegate_to_creative while image generation is set up.
         """
         working = self._working_agents()
         replaced = self._replaced_tool_names(working)
         builtins = [tool for tool in self._tools if tool.name not in replaced]
         mcp = [tool for tool in self._mcp_tools if not any(agent.owns(tool) for agent in working)]
-        return builtins + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working]
+        creative = [self._creative_tool()] if self._creative is not None and self._creative.available else []
+        return builtins + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working] + creative
 
     def _replaced_tool_names(self, working: Optional[list[Any]] = None) -> set[str]:
         """The built-in tools working agents have taken over (the productivity agent: send_line_notification)."""
@@ -3182,6 +3272,65 @@ class LLMBrain:
         footer = f"\nWHAT ITS TOOLS DID (from the tools themselves, not the agent's words):\n{done}" if done else ""
         return f"{header}\n{report}{footer}"
 
+    # -- images (agents/creative_agent.py) ------------------------------------
+
+    def _start_creative(self) -> Any:
+        """The Head of Creative, or None when JARVIS_CREATIVE=0 or it cannot be built. Never raises."""
+        if _env("JARVIS_CREATIVE", "1").lower() in ("0", "false", "no", "off"):
+            print("[Brain] Images off (JARVIS_CREATIVE=0).")
+            return None
+        try:
+            # Imported here, not at the top: the agents package imports this module.
+            from agents import creative_agent
+
+            return creative_agent.build()
+        except Exception as exc:  # noqa: BLE001 - images are an extra; the manager works without them
+            print(f"[Brain] Image generation could not start ({type(exc).__name__}: {exc}).")
+            return None
+
+    def _creative_tool(self) -> ToolSpec:
+        """delegate_to_creative: built once, the same object every turn (the tool list stays cacheable)."""
+        if self._creative_spec is None:
+            self._creative_spec = ToolSpec(
+                name=DELEGATE_CREATIVE,
+                description=(
+                    "Hand an image request to your Head of Creative, who creates an original, high-quality "
+                    "image with OpenAI's image model and saves it as a PNG file on this computer. Use it "
+                    "whenever the user asks you to draw, create, generate, design or make a picture, a photo-"
+                    "like image, an illustration, a logo, a poster, an icon or any other artwork. One call "
+                    "makes one image (it takes up to a minute). Returns SUCCESS with the absolute path of the "
+                    "saved file, or ERROR with what went wrong."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "image_description": {
+                            "type": "string",
+                            "description": (
+                                "The whole image, self-contained and in English (the Head of Creative does not "
+                                "see the conversation): the subject, setting, composition, style or medium, "
+                                "colours, lighting and mood, plus any text that must appear in it, word for word."
+                            ),
+                        }
+                    },
+                    "required": ["image_description"],
+                },
+                handler=lambda image_description="": self._create_image(image_description),
+                requires_confirmation=False,
+                # Foreground: the saved file's path IS the answer.
+                background=False,
+                label="the Head of Creative",
+                source="agent",
+            )
+        return self._creative_spec
+
+    def _create_image(self, image_description: str = "") -> str:
+        """Runs one image request on the Head of Creative; its SUCCESS/ERROR text goes back to the model."""
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        shown = str(image_description or "")[:160].encode(encoding, errors="backslashreplace").decode(encoding)
+        print(f"[Brain] Delegating to the Head of Creative: {shown}")
+        return self._creative.generate_image(image_description)
+
     def _team_rule(self, tools: list[ToolSpec]) -> str:
         """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
         members = [
@@ -3236,15 +3385,18 @@ class LLMBrain:
         "what's my sister's name?" belongs to the assistant behind it, and
         "Long-term memory of the person you are talking to ..." does.
         """
+        base = FRONT_DOOR_PROMPT
+        if self._creative is not None and self._creative.available:
+            base += _FRONT_DOOR_CREATIVE
         if not self._mcp_tools:
-            return FRONT_DOOR_PROMPT
+            return base
         notes = self._mcp.server_notes() if self._mcp is not None else []
         if not notes:
             names = ", ".join(t.label or t.name for t in self._mcp_tools[:12])
             notes = [("tools", names)]
         servers = "\n".join(f"  - {name}: {note}" for name, note in notes)
         return (
-            FRONT_DOOR_PROMPT
+            base
             + "\n- External tool servers are also connected to the assistant behind you:\n"
             + servers
             + "\n  A request one of them could answer - reading a link, a question about the user's "
@@ -3828,16 +3980,19 @@ class LLMBrain:
         # call can search the web.
         context = turn_context()
         if system is None:
+            caller = request_context.current()
             rule = realtime_rule(tools)
             if rule:
                 context += "\n\n" + rule
             team = self._team_rule(tools)
             if team:
                 context += "\n\n" + team
+            images = creative_rule(tools, web=caller is not None and caller.is_web)
+            if images:
+                context += "\n\n" + images
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
-            caller = request_context.current()
             if caller is not None and caller.is_web:
                 prompt += WEB_CHAT_ADDENDUM
                 if caller.voice_reply:
