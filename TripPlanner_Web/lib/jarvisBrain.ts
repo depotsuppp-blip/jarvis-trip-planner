@@ -84,8 +84,13 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };
 
-/** Who is asking, where this app lives, and whether to voice the reply - see the contract above. */
-export type ChatContext = { userId?: string; appUrl?: string; speak?: boolean };
+/**
+ * Who is asking, where this app lives, and whether to voice the reply - see the contract above.
+ * `signal` is the person's own request: when they stop it (the hub's "Stop generating"), the
+ * call to the brain is dropped and a JarvisBrainCancelled is thrown, so nothing is saved. The
+ * brain itself finishes the turn it started - this only stops waiting for it.
+ */
+export type ChatContext = { userId?: string; appUrl?: string; speak?: boolean; signal?: AbortSignal };
 
 /** A typed turn's extras: the files attached to it (see `attachments` in the contract above). */
 export type AskContext = ChatContext & { attachments?: Attachment[] };
@@ -112,6 +117,19 @@ const BRAIN_TIMEOUT_MS = 120_000;
 
 export class JarvisBrainError extends Error {}
 
+/** The person stopped waiting (their request was aborted): not a failure, and nothing to save or show. */
+export class JarvisBrainCancelled extends JarvisBrainError {
+  constructor() {
+    super("Stopped.");
+  }
+}
+
+/** The brain call's signal: our own time limit, and the person's request when there is one. */
+function brainSignal(context: ChatContext): AbortSignal {
+  const limit = AbortSignal.timeout(BRAIN_TIMEOUT_MS);
+  return context.signal ? AbortSignal.any([limit, context.signal]) : limit;
+}
+
 export async function askJarvis(
   message: string,
   history: ChatTurn[],
@@ -132,9 +150,10 @@ export async function askJarvis(
         ...(context.attachments?.length ? { attachments: context.attachments } : {}),
       }),
       cache: "no-store",
-      signal: AbortSignal.timeout(BRAIN_TIMEOUT_MS),
+      signal: brainSignal(context),
     });
   } catch (error) {
+    if (context.signal?.aborted) throw new JarvisBrainCancelled();
     const timedOut = error instanceof DOMException && error.name === "TimeoutError";
     console.error(`Jarvis brain unreachable at ${BRAIN_URL}:`, error);
     throw new JarvisBrainError(
@@ -148,6 +167,7 @@ export async function askJarvis(
   }
 
   const data = (await response.json().catch(() => null)) as { reply?: unknown; audio?: unknown } | null;
+  if (context.signal?.aborted) throw new JarvisBrainCancelled();
   const reply = replyAsText(data?.reply);
   if (!reply) throw new JarvisBrainError("Jarvis brain sent an empty reply.");
   return { reply, audio: context.speak ? parseReplyAudio(data?.audio) : null };
@@ -195,15 +215,17 @@ export async function askJarvisByVoice(
       method: "POST",
       body: form,
       cache: "no-store",
-      signal: AbortSignal.timeout(BRAIN_TIMEOUT_MS),
+      signal: brainSignal(context),
     });
   } catch (error) {
+    if (context.signal?.aborted) throw new JarvisBrainCancelled();
     const timedOut = error instanceof DOMException && error.name === "TimeoutError";
     console.error(`Jarvis voice endpoint unreachable at ${VOICE_URL}:`, error);
     throw new JarvisVoiceError(timedOut ? "Jarvis brain took too long to answer." : "Jarvis brain is offline.");
   }
 
   const data: unknown = await response.json().catch(() => null);
+  if (context.signal?.aborted) throw new JarvisBrainCancelled();
   const body = (data && typeof data === "object" ? data : {}) as Record<string, unknown>;
 
   if (!response.ok) {

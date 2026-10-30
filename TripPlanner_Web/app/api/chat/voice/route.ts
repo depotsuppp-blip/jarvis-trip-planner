@@ -10,7 +10,7 @@ import {
   saveReply,
   saveUserMessage,
 } from "@/lib/chatTurns";
-import { askJarvisByVoice, JarvisBrainError, JarvisVoiceError, type ChatTurn } from "@/lib/jarvisBrain";
+import { askJarvisByVoice, JarvisBrainCancelled, JarvisBrainError, JarvisVoiceError, type ChatTurn } from "@/lib/jarvisBrain";
 import { checkRateLimit } from "@/lib/rateLimit";
 import { speakableAudio } from "@/lib/jarvis/replyAudio";
 
@@ -45,7 +45,8 @@ const TargetSchema = z.object({
  * Responses: 200 { conversationId, userMessage, reply, transcript, engine, audio? },
  * 400 not a recording, 401 signed out, 404 unknown conversation, 413 too big,
  * 415 not audio, 422 nothing was heard, 429 rate-limited, 502 transcription or
- * the brain failed, 500 database failed.
+ * the brain failed, 500 database failed, 499 the person stopped it ("Stop generating":
+ * the brain call is dropped and nothing of the turn is saved).
  *
  * `engine` says who transcribed it: "openai" (the Whisper API) or "local"
  * (faster-whisper on the brain's own machine, when it has no OpenAI key).
@@ -104,8 +105,10 @@ export async function POST(request: NextRequest) {
 
   let heard: Awaited<ReturnType<typeof askJarvisByVoice>>;
   try {
-    heard = await askJarvisByVoice(audio, history, { userId, appUrl: request.nextUrl.origin, speak });
+    heard = await askJarvisByVoice(audio, history, { userId, appUrl: request.nextUrl.origin, speak, signal: request.signal });
   } catch (error) {
+    // "Stop generating": the person dropped this turn before seeing a word of it, so none of it is kept.
+    if (error instanceof JarvisBrainCancelled || request.signal.aborted) return stopped();
     const failure = error instanceof JarvisVoiceError ? error : null;
     const message = error instanceof JarvisBrainError ? error.message : "Jarvis couldn't answer just now.";
     console.error("POST /api/chat/voice: the brain failed:", error);
@@ -126,6 +129,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: 502 });
   }
 
+  // Stopped while the answer was on its way in: nothing of this turn reached the page, so nothing is saved.
+  if (request.signal.aborted) return stopped();
+
   try {
     const conversation = existing ?? (await createConversation(userId, heard.transcript));
     const userMessage = await saveUserMessage(conversation.id, heard.transcript);
@@ -143,4 +149,10 @@ export async function POST(request: NextRequest) {
     console.error("POST /api/chat/voice failed saving the turn:", error);
     return NextResponse.json({ error: "Couldn't save the conversation. Please try again." }, { status: 500 });
   }
+}
+
+/** The answer to a turn the person stopped ("Stop generating"): nobody reads it, and nothing was saved. */
+function stopped() {
+  console.info("POST /api/chat/voice: stopped by the person; nothing of the turn is saved.");
+  return NextResponse.json({ error: "Stopped." }, { status: 499 });
 }

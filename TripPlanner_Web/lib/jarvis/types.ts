@@ -105,6 +105,19 @@ export interface ChatState {
   /** Bumped whenever the whole message list is swapped (a session change), so the feed jumps instead of gliding. */
   epoch: number;
   agents: AgentStatus[];
+  /** A reply is on its way: the feed ends in Jarvis's "thinking" bubble (PendingReply). Null when none is. */
+  pending: PendingReply | null;
+}
+
+/**
+ * What the thinking bubble says. `status` is what Jarvis is doing, in words - "Searching the
+ * web", "Generating an image" - from whatever can tell (ChatController.reportStatus); null
+ * means nothing has, and the bubble says it is thinking. Today nothing does: the brain
+ * answers each turn in one response, with no progress on the way, so this is the slot a
+ * streamed status will fill.
+ */
+export interface PendingReply {
+  status: string | null;
 }
 
 export interface OrbState {

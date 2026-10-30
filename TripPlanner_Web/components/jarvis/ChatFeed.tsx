@@ -7,35 +7,39 @@ import { useChat, useChatActions } from "@/lib/jarvis/JarvisProvider";
 import type { Access } from "@/lib/jarvis/types";
 import { useGreeting } from "@/lib/jarvis/useClock";
 import { MessageBubble } from "./MessageBubble";
+import { PendingReply } from "./PendingReply";
 import { focusRing, thinScroll } from "./styles";
 
 /**
  * The conversation: a scrolling log of messages, or - before there are any -
  * a greeting that says what to do, a skeleton while a session loads, or a plain
- * statement and a retry when it failed.
+ * statement and a retry when it failed. While a reply is on its way it ends in
+ * Jarvis's thinking bubble (PendingReply), with Stop generating under it.
  *
- * It stays readable while Jarvis listens or thinks - nothing is laid over it; the
- * Signal Orb in the sidebar and the top bar say what Jarvis is doing. It re-renders
- * when the message list changes; the rows are memoised, so that costs the history
- * above a new reply nothing.
+ * It stays readable and scrollable while Jarvis listens or thinks - nothing is laid
+ * over it. It re-renders when the message list changes and when a reply starts or
+ * stops being on its way; the rows are memoised, so that costs the history above a
+ * new reply nothing.
  */
 export const ChatFeed = memo(function ChatFeed() {
   const messages = useChat((state) => state.messages);
   const conversation = useChat((state) => state.conversation);
   const access = useChat((state) => state.access);
   const epoch = useChat((state) => state.epoch);
+  const waiting = useChat((state) => state.pending !== null);
 
   const scroller = useRef<HTMLDivElement | null>(null);
   const seenEpoch = useRef(epoch);
 
-  // Follow the conversation to its newest message: glide for a new message, jump when a whole other session arrived.
+  // Follow the conversation to its foot - the newest message, or the thinking bubble under the
+  // message just sent: glide for those, jump when a whole other session arrived.
   useEffect(() => {
     const element = scroller.current;
     if (!element) return;
     const jump = seenEpoch.current !== epoch || window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     seenEpoch.current = epoch;
     element.scrollTo({ top: element.scrollHeight, behavior: jump ? "auto" : "smooth" });
-  }, [messages, epoch]);
+  }, [messages, epoch, waiting]);
 
   return (
     <div ref={scroller} className={`min-h-0 flex-1 overflow-y-auto ${thinScroll}`}>
@@ -49,6 +53,8 @@ export const ChatFeed = memo(function ChatFeed() {
             <MessageBubble key={message.id} message={message} />
           ))}
         </ol>
+        {/* Outside the log: it is not a message, and its own status line is what gets announced. */}
+        <PendingReply />
       </div>
     </div>
   );

@@ -103,7 +103,11 @@ export interface ChatActions {
   toggleVoice(): void;
   /** Stops recording and sends it (what Talk does while recording). */
   finishVoice(): Promise<void>;
-  /** Throws a recording away unsent, or gives up on a turn that is waiting for its answer. */
+  /**
+   * Throws a recording away unsent, or stops a turn that is waiting for its answer - spoken or
+   * typed ("Stop generating", Cancel, Escape). A stopped turn's request is aborted: its answer is
+   * neither shown nor saved (the server drops it too), and the person's own message stays.
+   */
   endVoice(): void;
   /** Turns voice replies on or off. Turning them off also cuts off a reply that is being read out. */
   toggleSpeech(): void;
@@ -128,6 +132,7 @@ function initialChat(): ChatState {
     messages: [],
     epoch: 0,
     agents: initialAgents(),
+    pending: null,
   };
 }
 
@@ -162,6 +167,8 @@ export class ChatController {
   private bootstrapping: Promise<void> = Promise.resolve();
   /** The tool-status refresh (see refreshTools); its own timer, because clearTimers runs on every turn. */
   private toolsTimer: number | null = null;
+  /** The current turn's request to the server: what "Stop generating" aborts. */
+  private request: AbortController | null = null;
 
   /** Stable for the life of the controller: pass them around freely, nothing re-renders because of them. */
   readonly actions: ChatActions = {
@@ -195,6 +202,8 @@ export class ChatController {
   dispose(): void {
     this.disposed = true;
     this.stopToolsTimer();
+    this.request?.abort();
+    this.request = null;
     this.abandonRecording();
     this.clearTimers();
     this.turn++;
@@ -277,7 +286,8 @@ export class ChatController {
     const state = this.chat.getState();
     if (id === state.activeSessionId && state.conversation !== "error") return;
 
-    this.cancelTurn();
+    // Leaving a session is not "stop": a turn on its way finishes, and its reply is saved there.
+    this.cancelTurn({ keepRequest: true });
     const epoch = ++this.epoch;
     this.chat.setState({ activeSessionId: id, conversation: "loading", messages: [], epoch });
 
@@ -304,7 +314,8 @@ export class ChatController {
   }
 
   newSession(): void {
-    this.cancelTurn();
+    // As in selectSession: a turn on its way finishes in the session it belongs to.
+    this.cancelTurn({ keepRequest: true });
     const epoch = ++this.epoch;
     this.chat.setState({ activeSessionId: null, conversation: "ready", messages: [], epoch });
   }
@@ -334,6 +345,7 @@ export class ChatController {
       ...(file ? { attachments: [{ name: file.name, size: file.size }] } : {}),
     });
     this.orb.setState({ mode: "thinking", voice: false });
+    this.showPending();
 
     if (demo) {
       this.later(DEMO_THINK_MS, () => {
@@ -345,17 +357,26 @@ export class ChatController {
 
     this.setAgent("brain", "working");
     await this.bootstrapping;
-    if (this.disposed) return;
+    // Stopped (or the session left) while the page was still loading: the turn never goes out.
+    if (this.disposed || this.turn !== mine) return;
 
     const epoch = this.epoch;
     const { activeSessionId } = this.chat.getState();
-    const result = await chatApi.send({
-      message: text,
-      ...(file ? { file } : {}),
-      ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
-      ...(this.speech.getState().enabled ? { speak: true } : {}),
-    });
+    const request = this.beginRequest();
+    const result = await chatApi.send(
+      {
+        message: text,
+        ...(file ? { file } : {}),
+        ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
+        ...(this.speech.getState().enabled ? { speak: true } : {}),
+      },
+      request.signal
+    );
+    if (this.request === request) this.request = null;
     if (this.disposed) return;
+    // Stopped: endVoice has already put everything back; the answer is dropped on purpose.
+    if (!result.ok && result.kind === "cancelled") return;
+    this.hidePending(mine);
 
     let toSpeak: SpokenReply | null = null;
     if (result.ok) {
@@ -469,6 +490,7 @@ export class ChatController {
     this.clearTimers();
     const mine = ++this.turn;
     this.orb.setState({ mode: "thinking", voice: true });
+    this.showPending();
     this.setAgent("voice", "working", "Transcribing");
 
     let audio: RecordedAudio;
@@ -492,15 +514,24 @@ export class ChatController {
     }
 
     await this.bootstrapping;
-    if (this.disposed) return;
+    if (this.disposed || this.turn !== mine) return;
 
     const epoch = this.epoch;
     const { activeSessionId } = this.chat.getState();
-    const result = await chatApi.sendVoice(audio.blob, {
-      ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
-      ...(this.speech.getState().enabled ? { speak: true } : {}),
-    });
+    const request = this.beginRequest();
+    const result = await chatApi.sendVoice(
+      audio.blob,
+      {
+        ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
+        ...(this.speech.getState().enabled ? { speak: true } : {}),
+      },
+      request.signal
+    );
+    if (this.request === request) this.request = null;
     if (this.disposed) return;
+    // Stopped: endVoice has already put everything back; nothing of this turn is shown (or saved).
+    if (!result.ok && result.kind === "cancelled") return;
+    this.hidePending(mine);
 
     let toSpeak: SpokenReply | null = null;
     if (result.ok) {
@@ -602,6 +633,8 @@ export class ChatController {
     this.turn++;
     this.player.stop();
     this.orb.setState({ mode, voice: mode !== "idle" });
+    // "Thinking" shows the thinking bubble too, so it can be looked at without a real turn.
+    this.chat.setState({ pending: mode === "thinking" ? { status: null } : null });
   }
 
   previewWidget(tool: DemoTool): void {
@@ -611,6 +644,7 @@ export class ChatController {
     const mine = ++this.turn;
     this.player.stop();
     this.orb.setState({ mode: "thinking", voice: false });
+    this.showPending();
     this.later(DEMO_THINK_MS, () => {
       this.append({ role: "jarvis", content: demoReply(tool, Date.now()), origin: "demo" });
       this.settle(mine);
@@ -619,14 +653,54 @@ export class ChatController {
 
   // ------------------------------------------------------------------ helpers
 
-  /** Stops whatever the orb is part-way through and sends it home. A recording in progress is thrown away. */
-  private cancelTurn(): void {
+  /**
+   * Stops whatever the orb is part-way through and sends it home. A recording in progress is
+   * thrown away, and the request of a turn waiting for its answer is aborted ("Stop generating"):
+   * the page drops the answer and the server does not save it. `keepRequest` is for leaving a
+   * session (selectSession, newSession): that turn's request carries on, and its reply is saved
+   * in the session it belongs to.
+   */
+  private cancelTurn({ keepRequest = false }: { keepRequest?: boolean } = {}): void {
+    if (!keepRequest) this.request?.abort();
+    this.request = null;
     this.abandonRecording();
     this.clearTimers();
     this.turn++;
     this.player.stop();
     this.orb.setState({ mode: "idle", voice: false });
+    if (this.chat.getState().pending) this.chat.setState({ pending: null });
     this.resetVoiceAgent();
+    // A stopped typed turn will never hear back: the manager is not working on it any more as far as this page knows.
+    if (!keepRequest && this.chat.getState().agents.find((agent) => agent.id === "brain")?.state === "working") {
+      this.setAgent("brain", "ready");
+    }
+  }
+
+  /** A new request for this turn: its signal is what cancelTurn aborts. */
+  private beginRequest(): AbortController {
+    const request = new AbortController();
+    this.request = request;
+    return request;
+  }
+
+  /** Jarvis's thinking bubble at the foot of the feed, for this turn. */
+  private showPending(): void {
+    this.chat.setState({ pending: { status: null } });
+  }
+
+  /** Takes the bubble away - unless a newer turn already has its own. */
+  private hidePending(turn: number): void {
+    if (this.turn === turn && this.chat.getState().pending) this.chat.setState({ pending: null });
+  }
+
+  /**
+   * What Jarvis is doing, in words ("Searching the web", "Generating an image"), for the thinking
+   * bubble - for whatever can tell while a turn is on its way; null goes back to "thinking".
+   * Nothing calls it yet: the brain answers a turn in one response, with no progress before it.
+   * A streamed status (server-sent events from the brain's tool calls) would call it per step.
+   */
+  reportStatus(status: string | null): void {
+    if (this.chat.getState().pending) this.chat.setState({ pending: { status } });
   }
 
   /** A cancelled recording or upload must not leave the sidebar saying Voice is working. */
@@ -650,6 +724,7 @@ export class ChatController {
   /** Back to idle - but only if nobody pressed Cancel or began another turn meanwhile. */
   private settle(turn: number): void {
     if (this.turn === turn) this.orb.setState({ mode: "idle", voice: false });
+    this.hidePending(turn);
   }
 
   private append(

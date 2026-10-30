@@ -28,7 +28,9 @@ export type ApiFailureKind =
   | "no-speech"
   | "brain"
   | "server"
-  | "network";
+  | "network"
+  // The page itself stopped the request ("Stop generating"): not a failure to report.
+  | "cancelled";
 
 export interface ApiFailure {
   ok: false;
@@ -121,15 +123,22 @@ function kindFor(status: number): ApiFailureKind {
   return "server";
 }
 
+/** A read's own time limit ran out - unlike the page stopping a turn, that IS a failure to report. */
+function isTimeout(signal: AbortSignal): boolean {
+  return signal.reason instanceof DOMException && signal.reason.name === "TimeoutError";
+}
+
 async function request<T>(url: string, init: RequestInit = {}): Promise<ApiResult<T>> {
   let response: Response;
   try {
     response = await fetch(url, { credentials: "same-origin", ...init });
   } catch {
+    if (init.signal?.aborted && !isTimeout(init.signal)) return { ok: false, kind: "cancelled", status: 0, message: "" };
     return { ok: false, kind: "network", status: 0, message: FALLBACK_MESSAGE };
   }
 
   const data: unknown = await response.json().catch(() => null);
+  if (init.signal?.aborted && !isTimeout(init.signal)) return { ok: false, kind: "cancelled", status: 0, message: "" };
   if (response.ok) return { ok: true, data: data as T };
 
   const kind = kindFor(response.status);
@@ -165,12 +174,14 @@ export const chatApi = {
 
   // No client timeout: the brain may run a whole trip plan (tens of seconds) and the server enforces its own limit.
   // With a file the turn goes as multipart (no Content-Type set, so the browser adds the boundary); without, as JSON.
-  send: ({ file, ...turn }: TurnRequest) => {
+  // `signal` is "Stop generating": aborting it answers { ok: false, kind: "cancelled" }, and the server saves no reply.
+  send: ({ file, ...turn }: TurnRequest, signal?: AbortSignal) => {
     if (!file) {
       return request<TurnData>("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(turn),
+        signal,
       });
     }
     const form = new FormData();
@@ -179,18 +190,18 @@ export const chatApi = {
     if (turn.conversationId) form.append("conversationId", turn.conversationId);
     else if (turn.newConversation) form.append("newConversation", "true");
     if (turn.speak) form.append("speak", "true");
-    return request<TurnData>("/api/chat", { method: "POST", body: form });
+    return request<TurnData>("/api/chat", { method: "POST", body: form, signal });
   },
 
   // The recording goes as multipart, and no Content-Type is set so the browser adds the boundary.
   // No client timeout, for the same reason as `send`: transcription and then the brain's whole turn.
-  sendVoice: (audio: Blob, turn: Omit<TurnRequest, "message">) => {
+  sendVoice: (audio: Blob, turn: Omit<TurnRequest, "message">, signal?: AbortSignal) => {
     const form = new FormData();
     form.append("audio", audio, `voice.${extensionFor(audio.type)}`);
     if (turn.conversationId) form.append("conversationId", turn.conversationId);
     else if (turn.newConversation) form.append("newConversation", "true");
     if (turn.speak) form.append("speak", "true");
-    return request<VoiceTurnData>("/api/chat/voice", { method: "POST", body: form });
+    return request<VoiceTurnData>("/api/chat/voice", { method: "POST", body: form, signal });
   },
 };
 

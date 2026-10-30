@@ -11,7 +11,7 @@ import {
   saveReply,
   saveUserMessage,
 } from "@/lib/chatTurns";
-import { askJarvis, JarvisBrainError, type ChatTurn } from "@/lib/jarvisBrain";
+import { askJarvis, JarvisBrainCancelled, JarvisBrainError, type ChatTurn } from "@/lib/jarvisBrain";
 import { MAX_DOCUMENT_BYTES, storedUserMessage, type Attachment } from "@/lib/jarvis/attachments";
 import { speakableAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 import { prisma } from "@/lib/prisma";
@@ -108,6 +108,11 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  * failure never loses it: that case answers 502 and the message stays in
  * the history.
  *
+ * "Stop generating" in the hub aborts this request. The call to the brain is
+ * dropped with it (request.signal), and the reply - if it still arrives - is not
+ * saved: the person's message stays, unanswered, exactly as they saw it. The
+ * brain itself (Python) finishes the turn it started; this only stops waiting.
+ *
  * The brain is told who is asking (the session's user id) and which origin
  * this app is served from: its trip tool plans a trip FOR that person
  * (personalized from their Taste Profile) by calling back into this instance
@@ -123,7 +128,8 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  *
  * Responses: 200 { conversationId, userMessage, reply, audio? }, 400 bad body, 401
  * signed out, 404 unknown conversation, 413 / 415 / 503 the file (above), 429
- * rate-limited, 502 brain failed, 500 database (or disk) failed. With a file,
+ * rate-limited, 502 brain failed, 500 database (or disk) failed, 499 stopped by the person
+ * (the reply is not saved). With a file,
  * `userMessage.content` is the stored form: JSON with the text and the file.
  */
 export async function POST(request: NextRequest) {
@@ -194,17 +200,27 @@ export async function POST(request: NextRequest) {
   let replyText: string;
   let audio: ReplyAudio | null = null;
   try {
-    const answer = await askJarvis(message, history, { userId, appUrl: request.nextUrl.origin, speak, attachments });
+    const answer = await askJarvis(message, history, {
+      userId,
+      appUrl: request.nextUrl.origin,
+      speak,
+      attachments,
+      signal: request.signal,
+    });
     replyText = answer.reply.trim();
     if (!replyText) throw new Error("The brain returned an empty reply.");
     audio = speakableAudio(replyText, answer.audio);
   } catch (error) {
+    if (error instanceof JarvisBrainCancelled || request.signal.aborted) return stopped(conversation.id);
     console.error(`POST /api/chat: the brain failed for conversation ${conversation.id}:`, error);
     return NextResponse.json(
       { error: error instanceof JarvisBrainError ? error.message : "Jarvis couldn't answer just now.", conversationId: conversation.id, userMessage },
       { status: 502 }
     );
   }
+
+  // Stopped while the answer was on its way in: the person never sees it, so it is not kept either.
+  if (request.signal.aborted) return stopped(conversation.id);
 
   try {
     const reply = await saveReply(conversation.id, replyText);
@@ -225,6 +241,15 @@ export async function POST(request: NextRequest) {
  * A message's `content` is returned as stored. For a reply from a tool it may
  * be a JSON object instead of prose; the hub parses it (lib/jarvis/messageContent.ts).
  */
+/**
+ * The answer to a request the person stopped. Nobody reads it (the page dropped the
+ * request), so it only has to be honest: 499, the code proxies use for "client closed".
+ */
+function stopped(conversationId: string) {
+  console.info(`POST /api/chat: stopped by the person (conversation ${conversationId}); the reply is not saved.`);
+  return NextResponse.json({ error: "Stopped.", conversationId }, { status: 499 });
+}
+
 export async function GET(request: NextRequest) {
   const userId = await getSessionUserId();
   if (!userId) {

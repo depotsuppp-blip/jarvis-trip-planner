@@ -15,10 +15,10 @@ import { focusRing } from "./styles";
  *
  * Talk records for real (lib/jarvis/voiceRecorder.ts) and is a toggle: one press
  * starts, the next sends. While it records, the field gives its place to a
- * "Recording 0:07" clock and Talk says "Send". While Jarvis works on a turn - typed
- * or spoken - the field, Send and Attach wait, Talk is off, and Cancel ends the turn
- * (Escape does too). Cancel is there for as long as a turn is: recording, then
- * waiting for the answer.
+ * "Recording 0:07" clock, Talk says "Send" and Cancel throws the recording away.
+ * While Jarvis works on an answer - typed or spoken - the field, Send and Attach
+ * wait and Talk is off; the way out is "Stop generating" under the thinking bubble
+ * at the foot of the conversation (PendingReply). Escape does either, any time.
  *
  * Attach (the paperclip) picks one file - PDF, Word .docx or text, the kinds
  * Jarvis's reader can open (lib/jarvis/attachments.ts) - which waits as a chip
@@ -79,8 +79,8 @@ export const Composer = memo(function Composer() {
     return () => document.removeEventListener("keydown", onKey);
   }, [busy, actions]);
 
-  // A turn is over and the control that held focus is gone or was switched off (Cancel, or the
-  // field while it waited): put the keyboard back where the next turn starts - Talk after a
+  // A turn is over and the control that held focus is gone or was switched off (Cancel, Stop
+  // generating, or the field while it waited): put the keyboard back where the next turn starts - Talk after a
   // spoken one, the field after a typed one - unless the person already went elsewhere.
   useEffect(() => {
     if (busy) {
@@ -164,11 +164,11 @@ export const Composer = memo(function Composer() {
           <Paperclip className="size-5" aria-hidden="true" />
         </button>
 
-        {busy && (
+        {listening && (
           <button
             type="button"
             onClick={actions.endVoice}
-            aria-label={listening ? "Cancel recording" : "Cancel this turn"}
+            aria-label="Cancel recording"
             title="Cancel (Esc)"
             className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] sm:w-auto sm:px-3.5 ${focusRing}`}
           >
@@ -181,7 +181,7 @@ export const Composer = memo(function Composer() {
           ref={talk}
           type="button"
           onClick={actions.toggleVoice}
-          // While Jarvis is answering, Cancel is the one way out; Talk waits for the next turn.
+          // While Jarvis is answering, Stop generating (under the thinking bubble) is the way out; Talk waits for the next turn.
           disabled={busy && !listening}
           aria-label={listening ? "Stop recording and send" : "Talk to Jarvis"}
           aria-pressed={voice}
