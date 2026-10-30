@@ -1,15 +1,14 @@
 "use client";
 
-import { createContext, createRef, useContext, useEffect, useState, type ReactNode, type RefObject } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { ChatController, type ChatActions } from "./chatController";
 import { createShellStore, type ShellState, type ShellStore } from "./shell";
 import { useStore } from "./store";
 import type { ChatState, OrbState, SpeechState } from "./types";
 
 /**
- * Hands the hub's three long-lived things to the components below it: the
- * controller (chat + orb state and every action), the shell (layout state) and
- * the two DOM anchors the orb is placed from.
+ * Hands the hub's two long-lived things to the components below it: the
+ * controller (chat + orb state and every action) and the shell (layout state).
  *
  * The context value is created once and never changes, so reading it re-renders
  * nobody. Components get data through the selector hooks below, which subscribe
@@ -19,13 +18,6 @@ import type { ChatState, OrbState, SpeechState } from "./types";
 interface JarvisContextValue {
   controller: ChatController;
   shell: ShellStore;
-  /**
-   * Where the orb sits when idle: `slot` is the empty box inside the composer that
-   * the small orb floats over. Set by the Composer, read by OrbStage - a ref, never
-   * state, so moving it re-renders nothing. (The stage the orb centres itself on is
-   * found from the slot, by `data-jarvis-stage`: see OrbStage.)
-   */
-  anchors: { slot: RefObject<HTMLDivElement | null> };
 }
 
 const JarvisContext = createContext<JarvisContextValue | null>(null);
@@ -34,7 +26,6 @@ export function JarvisProvider({ children }: { children: ReactNode }) {
   const [value] = useState<JarvisContextValue>(() => ({
     controller: new ChatController(),
     shell: createShellStore(),
-    anchors: { slot: createRef<HTMLDivElement>() },
   }));
 
   useEffect(() => {
@@ -79,9 +70,4 @@ export function useChatActions(): ChatActions {
 /** The shell's own actions (collapse, open and close the drawer). Stable. */
 export function useShellActions(): ShellStore {
   return useJarvis().shell;
-}
-
-/** The orb's home anchor; read its `.current` only in effects and event handlers. */
-export function useOrbAnchors(): JarvisContextValue["anchors"] {
-  return useJarvis().anchors;
 }

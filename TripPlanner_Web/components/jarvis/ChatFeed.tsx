@@ -3,8 +3,8 @@
 import { memo, useEffect, useRef } from "react";
 import Link from "next/link";
 import { RefreshCw } from "lucide-react";
-import { useChat, useChatActions, useOrb } from "@/lib/jarvis/JarvisProvider";
-import { isFocalMode, type Access } from "@/lib/jarvis/types";
+import { useChat, useChatActions } from "@/lib/jarvis/JarvisProvider";
+import type { Access } from "@/lib/jarvis/types";
 import { useGreeting } from "@/lib/jarvis/useClock";
 import { MessageBubble } from "./MessageBubble";
 import { focusRing, thinScroll } from "./styles";
@@ -14,16 +14,16 @@ import { focusRing, thinScroll } from "./styles";
  * a greeting that says what to do, a skeleton while a session loads, or a plain
  * statement and a retry when it failed.
  *
- * It re-renders when the message list changes and when the orb goes in or out of
- * its centre-stage modes (to dim). The rows are memoised, so neither costs the
- * history above a new reply anything.
+ * It stays readable while Jarvis listens or thinks - nothing is laid over it; the
+ * Signal Orb in the sidebar and the top bar say what Jarvis is doing. It re-renders
+ * when the message list changes; the rows are memoised, so that costs the history
+ * above a new reply nothing.
  */
 export const ChatFeed = memo(function ChatFeed() {
   const messages = useChat((state) => state.messages);
   const conversation = useChat((state) => state.conversation);
   const access = useChat((state) => state.access);
   const epoch = useChat((state) => state.epoch);
-  const focal = useOrb((state) => isFocalMode(state.mode));
 
   const scroller = useRef<HTMLDivElement | null>(null);
   const seenEpoch = useRef(epoch);
@@ -38,13 +38,7 @@ export const ChatFeed = memo(function ChatFeed() {
   }, [messages, epoch]);
 
   return (
-    <div
-      ref={scroller}
-      aria-hidden={focal}
-      className={`min-h-0 flex-1 overflow-y-auto transition-opacity duration-500 ease-out motion-reduce:transition-none ${thinScroll} ${
-        focal ? "pointer-events-none opacity-30" : "opacity-100"
-      }`}
-    >
+    <div ref={scroller} className={`min-h-0 flex-1 overflow-y-auto ${thinScroll}`}>
       <div className="mx-auto w-full max-w-2xl px-4 py-8">
         {conversation === "loading" && messages.length === 0 && <FeedSkeleton />}
         {conversation === "error" && <FeedError />}

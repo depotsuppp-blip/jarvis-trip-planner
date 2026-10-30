@@ -43,7 +43,7 @@ import {
  * switching voice replies off cuts the clip off.
  *
  * Staleness. Two counters keep an old answer from landing in the wrong place:
- * `turn` says which turn the orb belongs to (End, a new turn or a session
+ * `turn` says which turn the orb belongs to (Cancel, a new turn or a session
  * change bumps it, so a finished request does not drag the orb back to idle),
  * and `epoch` says which session the message list belongs to (a request that
  * finishes after the person has opened another session is not appended to it).
@@ -647,7 +647,7 @@ export class ChatController {
     this.append({ role: "jarvis", content: { text, widgets: [] }, origin: "server", tone: "error" });
   }
 
-  /** Back to idle - but only if nobody pressed End or began another turn meanwhile. */
+  /** Back to idle - but only if nobody pressed Cancel or began another turn meanwhile. */
   private settle(turn: number): void {
     if (this.turn === turn) this.orb.setState({ mode: "idle", voice: false });
   }

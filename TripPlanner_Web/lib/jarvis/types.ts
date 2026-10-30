@@ -118,7 +118,7 @@ export interface SpeechState {
   enabled: boolean;
 }
 
-/** Centre stage only while Jarvis is being listened to or is thinking; idle and speaking send the orb home. */
+/** A turn is in progress: Jarvis is being listened to or is working on an answer (the dock offers Cancel; idle and speaking do not). */
 export function isFocalMode(mode: OrbMode): boolean {
   return mode === "listening" || mode === "thinking";
 }
