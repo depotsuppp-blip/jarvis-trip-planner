@@ -1,0 +1,807 @@
+"""
+The Head of Publishing: PowerPoint presentations (.pptx), built from a slide plan.
+
+Phase 2 of the capability orchestrator, the second native capability after images
+(creative_agent.py): Jarvis hands over a real file, not only text.
+
+    manager (llm_brain) --delegate_to_publishing(presentation_data)--> PublishingAgent
+        -> the JSON read and checked against the shape below (parse_deck)
+        -> a text size chosen for every slide, or an ERROR when it cannot fit (plan_deck)
+        -> python-pptx lays out a 16:9 deck: an opening slide, then one slide per entry
+        -> saved as artifacts/presentation_YYYYMMDD_HHMMSS.pptx, opened again and checked
+        <- "SUCCESS: ...\nPath: <absolute path>\nURL: /artifacts/<file name>"
+           or "ERROR: <what was wrong and what to change>"
+
+In the web chat the brain swaps the Path and URL lines for a Markdown download link,
+[Download Presentation](/artifacts/<file name>) (markdown_link): api_server.py serves the
+folder at that path, and the web app hands the file to the person whose chat shows the
+link (TripPlanner_Web/app/artifacts/[name]).
+
+NOT A LANGUAGE-MODEL LOOP, like the Head of Creative. The manager plans the content -
+with the Head of Research when it needs facts - and writes the JSON; this lays it out.
+No API, no key and no cost: it is there whenever python-pptx is installed.
+
+THE DATA. One JSON object, as a string or as the dict itself:
+
+    {"title": "Solar power in Thailand",              optional: makes the opening slide
+     "subtitle": "Market briefing, November 2026",    optional: under that title
+     "slides": [                                       1 to MAX_SLIDES, numbered from 1
+        {"title": "Where we are",                      required, a few words
+         "bullet_points": ["...", "..."]},             0 to MAX_BULLETS strings; [] = a section slide
+        ...]}
+
+A bare list is read as the slides. Strictly typed: a missing field, a wrong type or text
+that cannot fit is an ERROR naming the slide and what to change, so the manager can fix
+the data and call again. A field the deck has no place for is left out and named in the
+SUCCESS answer instead of failing the whole deck. Leading bullet characters ("- ", "• "),
+Markdown bold and heading marks are dropped: a slide shows the words, not the markup.
+
+THE LAYOUT. python-pptx's default template at PowerPoint's own 16:9 size, every box placed
+for that width: a dark opening slide (section slides match it), white content slides with
+a rose rule under the title and the slide number. The text size is picked per slide - the
+largest that fits by an estimate of how each line wraps (combining marks take no width,
+CJK characters twice the usual) - and the boxes still shrink text edited in PowerPoint
+later (TEXT_TO_FIT_SHAPE). Thai is set in Leelawadee UI: the template's own Thai fonts,
+Angsana New and Cordia New, look much smaller than the Latin text beside them. A slide
+whose text does not fit even at the smallest size is an ERROR ("split it into two
+slides"), never a slide that runs off the page.
+
+VERIFIED. The saved file is opened again: the slide count and every title must be what
+was asked for, or the file is deleted and the answer is an ERROR. A file is never
+overwritten (_2, _3... when two decks land in the same second), and the same deck asked
+for again within SAME_REQUEST_SECONDS returns the file already made.
+
+NEVER RAISES. Every failure comes back as one sentence starting "ERROR:".
+
+    python -m agents.publishing_agent --check        python-pptx, a test deck in memory, the folder
+    python -m agents.publishing_agent deck.json      builds one deck from a JSON file
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import re
+import sys
+import threading
+import time
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from .creative_agent import ARTIFACTS_DIR, web_url
+
+try:
+    import pptx
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
+    from pptx.oxml.ns import qn
+    from pptx.util import Emu, Pt
+
+    _PPTX_IMPORT_ERROR = ""
+except ImportError as exc:  # pragma: no cover - requirements.txt has it; an old environment may not
+    pptx = None  # type: ignore[assignment]
+    _PPTX_IMPORT_ERROR = str(exc)
+
+# What a .pptx is. api_server.py registers it for the files it serves: Python's own table
+# has no entry for it on Linux (the Docker image), where it would go out as
+# application/octet-stream.
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+FILE_PREFIX = "presentation"
+DOWNLOAD_LABEL = "Download Presentation"
+
+MAX_INPUT_CHARS = 200_000
+MAX_SLIDES = 40
+MAX_BULLETS = 12
+MAX_TITLE_CHARS = 200
+MAX_SUBTITLE_CHARS = 300
+MAX_BULLET_CHARS = 600
+SAME_REQUEST_SECONDS = 120
+
+DECK_FIELDS = ("title", "subtitle", "slides")
+SLIDE_FIELDS = ("title", "bullet_points")
+
+# --- Geometry (EMU: 914400 to the inch, 12700 to the point) ----------------------------
+EMU_PER_INCH = 914400
+EMU_PER_PT = 12700
+
+
+def _inches(value: float) -> int:
+    return int(round(value * EMU_PER_INCH))
+
+
+SLIDE_WIDTH = 12192000  # 13.333 in: PowerPoint's own 16:9
+SLIDE_HEIGHT = 6858000  # 7.5 in
+MARGIN_X = _inches(0.7)
+CONTENT_WIDTH = SLIDE_WIDTH - 2 * MARGIN_X
+
+# A text box's own padding (python-pptx's and PowerPoint's default insets), and the
+# template's first-level bullet indent - both taken off the room the text has.
+INSET_X = 91440
+INSET_Y = 45720
+BULLET_INDENT = 342900
+
+# (left, top, width, height). Titles sit on the bottom of their box, so the rule under
+# them stays put whether a title takes one line or two; the rules start where the text
+# does, inside the boxes' padding.
+TITLE_BOX = (MARGIN_X, _inches(0.35), CONTENT_WIDTH, _inches(1.3))
+TITLE_RULE = (MARGIN_X + INSET_X, _inches(1.8), _inches(0.9), _inches(0.06))
+BODY_BOX = (MARGIN_X, _inches(2.1), CONTENT_WIDTH, _inches(4.6))
+NUMBER_BOX = (SLIDE_WIDTH - MARGIN_X - _inches(1.0), _inches(6.85), _inches(1.0), _inches(0.4))
+COVER_TITLE_BOX = (MARGIN_X, _inches(1.3), CONTENT_WIDTH, _inches(2.6))
+COVER_RULE = (MARGIN_X + INSET_X, _inches(4.08), _inches(1.1), _inches(0.08))
+COVER_SUBTITLE_BOX = (MARGIN_X, _inches(4.35), CONTENT_WIDTH, _inches(1.5))
+
+# --- Type -------------------------------------------------------------------------------
+# Largest first; the first size at which the text fits is used.
+COVER_TITLE_SIZES = (44, 40, 36, 32)
+SUBTITLE_SIZES = (24, 22, 20, 18)
+SLIDE_TITLE_SIZES = (36, 32, 28, 24)
+BODY_SIZES = (28, 24, 22, 20, 18, 16)
+NUMBER_SIZE = 12
+COVER_TITLE_LINES = 3
+SUBTITLE_LINES = 3
+SLIDE_TITLE_LINES = 2
+BULLET_GAP = 0.5  # space after each bullet point, as a share of its text size
+THAI_FONT = "Leelawadee UI"
+
+# Height of one line as a share of the text size. PowerPoint measured 1.2 for Calibri and
+# for Leelawadee UI alike (2026-11-01); Thai keeps more room for an app that sets it in
+# another font, whose stacked vowels and tone marks need taller lines.
+LATIN_LINE = 1.22
+THAI_LINE = 1.3
+# Lines break between words (Thai between words with no space either), so a line rarely
+# fills the whole width: the estimate leaves this share of it unused.
+WRAP_SLACK = 0.93
+
+# --- Colours: the Jarvis hub's (TripPlanner_Web) slate and rose ------------------------
+INK = (0x0F, 0x17, 0x2A)  # slate-900: titles, the opening slide's background
+BODY_INK = (0x1E, 0x29, 0x3B)  # slate-800: bullet points
+MUTED = (0x64, 0x74, 0x8B)  # slate-500: slide numbers on white
+COVER_TEXT = (0xFF, 0xFF, 0xFF)
+COVER_SUBTEXT = (0xCB, 0xD5, 0xE1)  # slate-300
+COVER_MUTED = (0x94, 0xA3, 0xB8)  # slate-400: slide numbers on the dark slides
+ACCENT = (0xEC, 0x00, 0x3F)  # rose-600, the hub's accent
+
+_THAI = re.compile("[฀-๿]")
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\ud800-\udfff￾￿]")
+_BULLET_MARK = re.compile(r"^(?:[•‣◦▪▫·●○■□➢➤►▶✓✔]\s*|[-*–—]\s+)+")
+_HEADING_MARK = re.compile(r"^#{1,6}\s+")
+_FENCE = re.compile(r"^```[a-zA-Z]*\s*(.*?)\s*```$", re.DOTALL)
+
+
+class DeckError(Exception):
+    """The data cannot become a deck. The message is one sentence for the manager: what is wrong, what to change."""
+
+
+@dataclass(frozen=True)
+class SlideSpec:
+    title: str
+    bullets: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DeckSpec:
+    title: str  # "" = no opening slide
+    subtitle: str
+    slides: tuple[SlideSpec, ...]
+    left_out: tuple[str, ...]  # fields the deck has no place for, named in the SUCCESS answer
+
+
+@dataclass(frozen=True)
+class PlannedSlide:
+    """One slide of the finished deck, with the text sizes it gets."""
+
+    kind: str  # "cover" (the opening slide), "section" (a slide with no bullets) or "content"
+    title: str
+    title_size: int
+    bullets: tuple[str, ...] = ()
+    body_size: int = 0
+    subtitle: str = ""
+    subtitle_size: int = 0
+
+
+# ---------------------------------------------------------------------------------------
+# Reading the data
+# ---------------------------------------------------------------------------------------
+
+
+def parse_deck(data: Any) -> DeckSpec:
+    """`data` (a JSON string, a dict or a list of slides) as a DeckSpec. Raises DeckError."""
+    if isinstance(data, (bytes, bytearray)):
+        data = bytes(data).decode("utf-8", errors="replace")
+    if isinstance(data, str):
+        data = _load_json(data)
+    if isinstance(data, list):
+        data = {"slides": data}
+    if not isinstance(data, dict):
+        raise DeckError(f"presentation_data must be a JSON object with a \"slides\" list, not {_kind(data)}.")
+
+    left_out = [f'"{key}"' for key in data if key not in DECK_FIELDS]
+    title = _text_field(data.get("title"), "the deck's title", MAX_TITLE_CHARS, heading=True)
+    subtitle = _text_field(data.get("subtitle"), "the subtitle", MAX_SUBTITLE_CHARS)
+    if subtitle and not title:
+        left_out.append('"subtitle" (there is no deck title to put it under)')
+        subtitle = ""
+
+    raw_slides = data.get("slides")
+    if raw_slides is None:
+        raise DeckError(
+            'presentation_data has no "slides" list. Send {"title": "...", "slides": [{"title": "...", '
+            '"bullet_points": ["...", "..."]}]}.'
+        )
+    if not isinstance(raw_slides, list):
+        raise DeckError(f'"slides" must be a list of slide objects, not {_kind(raw_slides)}.')
+    if not raw_slides:
+        raise DeckError('"slides" is empty: a presentation needs at least one slide.')
+    if len(raw_slides) > MAX_SLIDES:
+        raise DeckError(f"the deck has {len(raw_slides)} slides, more than the {MAX_SLIDES} allowed. Make it shorter.")
+
+    slides: list[SlideSpec] = []
+    extra: dict[str, int] = {}
+    for number, raw in enumerate(raw_slides, start=1):
+        where = f"slide {number}"
+        if not isinstance(raw, dict):
+            raise DeckError(f'{where} must be an object with "title" and "bullet_points", not {_kind(raw)}.')
+        for key in raw:
+            if key not in SLIDE_FIELDS:
+                extra[key] = extra.get(key, 0) + 1
+        slide_title = _text_field(raw.get("title"), f"{where}'s title", MAX_TITLE_CHARS, heading=True)
+        if not slide_title:
+            raise DeckError(f'{where} has no title: every slide needs a short "title".')
+        if "bullet_points" not in raw:
+            raise DeckError(f'{where} has no "bullet_points" list (send [] for a section slide with only a title).')
+        raw_bullets = raw["bullet_points"]
+        if not isinstance(raw_bullets, list):
+            raise DeckError(f'{where}\'s "bullet_points" must be a list of strings, not {_kind(raw_bullets)}.')
+        if len(raw_bullets) > MAX_BULLETS:
+            raise DeckError(
+                f"{where} has {len(raw_bullets)} bullet points, more than the {MAX_BULLETS} that fit on a slide. "
+                "Split it into two slides."
+            )
+        bullets: list[str] = []
+        for index, raw_bullet in enumerate(raw_bullets, start=1):
+            if not isinstance(raw_bullet, str):
+                raise DeckError(f"{where}, bullet point {index} must be text, not {_kind(raw_bullet)}.")
+            bullet = _clean(raw_bullet, bullet=True)
+            if len(bullet) > MAX_BULLET_CHARS:
+                raise DeckError(
+                    f"{where}, bullet point {index} is {len(bullet)} characters long, more than the "
+                    f"{MAX_BULLET_CHARS} allowed. Shorten it or split it into several points."
+                )
+            if bullet:
+                bullets.append(bullet)
+        slides.append(SlideSpec(slide_title, tuple(bullets)))
+
+    for key, count in extra.items():
+        left_out.append(f'"{key}" on {count} slide{"s" if count != 1 else ""}')
+    return DeckSpec(title, subtitle, tuple(slides), tuple(left_out))
+
+
+def _load_json(text: str) -> Any:
+    text = text.strip()
+    if not text:
+        raise DeckError("no presentation data was given. Call again with the whole deck as JSON in presentation_data.")
+    if len(text) > MAX_INPUT_CHARS:
+        raise DeckError(
+            f"the presentation data is {len(text):,} characters long, more than the {MAX_INPUT_CHARS:,} allowed. "
+            "Make the deck shorter."
+        )
+    fenced = _FENCE.match(text)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        value = json.loads(text)
+        # JSON sent as a JSON string ("{\"title\": ...}"): read once more.
+        if isinstance(value, str) and value.strip()[:1] in ("{", "["):
+            value = json.loads(value)
+    except json.JSONDecodeError as exc:
+        cut = " - it looks cut off before the end" if exc.pos >= len(text.rstrip()) - 1 else ""
+        raise DeckError(
+            f"presentation_data is not valid JSON ({exc.msg} at character {exc.pos}){cut}. "
+            "Send the whole deck again as one JSON object."
+        ) from exc
+    return value
+
+
+def _text_field(value: Any, what: str, limit: int, heading: bool = False) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise DeckError(f"{what} must be text, not {_kind(value)}.")
+    text = _clean(value, heading=heading)
+    if len(text) > limit:
+        raise DeckError(f"{what} is {len(text)} characters long, more than the {limit} allowed. Shorten it.")
+    return text
+
+
+def _clean(text: str, bullet: bool = False, heading: bool = False) -> str:
+    """One line of plain text: control characters and markup out, whitespace collapsed."""
+    text = " ".join(_CONTROL.sub(" ", text).split())
+    # Markdown bold. Not "__": that is also how "__init__.py" is written.
+    text = text.replace("**", "")
+    if bullet:
+        text = _BULLET_MARK.sub("", text)
+    if heading:
+        text = _HEADING_MARK.sub("", text)
+    return text.strip()
+
+
+def _kind(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true/false"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, str):
+        return "text"
+    if isinstance(value, list):
+        return "a list"
+    if isinstance(value, dict):
+        return "an object"
+    return type(value).__name__
+
+
+# ---------------------------------------------------------------------------------------
+# Fitting the text
+# ---------------------------------------------------------------------------------------
+
+
+def _char_em(char: str) -> float:
+    """Roughly how wide `char` is, in ems."""
+    if unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me", "Cf"):
+        return 0.0  # Thai vowel and tone marks sit on the letter before them
+    if unicodedata.east_asian_width(char) in ("W", "F"):
+        return 1.0
+    if char.isspace():
+        return 0.25
+    if _THAI.match(char):
+        return 0.58
+    if char.isupper() or char in "mwMW@%&":
+        return 0.62
+    return 0.5
+
+
+def count_lines(text: str, size: float, width_pt: float) -> int:
+    """How many lines `text` wraps to at `size` points in a column `width_pt` wide (an estimate)."""
+    limit = width_pt * WRAP_SLACK
+    lines, used = 1, 0.0
+    for token in re.findall(r"\s+|\S+", text):
+        width = sum(_char_em(char) for char in token) * size
+        if token.isspace():
+            if used:
+                used += width
+            continue
+        if used + width <= limit:
+            used += width
+        elif width <= limit:
+            lines += 1
+            used = width
+        else:
+            # A word longer than the line - Thai writes a whole clause without a space.
+            for char in token:
+                step = _char_em(char) * size
+                if used and used + step > limit:
+                    lines += 1
+                    used = step
+                else:
+                    used += step
+    return lines
+
+
+def _line_height(text: str, size: float) -> float:
+    return size * (THAI_LINE if _THAI.search(text) else LATIN_LINE)
+
+
+def fit_size(
+    texts: tuple[str, ...] | list[str],
+    sizes: tuple[int, ...],
+    box: tuple[int, int, int, int],
+    *,
+    indent: int = 0,
+    gap: float = 0.0,
+    max_lines: Optional[int] = None,
+) -> Optional[int]:
+    """The largest of `sizes` at which `texts`, one paragraph each, fit in `box`; None when none does."""
+    width_pt = (box[2] - 2 * INSET_X - indent) / EMU_PER_PT
+    height_pt = (box[3] - 2 * INSET_Y) / EMU_PER_PT
+    for size in sizes:
+        total = 0.0
+        for text in texts:
+            lines = count_lines(text, size, width_pt)
+            if max_lines is not None and lines > max_lines:
+                break
+            total += lines * _line_height(text, size)
+        else:
+            total += gap * size * max(0, len(texts) - 1)
+            if total <= height_pt:
+                return size
+    return None
+
+
+def plan_deck(deck: DeckSpec) -> list[PlannedSlide]:
+    """Every slide of the finished deck with its text sizes. Raises DeckError for text that cannot fit."""
+    planned: list[PlannedSlide] = []
+    if deck.title:
+        size = fit_size([deck.title], COVER_TITLE_SIZES, COVER_TITLE_BOX, max_lines=COVER_TITLE_LINES)
+        if size is None:
+            raise DeckError(
+                f"the deck's title is too long for the opening slide ({len(deck.title)} characters). Shorten it "
+                "and put the rest in the subtitle."
+            )
+        subtitle_size = 0
+        if deck.subtitle:
+            subtitle_size = fit_size([deck.subtitle], SUBTITLE_SIZES, COVER_SUBTITLE_BOX, max_lines=SUBTITLE_LINES) or 0
+            if not subtitle_size:
+                raise DeckError(f"the subtitle is too long ({len(deck.subtitle)} characters). Shorten it to a line or two.")
+        planned.append(PlannedSlide("cover", deck.title, size, subtitle=deck.subtitle, subtitle_size=subtitle_size))
+
+    for number, slide in enumerate(deck.slides, start=1):
+        if not slide.bullets:
+            size = fit_size([slide.title], COVER_TITLE_SIZES, COVER_TITLE_BOX, max_lines=COVER_TITLE_LINES)
+            if size is None:
+                raise DeckError(f"slide {number}'s title is too long for a section slide ({len(slide.title)} characters). Shorten it.")
+            planned.append(PlannedSlide("section", slide.title, size))
+            continue
+        title_size = fit_size([slide.title], SLIDE_TITLE_SIZES, TITLE_BOX, max_lines=SLIDE_TITLE_LINES)
+        if title_size is None:
+            raise DeckError(
+                f"slide {number}'s title is too long for a slide title ({len(slide.title)} characters). Shorten it to "
+                "a few words and move the detail into a bullet point."
+            )
+        body_size = fit_size(slide.bullets, BODY_SIZES, BODY_BOX, indent=BULLET_INDENT, gap=BULLET_GAP)
+        if body_size is None:
+            characters = sum(len(bullet) for bullet in slide.bullets)
+            raise DeckError(
+                f"slide {number} has too much text to fit on one slide ({len(slide.bullets)} bullet points, "
+                f"{characters:,} characters). Split it into two slides or shorten the points."
+            )
+        planned.append(PlannedSlide("content", slide.title, title_size, slide.bullets, body_size))
+    return planned
+
+
+# ---------------------------------------------------------------------------------------
+# Building the file
+# ---------------------------------------------------------------------------------------
+
+
+def build_deck(deck: DeckSpec, planned: list[PlannedSlide], now: Optional[datetime] = None) -> Any:
+    """A python-pptx Presentation holding `planned`, not yet saved."""
+    prs = Presentation()
+    prs.slide_width = SLIDE_WIDTH
+    prs.slide_height = SLIDE_HEIGHT
+    layouts = {layout.name: layout for layout in prs.slide_layouts}
+
+    for position, item in enumerate(planned, start=1):
+        if item.kind == "cover":
+            slide = prs.slides.add_slide(layouts["Title Slide"])
+            _dark(slide)
+            _text(slide.shapes.title, COVER_TITLE_BOX, item.title, item.title_size, COVER_TEXT, bold=True, anchor="bottom")
+            _rule(slide, COVER_RULE)
+            subtitle = slide.placeholders[1]
+            if item.subtitle:
+                _text(subtitle, COVER_SUBTITLE_BOX, item.subtitle, item.subtitle_size, COVER_SUBTEXT, anchor="top")
+            else:
+                # An empty placeholder shows "Click to add subtitle" while the deck is edited.
+                subtitle._element.getparent().remove(subtitle._element)
+        elif item.kind == "section":
+            slide = prs.slides.add_slide(layouts["Title Only"])
+            _dark(slide)
+            _text(slide.shapes.title, COVER_TITLE_BOX, item.title, item.title_size, COVER_TEXT, bold=True, anchor="bottom")
+            _rule(slide, COVER_RULE)
+            _number(slide, position, COVER_MUTED)
+        else:
+            slide = prs.slides.add_slide(layouts["Title and Content"])
+            _text(slide.shapes.title, TITLE_BOX, item.title, item.title_size, INK, bold=True, anchor="bottom")
+            _rule(slide, TITLE_RULE)
+            _bullets(slide.placeholders[1], item.bullets, item.body_size)
+            _number(slide, position, MUTED)
+
+    # The template's own properties name its author, the library and 2013.
+    props = prs.core_properties
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(tzinfo=None)
+    props.title = (deck.title or deck.slides[0].title)[:255]
+    props.subject = deck.subtitle[:255]
+    props.author = "Jarvis"
+    props.last_modified_by = "Jarvis"
+    props.comments = ""
+    props.created = stamp
+    props.modified = stamp
+    props.revision = 1
+    return prs
+
+
+def _rgb(colour: tuple[int, int, int]) -> Any:
+    return RGBColor(*colour)
+
+
+def _place(shape: Any, box: tuple[int, int, int, int]) -> None:
+    shape.left, shape.top, shape.width, shape.height = (Emu(value) for value in box)
+
+
+def _frame(shape: Any, anchor: str) -> Any:
+    frame = shape.text_frame
+    frame.clear()
+    frame.word_wrap = True
+    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    frame.vertical_anchor = MSO_ANCHOR.BOTTOM if anchor == "bottom" else MSO_ANCHOR.TOP
+    frame.margin_left = frame.margin_right = Emu(INSET_X)
+    frame.margin_top = frame.margin_bottom = Emu(INSET_Y)
+    return frame
+
+
+def _style(run: Any, size: int, colour: tuple[int, int, int], bold: bool = False) -> None:
+    font = run.font
+    font.size = Pt(size)
+    font.bold = bold
+    font.color.rgb = _rgb(colour)
+    # Thai (a complex script to PowerPoint) is drawn in the cs typeface. a:cs comes after
+    # a:solidFill and a:latin in a:rPr and nothing that follows it is ever set here.
+    properties = run._r.get_or_add_rPr()
+    complex_script = properties.find(qn("a:cs"))
+    if complex_script is None:
+        complex_script = properties.makeelement(qn("a:cs"), {})
+        properties.append(complex_script)
+    complex_script.set("typeface", THAI_FONT)
+
+
+def _text(shape: Any, box: tuple[int, int, int, int], text: str, size: int, colour: tuple[int, int, int], *, bold: bool = False, anchor: str = "top") -> None:
+    _place(shape, box)
+    paragraph = _frame(shape, anchor).paragraphs[0]
+    paragraph.alignment = PP_ALIGN.LEFT
+    run = paragraph.add_run()
+    run.text = text
+    _style(run, size, colour, bold)
+
+
+def _bullets(shape: Any, bullets: tuple[str, ...], size: int) -> None:
+    _place(shape, BODY_BOX)
+    frame = _frame(shape, "top")
+    for index, bullet in enumerate(bullets):
+        paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
+        paragraph.level = 0
+        paragraph.alignment = PP_ALIGN.LEFT
+        paragraph.space_before = Pt(0)
+        paragraph.space_after = Pt(round(size * BULLET_GAP))
+        run = paragraph.add_run()
+        run.text = bullet
+        _style(run, size, BODY_INK)
+
+
+def _rule(slide: Any, box: tuple[int, int, int, int]) -> None:
+    shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, *(Emu(value) for value in box))
+    shape.name = "Accent rule"
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _rgb(ACCENT)
+    shape.line.fill.background()
+    shape.shadow.inherit = False
+
+
+def _number(slide: Any, position: int, colour: tuple[int, int, int]) -> None:
+    box = slide.shapes.add_textbox(*(Emu(value) for value in NUMBER_BOX))
+    box.name = "Slide number"
+    frame = box.text_frame
+    frame.word_wrap = False
+    paragraph = frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.RIGHT
+    run = paragraph.add_run()
+    run.text = str(position)
+    _style(run, NUMBER_SIZE, colour)
+
+
+def _dark(slide: Any) -> None:
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = _rgb(INK)
+
+
+# ---------------------------------------------------------------------------------------
+# The agent
+# ---------------------------------------------------------------------------------------
+
+
+class PublishingAgent:
+    """Builds one PowerPoint file per call and saves it in artifacts/. Building one makes no network call."""
+
+    name = "publishing"
+    title = "Head of Publishing"
+    tool_name = "delegate_to_publishing"
+
+    def __init__(self, *, artifacts_dir: Optional[Path | str] = None, now: Optional[Callable[[], datetime]] = None) -> None:
+        self.artifacts_dir = Path(artifacts_dir) if artifacts_dir else ARTIFACTS_DIR
+        self._now = now or datetime.now
+        self._lock = threading.Lock()
+        self._recent: dict[str, tuple[float, Path]] = {}  # the deck's fingerprint -> (when, file)
+        self.unavailable_reason = "" if pptx is not None else f"python-pptx is not installed ({_PPTX_IMPORT_ERROR})"
+
+    @property
+    def available(self) -> bool:
+        return pptx is not None
+
+    def describe(self) -> str:
+        if not self.available:
+            return f"off ({self.unavailable_reason})"
+        return f"python-pptx {getattr(pptx, '__version__', '?')}, 16:9 decks, into {self.artifacts_dir}"
+
+    # -- the work ------------------------------------------------------------
+
+    def build_presentation(self, presentation_data: Any) -> str:
+        """Builds a deck from `presentation_data` and saves it. Returns SUCCESS + its path and URL, or ERROR + why."""
+        if not self.available:
+            return f"ERROR: presentations are not set up ({self.unavailable_reason}). Tell the user; do not try again."
+        try:
+            deck = parse_deck(presentation_data)
+            planned = plan_deck(deck)
+        except DeckError as err:
+            print(f"[Agent:publishing] Not built: {_shown(str(err), 240)}")
+            return f"ERROR: {err}"
+
+        fingerprint = hashlib.sha256(
+            json.dumps([deck.title, deck.subtitle, [[s.title, s.bullets] for s in deck.slides]], ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        summary = _summary(planned)
+        # One deck at a time, so the same deck asked for twice at once is made once.
+        with self._lock:
+            again = self._already_made(fingerprint)
+            if again:
+                return again
+
+            started = time.monotonic()
+            print(f"[Agent:publishing] Building {summary}: {_shown(planned[0].title)}")
+            try:
+                prs = build_deck(deck, planned)
+            except Exception as exc:  # noqa: BLE001 - python-pptx/lxml refusing something unexpected
+                print(f"[Agent:publishing] python-pptx failed: {type(exc).__name__}: {exc}")
+                return f"ERROR: the presentation could not be built ({type(exc).__name__}: {_shown(str(exc), 160)})."
+            try:
+                path = self._save(prs)
+            except OSError as exc:
+                return f"ERROR: the presentation was built but could not be saved in {self.artifacts_dir} ({exc})."
+
+            problem = _verify(path, [item.title for item in planned])
+            if problem:
+                print(f"[Agent:publishing] {path.name} failed its check ({problem}); deleted.")
+                path.unlink(missing_ok=True)
+                return f"ERROR: the presentation was saved but did not check out ({problem}), so it was deleted."
+
+            self._recent[fingerprint] = (time.monotonic(), path)
+            size_kb = max(1, round(path.stat().st_size / 1024))
+            print(f"[Agent:publishing] Saved {path} ({size_kb} KB, {time.monotonic() - started:.1f} s).")
+            lines = [
+                f"SUCCESS: the presentation was created and saved as a PowerPoint file ({summary}, 16:9).",
+                f"Path: {path}",
+                f"URL: {web_url(path)}",
+            ]
+            if deck.left_out:
+                lines.append(
+                    "Left out (a slide only has a title and bullet points; the deck a title and subtitle): "
+                    + ", ".join(deck.left_out)
+                    + "."
+                )
+            return "\n".join(lines)
+
+    def _already_made(self, fingerprint: str) -> str:
+        """The answer for the same deck made moments ago (the file still there), or ""."""
+        now = time.monotonic()
+        for key, (when, _path) in list(self._recent.items()):
+            if now - when > SAME_REQUEST_SECONDS:
+                del self._recent[key]
+        hit = self._recent.get(fingerprint)
+        if hit is None or not hit[1].exists():
+            return ""
+        print(f"[Agent:publishing] Same deck {now - hit[0]:.0f} s ago; not made again.")
+        return (
+            f"SUCCESS: this exact presentation was already created {now - hit[0]:.0f} seconds ago, so it was not "
+            f"made again.\nPath: {hit[1]}\nURL: {web_url(hit[1])}"
+        )
+
+    def _save(self, prs: Any) -> Path:
+        """Writes `prs` as artifacts/presentation_YYYYMMDD_HHMMSS.pptx (_2, _3... if taken) and returns its absolute path."""
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        stamp = self._now().strftime("%Y%m%d_%H%M%S")
+        for number in range(1, 100):
+            path = self.artifacts_dir / (
+                f"{FILE_PREFIX}_{stamp}.pptx" if number == 1 else f"{FILE_PREFIX}_{stamp}_{number}.pptx"
+            )
+            try:
+                handle = open(path, "xb")  # never overwrites
+            except FileExistsError:
+                continue
+            try:
+                with handle:
+                    prs.save(handle)
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+            return path.resolve()
+        raise OSError(f"no free file name for {FILE_PREFIX}_{stamp}")
+
+    # -- setup check (python -m agents.publishing_agent --check) ---------------
+
+    def check(self) -> list[str]:
+        """Lines on the setup: python-pptx, a two-slide test deck built in memory, the folder. Saves nothing."""
+        lines = [f"Presentations: {self.describe()}"]
+        if not self.available:
+            return lines
+        try:
+            sample = parse_deck({"title": "Setup check", "slides": [{"title": "It works", "bullet_points": ["ทดสอบภาษาไทย", "English"]}]})
+            buffer = io.BytesIO()
+            build_deck(sample, plan_deck(sample)).save(buffer)
+            lines.append(f"  test deck: built in memory ({len(buffer.getvalue()) // 1024} KB)")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"  test deck: FAILED ({type(exc).__name__}: {exc})")
+        try:
+            self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+            probe = self.artifacts_dir / ".write-check"
+            probe.write_bytes(b"")
+            probe.unlink()
+            lines.append(f"  folder: {self.artifacts_dir} is writable")
+        except OSError as exc:
+            lines.append(f"  folder: {self.artifacts_dir} is NOT writable ({exc})")
+        return lines
+
+
+def _verify(path: Path, titles: list[str]) -> str:
+    """"" when the saved file opens and holds exactly these slide titles, in order; else what is wrong."""
+    try:
+        saved = Presentation(str(path))
+    except Exception as exc:  # noqa: BLE001 - a broken zip, bad XML
+        return f"it does not open as a presentation ({type(exc).__name__})"
+    found = []
+    for slide in saved.slides:
+        title = slide.shapes.title
+        found.append(title.text_frame.text if title is not None and title.has_text_frame else "")
+    if len(found) != len(titles):
+        return f"it has {len(found)} slides instead of {len(titles)}"
+    for number, (got, wanted) in enumerate(zip(found, titles), start=1):
+        if got != wanted:
+            return f"slide {number}'s title came out different from the one asked for"
+    return ""
+
+
+def _summary(planned: list[PlannedSlide]) -> str:
+    """"9 slides: an opening slide, 7 content slides and 1 section slide"."""
+    counts = {kind: sum(1 for item in planned if item.kind == kind) for kind in ("cover", "content", "section")}
+    parts = []
+    if counts["cover"]:
+        parts.append("an opening slide")
+    if counts["content"]:
+        parts.append(f"{counts['content']} content slide{'s' if counts['content'] != 1 else ''}")
+    if counts["section"]:
+        parts.append(f"{counts['section']} section slide{'s' if counts['section'] != 1 else ''}")
+    listed = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return f"{len(planned)} slide{'s' if len(planned) != 1 else ''}: {listed}"
+
+
+def markdown_link(path: Path | str, label: str = DOWNLOAD_LABEL) -> str:
+    """The Markdown line the web chat shows as a download: [Download Presentation](/artifacts/<file name>)."""
+    return f"[{label}]({web_url(path)})"
+
+
+def _shown(text: str, limit: int = 120) -> str:
+    """`text` cut short and safe for a console that cannot print Thai."""
+    text = text if len(text) <= limit else text[: limit - 1] + "…"
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return text.encode(encoding, errors="backslashreplace").decode(encoding)
+
+
+def build() -> PublishingAgent:
+    return PublishingAgent()
+
+
+if __name__ == "__main__":
+    agent = build()
+    arguments = sys.argv[1:]
+    if not arguments or arguments == ["--check"]:
+        print("\n".join(agent.check()))
+        raise SystemExit(0 if agent.available else 1)
+    source = Path(arguments[0])
+    result = agent.build_presentation(source.read_text(encoding="utf-8"))
+    print(_shown(result, 2000))
+    raise SystemExit(0 if result.startswith("SUCCESS") else 1)

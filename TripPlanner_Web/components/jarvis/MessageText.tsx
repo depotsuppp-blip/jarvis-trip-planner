@@ -1,17 +1,20 @@
 import { Fragment, type ReactNode } from "react";
-import { splitArtifactImages } from "@/lib/jarvis/artifacts";
+import { splitArtifacts } from "@/lib/jarvis/artifacts";
+import { ArtifactFile } from "./ArtifactFile";
 import { ArtifactImage } from "./ArtifactImage";
 
 /**
  * A reply's text, with web addresses drawn as real links - the trip Jarvis has
- * just planned arrives as one - and a picture Jarvis made drawn as the picture.
+ * just planned arrives as one - a picture Jarvis made drawn as the picture, and a
+ * file it made offered as a download.
  *
- * The text is plain; nothing in it is treated as markup except two things found
+ * The text is plain; nothing in it is treated as markup except what is found
  * with a pattern:
  *   - http(s) addresses become links (so a "javascript:" address can never become one);
- *   - the one Markdown image form Jarvis writes for a picture it made,
- *     `![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)`, becomes that image
- *     (lib/jarvis/artifacts.ts: a same-origin address and a name Jarvis gives, nothing else).
+ *   - the two Markdown forms Jarvis writes for what it made (lib/jarvis/artifacts.ts: a
+ *     same-origin address and a name Jarvis gives, nothing else):
+ *     `![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)` becomes that image, and
+ *     `[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)` a download.
  */
 const LINK_PATTERN = /https?:\/\/[^\s<>"'`]+/g;
 // Sentence punctuation stuck to the end of an address belongs to the sentence.
@@ -44,17 +47,19 @@ function withLinks(text: string, keyPrefix: string): ReactNode[] {
 }
 
 export function MessageText({ text }: { text: string }): ReactNode {
-  const parts = splitArtifactImages(text);
+  const parts = splitArtifacts(text);
   return (
     <>
       {parts.map((part, index) =>
         part.kind === "image" ? (
           <ArtifactImage key={`image:${index}`} name={part.name} alt={part.alt} />
+        ) : part.kind === "file" ? (
+          <ArtifactFile key={`file:${index}`} name={part.name} label={part.label} />
         ) : (
-          // The blank lines around a picture are the reply's paragraph breaks, and the
-          // picture is a block of its own: trimmed there, they would only add empty space.
+          // The blank lines around a picture or a download are the reply's paragraph
+          // breaks, and each is a block of its own: kept, they would only add empty space.
           <Fragment key={`text:${index}`}>
-            {withLinks(trimAroundImages(part.text, index > 0, index < parts.length - 1), `text:${index}`)}
+            {withLinks(trimAroundBlocks(part.text, index > 0, index < parts.length - 1), `text:${index}`)}
           </Fragment>
         )
       )}
@@ -62,10 +67,10 @@ export function MessageText({ text }: { text: string }): ReactNode {
   );
 }
 
-/** A text stretch with the line breaks next to a picture taken off. */
-function trimAroundImages(text: string, afterImage: boolean, beforeImage: boolean): string {
+/** A text stretch with the line breaks next to a picture or a download taken off. */
+function trimAroundBlocks(text: string, afterBlock: boolean, beforeBlock: boolean): string {
   let result = text;
-  if (afterImage) result = result.replace(/^\s*\n/, "");
-  if (beforeImage) result = result.replace(/\n\s*$/, "");
+  if (afterBlock) result = result.replace(/^\s*\n/, "");
+  if (beforeBlock) result = result.replace(/\n\s*$/, "");
   return result;
 }

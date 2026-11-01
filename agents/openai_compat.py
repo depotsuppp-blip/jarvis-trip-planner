@@ -164,6 +164,7 @@ class OpenAICompatibleProvider(_Provider):
         effort: Optional[str] = None,
         context: str = "",
         json_output: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", f"My {self.name} model isn't configured.")
@@ -171,7 +172,7 @@ class OpenAICompatibleProvider(_Provider):
         request: dict[str, Any] = {
             "model": model or self._model,
             "messages": to_messages(system, transcript, context),
-            "max_completion_tokens": self._max_tokens,
+            "max_completion_tokens": max_tokens or self._max_tokens,
         }
         if tools:
             request["tools"] = openai_tool_schemas(tools)

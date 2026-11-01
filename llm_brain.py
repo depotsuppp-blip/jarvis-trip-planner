@@ -122,9 +122,23 @@ Several things were added to this module beyond plain tool calling:
       reply names the folder and the file; in the web chat it carries the
       picture as a Markdown image, ![Generated Image](/artifacts/<file>),
       which api_server.py serves and the web app draws (CREATIVE_RULE,
-      _create_image, _with_images). Not a model loop and not part of the
+      _create_image, _with_artifacts). Not a model loop and not part of the
       team, so it works with JARVIS_AGENTS=0 too; there only when
       OPENAI_API_KEY is set, JARVIS_CREATIVE=0 turns it off.
+
+  PRESENTATIONS  delegate_to_publishing(presentation_data) hands a slide
+      plan - JSON the manager writes after planning the content, with the
+      Head of Research first when it needs facts - to the Head of Publishing
+      (agents/publishing_agent.py), which lays it out as a 16:9 PowerPoint
+      file with python-pptx, checks the saved file and keeps it as
+      artifacts/presentation_YYYYMMDD_HHMMSS.pptx. By voice the reply names
+      the folder and the file; in the web chat it carries a download link,
+      [Download Presentation](/artifacts/<file>) (PUBLISHING_RULE, _publish,
+      _with_artifacts). The slides travel inside the tool call, so a
+      presentation question may write up to LONG_OUTPUT_MAX_TOKENS instead
+      of MAX_TOKENS, and a tool call cut off by the limit is asked for again
+      with that room (_call_provider). No key and no cost: there whenever
+      python-pptx is installed, JARVIS_PUBLISHING=0 turns it off.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -368,6 +382,21 @@ When you answer, the response is converted to speech and played through a speake
 # Spoken answers are short by nature, so a small cap keeps replies tight
 # and avoids the assistant monologuing at the user through the speakers.
 MAX_TOKENS = 1024
+
+# ...except where the answer is a document. A presentation's slides are written as
+# the JSON argument of one tool call (delegate_to_publishing), and MAX_TOKENS cuts a
+# deck of any size off in the middle: Claude then hands back half a tool call, Gemini
+# an empty answer. A presentation question may write this much instead (LLMBrain.ask),
+# and a tool call that still comes back cut off is asked for once more with it
+# (LLMBrain._call_provider). A ceiling, not a target - only what is written is billed -
+# and kept within what the Anthropic SDK allows a request that is not streamed.
+LONG_OUTPUT_MAX_TOKENS = 8192
+
+# The answer when a tool call is cut off even with that much room: never half of it run.
+CUT_OFF_REPLY = (
+    "That came out too long for me to write in one go, so nothing was made. Ask for a shorter "
+    "version - for a presentation, fewer slides or shorter points - and I'll do it."
+)
 
 # Extended thinking costs seconds of latency, which is very noticeable
 # when the user is waiting for the speakers. It is disabled for plain
@@ -760,6 +789,62 @@ def creative_rule(tools: list[ToolSpec], web: bool) -> str:
     return CREATIVE_RULE.format(tool=DELEGATE_CREATIVE, share=CREATIVE_SHARE_WEB if web else CREATIVE_SHARE_VOICE)
 
 
+# PowerPoint files (agents/publishing_agent.py): a tool of the manager's own, like images.
+DELEGATE_PUBLISHING = "delegate_to_publishing"
+
+# Added to the per-turn context while the manager has that tool (publishing_rule), in the
+# uncached block for the same reason as CREATIVE_RULE: it is there only with python-pptx.
+PUBLISHING_RULE = (
+    "Presentations: you can build real PowerPoint files (.pptx) - you are a slide deck builder. When the "
+    "user asks for a presentation, slides, a slide deck or a PowerPoint, build the file instead of writing "
+    "the slides into your reply. First plan it: who it is for, the storyline, one idea per slide{research}. "
+    "Then write it as JSON: "
+    '{{"title": "...", "subtitle": "...", "slides": [{{"title": "...", "bullet_points": ["...", "..."]}}]}}. '
+    "The title and subtitle make the opening slide. Each slide has a short title and two to six bullet "
+    "points of about one line each, plain text without bullet characters or markdown; a slide whose "
+    "bullet_points list is empty becomes a section divider. Make five to twelve slides unless the user asks "
+    "for a number. Write the slides in the language the user wants - the one they wrote in, unless they say "
+    "otherwise: Thai slides for a request in Thai. Speaking English is a rule for your own reply, not for "
+    "the file. Call "
+    "{tool} once with that JSON as presentation_data. {share} Say a presentation was made only when the "
+    "result starts with SUCCESS. When it starts with ERROR and says what to change in the data, change "
+    "exactly that and call again once; otherwise tell the user in one sentence what went wrong."
+)
+PUBLISHING_RESEARCH = (
+    " - when it needs facts you are not sure of, figures or anything recent, get them with {tool} before "
+    "you write a single slide"
+)
+# The web chat cannot open a file on this computer: there the result's Download line is a
+# Markdown link to /artifacts/<file> (LLMBrain._publish), which the page offers as a download.
+PUBLISHING_SHARE_WEB = (
+    "Its result's Download line is a Markdown link that the chat shows as a download button: put that line "
+    "in your reply exactly as written, on its own line after one short sentence. Like an image line, it is "
+    "an exception to the no-markdown rule. Do not write the file's path on this computer."
+)
+PUBLISHING_SHARE_VOICE = (
+    "Its result gives the file's absolute path: tell the user it is saved in the artifacts folder of the "
+    "Jarvis project and say the file name; do not read out the rest of the path."
+)
+
+
+def publishing_rule(tools: list[ToolSpec], web: bool) -> str:
+    """
+    PUBLISHING_RULE when this call can build presentations, for a chat (download link) or a
+    voice call (file name); else "". It names how to look facts up first: the Head of
+    Research, or the web search tool when the team is off.
+    """
+    if not any(tool.name == DELEGATE_PUBLISHING for tool in tools):
+        return ""
+    research = next((tool.name for tool in tools if tool.name == DELEGATE_RESEARCH), None) or next(
+        (tool.name for tool in tools if tool.name == "web_search" or tool.name.endswith("__web_search")), None
+    )
+    return PUBLISHING_RULE.format(
+        research=PUBLISHING_RESEARCH.format(tool=research) if research else "",
+        tool=DELEGATE_PUBLISHING,
+        share=PUBLISHING_SHARE_WEB if web else PUBLISHING_SHARE_VOICE,
+    )
+
+
 # What the brain does when a reply holds a trip link or id that no tool returned
 # during this request (link_guard.py says which): it is not sent. The model gets
 # one chance to fix it - the likeliest cause is a plain request to plan a trip
@@ -1039,6 +1124,30 @@ def _asks_for_image(text: str) -> bool:
     return any(fragment in raw for fragment in _IMAGE_SUBSTRINGS)
 
 
+# A presentation is a tool call too (delegate_to_publishing), after the content is planned.
+# "Make a deck on our 2027 strategy" holds "strategy", which would send it to the reasoning
+# tier - slower, dearer, and with research and the slides' JSON on top, past the web chat's
+# two minutes - and the tool-less front door would write the slides into the chat. A deck
+# word on its own counts ("add a slide on pricing" is about the deck too). Thai, as
+# substrings: slide / present(ation) (two spellings) / to present / PowerPoint (two
+# spellings); "ppt" also catches "ทำppt" with no space before it.
+_PRESENTATION_WORDS = frozenset({
+    "presentation", "presentations", "slide", "slides", "slideshow", "deck", "decks", "powerpoint", "pptx",
+})
+_PRESENTATION_SUBSTRINGS: tuple[str, ...] = (
+    "สไลด์", "พรีเซน", "พรีเซ้น", "นำเสนอ", "พาวเวอร์พอย", "เพาเวอร์พอย", "power point", "ppt",
+)
+
+
+def _asks_for_presentation(text: str) -> bool:
+    """True when the utterance asks for a presentation, or is about the slides of one."""
+    words = set(re.sub(r"[^\w\s]", " ", text.lower()).split())
+    if words & _PRESENTATION_WORDS:
+        return True
+    raw = text.lower()
+    return any(fragment in raw for fragment in _PRESENTATION_SUBSTRINGS)
+
+
 # "How is the system doing?" is a tool call (get_system_status), not conversation: the front
 # door has no tools and would answer it from nothing. Whole words, like the lists above.
 _STATUS_WORDS: tuple[str, ...] = ("cpu", "ram", "memory", "uptime", "telemetry")
@@ -1095,6 +1204,10 @@ def _classify_intent(text: str) -> tuple[str, str]:
     if _asks_for_image(text):
         return INTENT_STANDARD, "an image request"
 
+    # And for "a deck on our strategy": planned on the standard tier, built by one tool call.
+    if _asks_for_presentation(text):
+        return INTENT_STANDARD, "a presentation request"
+
     for marker in _DEEP_MARKERS:
         if f" {marker} " in lowered:
             return INTENT_COMPLEX, f"matched {marker!r}"
@@ -1149,6 +1262,15 @@ _FRONT_DOOR_CREATIVE = (
     "illustration, a logo, a poster - and save them as files: a request to draw, create, generate "
     "or design any image is route_to \"ORCHESTRATOR\" with response null. Never say that you "
     "cannot make images."
+)
+
+# The same while it can build presentations (delegate_to_publishing): the cheap model would
+# otherwise write the slides into the chat as text.
+_FRONT_DOOR_PUBLISHING = (
+    "\n- The assistant behind you can also build PowerPoint presentations and save them as files: a "
+    "request for a presentation, slides, a slide deck or a PowerPoint, or to change one, is route_to "
+    "\"ORCHESTRATOR\" with response null. Never write the slides yourself, and never say that you "
+    "cannot make a presentation."
 )
 
 # A web address in the utterance: "what does https://... say", "summarise www.example.com".
@@ -1235,7 +1357,7 @@ def _looks_like_tool_command(text: str) -> bool:
     if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS + _AGENDA_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
-    return _mentions_trip(text) or _asks_system_status(text) or _asks_for_image(text)
+    return _mentions_trip(text) or _asks_system_status(text) or _asks_for_image(text) or _asks_for_presentation(text)
 
 
 # -- tool implementations ---------------------------------------------
@@ -2332,6 +2454,9 @@ class Turn:
     text: str = ""
     calls: list[ToolCall] = field(default_factory=list)
     results: list[ToolResult] = field(default_factory=list)
+    # True when the output limit ended this answer (Anthropic stop_reason "max_tokens",
+    # Gemini finish_reason MAX_TOKENS): a tool call in it may be missing its end.
+    cut_off: bool = False
 
 
 class ProviderError(Exception):
@@ -2412,6 +2537,7 @@ class _Provider:
         effort: Optional[str] = None,
         context: str = "",
         json_output: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> Turn:
         """
         One model call. `system` is the persona - the same text on every call, so a
@@ -2419,7 +2545,8 @@ class _Provider:
         date, the place, rules that depend on this turn's tools - see turn_context),
         sent after it. `json_output` asks for one JSON object where the API has a
         mode for it (a specialist agent's structured answer, agents/); a provider
-        without one ignores it and the prompt has to say so.
+        without one ignores it and the prompt has to say so. `max_tokens` replaces
+        the provider's own output limit for this one call (LONG_OUTPUT_MAX_TOKENS).
         """
         raise NotImplementedError
 
@@ -2530,6 +2657,7 @@ class AnthropicProvider(_Provider):
         effort: Optional[str] = None,
         context: str = "",
         json_output: bool = False,  # no JSON mode here; only the agents ask, and none runs on Claude
+        max_tokens: Optional[int] = None,
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Anthropic model isn't configured.")
@@ -2539,7 +2667,7 @@ class AnthropicProvider(_Provider):
         target = model or self._model
         request: dict[str, Any] = {
             "model": target,
-            "max_tokens": self._max_tokens,
+            "max_tokens": max_tokens or self._max_tokens,
             # A cache_control breakpoint on the system prompt, not a
             # plain string - SYSTEM_PROMPT is identical on every call
             # this provider makes, so Anthropic can serve it from cache
@@ -2605,14 +2733,15 @@ class AnthropicProvider(_Provider):
             for block in response.content
             if getattr(block, "type", None) == "tool_use"
         ]
+        cut_off = getattr(response, "stop_reason", None) == "max_tokens"
 
         if calls:
-            return Turn(kind="tool_calls", text=text, calls=calls)
+            return Turn(kind="tool_calls", text=text, calls=calls, cut_off=cut_off)
 
-        if getattr(response, "stop_reason", None) == "max_tokens" and text:
+        if cut_off and text:
             text += " I had to cut that short."
 
-        return Turn(kind="assistant", text=text)
+        return Turn(kind="assistant", text=text, cut_off=cut_off)
 
     def describe_image(self, question: str, image_b64: str, media_type: str) -> str:
         """
@@ -2824,13 +2953,14 @@ class GeminiProvider(_Provider):
         effort: Optional[str] = None,
         context: str = "",
         json_output: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Gemini model isn't configured.")
 
         config_kwargs: dict[str, Any] = {
             "system_instruction": f"{system}\n\n{context}" if context else system,
-            "max_output_tokens": self._max_tokens,
+            "max_output_tokens": max_tokens or self._max_tokens,
         }
         if json_output and not tools:
             config_kwargs["response_mime_type"] = "application/json"
@@ -2875,8 +3005,11 @@ class GeminiProvider(_Provider):
 
         text_parts: list[str] = []
         calls: list[ToolCall] = []
+        cut_off = False
 
         for index, candidate in enumerate(response.candidates or []):
+            finish = getattr(candidate, "finish_reason", None)
+            cut_off = str(getattr(finish, "value", finish) or "").upper().endswith("MAX_TOKENS")
             content = getattr(candidate, "content", None)
             for part in getattr(content, "parts", None) or []:
                 # Thought parts are reasoning, not the answer.
@@ -2902,8 +3035,8 @@ class GeminiProvider(_Provider):
         text = "".join(text_parts).strip()
 
         if calls:
-            return Turn(kind="tool_calls", text=text, calls=calls)
-        return Turn(kind="assistant", text=text)
+            return Turn(kind="tool_calls", text=text, calls=calls, cut_off=cut_off)
+        return Turn(kind="assistant", text=text, cut_off=cut_off)
 
     def describe_image(self, question: str, image_b64: str, media_type: str) -> str:
         """One-shot vision call. See the Anthropic version for the why."""
@@ -3032,8 +3165,12 @@ class LLMBrain:
         # Image generation (agents/creative_agent.py): delegate_to_creative while it has a key.
         self._creative: Any = self._start_creative()
         self._creative_spec: Optional[ToolSpec] = None
-        # The Markdown image lines made during the current web request (see _with_images).
-        self._images_this_turn: list[str] = []
+        # PowerPoint files (agents/publishing_agent.py): delegate_to_publishing while python-pptx is there.
+        self._publishing: Any = self._start_publishing()
+        self._publishing_spec: Optional[ToolSpec] = None
+        # The Markdown lines for what was made during the current web request - a picture,
+        # a presentation's download link (see _with_artifacts).
+        self._artifacts_this_turn: list[str] = []
 
         # Feature 2 bookkeeping: what went to the background, so the same
         # side effect cannot be fired twice (see _execute).
@@ -3107,6 +3244,8 @@ class LLMBrain:
                 print(f"[Brain] Team: {agent.name} agent off ({why}); its tools stay with the manager.")
         if self._creative is not None:
             print(f"[Brain] Images: {DELEGATE_CREATIVE} -> {self._creative.describe()}.")
+        if self._publishing is not None:
+            print(f"[Brain] Presentations: {DELEGATE_PUBLISHING} -> {self._publishing.describe()}.")
 
     # -- capabilities --------------------------------------------------
 
@@ -3188,14 +3327,18 @@ class LLMBrain:
         tool per working agent. An agent that cannot work (no model, or its tool servers
         are down) is left out and its server tools stay here, so a missing key never takes
         a capability away. An agent's own tools (the calendar, LINE) are never here.
-        Last, delegate_to_creative while image generation is set up.
+        Last, delegate_to_creative while image generation is set up, and
+        delegate_to_publishing while presentations are.
         """
         working = self._working_agents()
         replaced = self._replaced_tool_names(working)
         builtins = [tool for tool in self._tools if tool.name not in replaced]
         mcp = [tool for tool in self._mcp_tools if not any(agent.owns(tool) for agent in working)]
         creative = [self._creative_tool()] if self._creative is not None and self._creative.available else []
-        return builtins + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working] + creative
+        publishing = [self._publishing_tool()] if self._publishing is not None and self._publishing.available else []
+        return (
+            builtins + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working] + creative + publishing
+        )
 
     def _replaced_tool_names(self, working: Optional[list[Any]] = None) -> set[str]:
         """The built-in tools working agents have taken over (the productivity agent: send_line_notification)."""
@@ -3339,8 +3482,8 @@ class LLMBrain:
         the model. In the web chat a SUCCESS's "Path: <file on this computer>" becomes
         "Image: ![Generated Image](/artifacts/<file>)" - the picture as the page draws it
         (api_server.py serves the folder, the web app passes it on) - and the line is
-        remembered so the reply is sure to carry it (_with_images). By voice the result is
-        the agent's own, path and all.
+        remembered so the reply is sure to carry it (_with_artifacts). By voice the result
+        is the agent's own, path and all.
         """
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
         shown = str(image_description or "")[:160].encode(encoding, errors="backslashreplace").decode(encoding)
@@ -3356,24 +3499,115 @@ class LLMBrain:
         for line in result.splitlines():
             if line.startswith("Path: "):
                 image = markdown_image(line[len("Path: "):].strip())
-                if image not in self._images_this_turn:
-                    self._images_this_turn.append(image)
+                if image not in self._artifacts_this_turn:
+                    self._artifacts_this_turn.append(image)
                 line = f"Image: {image}"
             lines.append(line)
         return "\n".join(lines)
 
-    def _with_images(self, reply: str) -> str:
+    def _with_artifacts(self, reply: str) -> str:
         """
-        `reply` with every image made during this web request in it, as its Markdown line:
-        the model's own copy when it wrote one (found by its /artifacts/ address), else the
-        line added at the end - a picture that was made and paid for is never lost to a
-        reply that only talked about it.
+        `reply` with everything made during this web request in it, as its Markdown line - a
+        picture, a presentation's download link: the model's own copy when it wrote one
+        (found by its /artifacts/ address), else the line added at the end. A picture that
+        was made and paid for, or a deck that was built, is never lost to a reply that only
+        talked about it.
         """
-        for image in self._images_this_turn:
-            address = image[image.index("](") :]  # "](/artifacts/image_....png)"
+        for line in self._artifacts_this_turn:
+            address = line[line.index("](") :]  # "](/artifacts/image_....png)"
             if address not in reply:
-                reply = f"{reply.rstrip()}\n\n{image}"
+                reply = f"{reply.rstrip()}\n\n{line}"
         return reply
+
+    # -- presentations (agents/publishing_agent.py) -----------------------------
+
+    def _start_publishing(self) -> Any:
+        """The Head of Publishing, or None when JARVIS_PUBLISHING=0 or it cannot be built. Never raises."""
+        if _env("JARVIS_PUBLISHING", "1").lower() in ("0", "false", "no", "off"):
+            print("[Brain] Presentations off (JARVIS_PUBLISHING=0).")
+            return None
+        try:
+            # Imported here, not at the top: the agents package imports this module.
+            from agents import publishing_agent
+
+            return publishing_agent.build()
+        except Exception as exc:  # noqa: BLE001 - presentations are an extra; the manager works without them
+            print(f"[Brain] Presentations could not start ({type(exc).__name__}: {exc}).")
+            return None
+
+    def _publishing_tool(self) -> ToolSpec:
+        """delegate_to_publishing: built once, the same object every turn (the tool list stays cacheable)."""
+        if self._publishing_spec is None:
+            from agents.publishing_agent import MAX_BULLETS, MAX_SLIDES  # the agents package imports this module
+
+            self._publishing_spec = ToolSpec(
+                name=DELEGATE_PUBLISHING,
+                description=(
+                    "Hand a finished slide plan to your Head of Publishing, who builds a real PowerPoint file "
+                    "(.pptx, 16:9) from it and saves it on this computer. Use it whenever the user asks for a "
+                    "presentation, slides, a slide deck or a PowerPoint, after you have planned the content "
+                    "(research first when it needs facts). It writes nothing itself: it lays out exactly the "
+                    "slides you send, as an opening slide from the title and subtitle, then one slide per entry. "
+                    "Returns SUCCESS with where the file is - the saved file's path, or in the web chat a Markdown "
+                    "download link - or ERROR with what to change in the data."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "presentation_data": {
+                            "type": "string",
+                            "description": (
+                                "The whole deck as one JSON object, written as a string: "
+                                '{"title": "Deck title", "subtitle": "Optional line under it", "slides": '
+                                '[{"title": "Slide title", "bullet_points": ["First point", "Second point"]}]}. '
+                                f"title and subtitle are optional and make the opening slide; slides is required: 1 "
+                                f"to {MAX_SLIDES} slides, each with a short title and a list of up to {MAX_BULLETS} "
+                                "bullet points (plain text, about one line each). An empty bullet_points list makes a "
+                                "section slide."
+                            ),
+                        }
+                    },
+                    "required": ["presentation_data"],
+                },
+                handler=lambda presentation_data="": self._publish(presentation_data),
+                requires_confirmation=False,
+                # Foreground: the saved file's path IS the answer.
+                background=False,
+                label="the Head of Publishing",
+                source="agent",
+            )
+        return self._publishing_spec
+
+    def _publish(self, presentation_data: Any = "") -> str:
+        """
+        Runs one deck on the Head of Publishing; its SUCCESS/ERROR text goes back to the
+        model. In the web chat a SUCCESS's Path and URL lines become one
+        "Download: [Download Presentation](/artifacts/<file>)" line - the link the page
+        offers as a download (api_server.py serves the folder, the web app passes it on) -
+        remembered so the reply is sure to carry it (_with_artifacts). By voice the path
+        stays and the URL goes: a web address means nothing through a speaker.
+        """
+        size = len(presentation_data) if isinstance(presentation_data, str) else len(json.dumps(presentation_data, default=str))
+        print(f"[Brain] Delegating to the Head of Publishing: {size:,} characters of slides.")
+        result = self._publishing.build_presentation(presentation_data)
+        if not result.startswith("SUCCESS"):
+            return result
+        caller = request_context.current()
+        web = caller is not None and caller.is_web
+
+        from agents.publishing_agent import markdown_link  # the agents package imports this module
+
+        lines = []
+        for line in result.splitlines():
+            if line.startswith("URL: "):
+                continue
+            if line.startswith("Path: ") and web:
+                link = markdown_link(line[len("Path: "):].strip())
+                if link not in self._artifacts_this_turn:
+                    self._artifacts_this_turn.append(link)
+                line = f"Download: {link}"
+            lines.append(line)
+        return "\n".join(lines)
 
     def _team_rule(self, tools: list[ToolSpec]) -> str:
         """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
@@ -3432,6 +3666,8 @@ class LLMBrain:
         base = FRONT_DOOR_PROMPT
         if self._creative is not None and self._creative.available:
             base += _FRONT_DOOR_CREATIVE
+        if self._publishing is not None and self._publishing.available:
+            base += _FRONT_DOOR_PUBLISHING
         if not self._mcp_tools:
             return base
         notes = self._mcp.server_notes() if self._mcp is not None else []
@@ -3894,7 +4130,7 @@ class LLMBrain:
         # round trips, so a heavy request does not silently drop back to
         # a cheaper model halfway through answering itself.
         self._dispatched_this_turn = []
-        self._images_this_turn = []
+        self._artifacts_this_turn = []
 
         intent, why = _classify_intent(_routing_text(user_text))
         model, effort = self._route(intent)
@@ -3902,6 +4138,11 @@ class LLMBrain:
             f"[Brain] Routing: {intent.upper()} ({why}) "
             f"-> {model or self._provider.model}, effort {effort}."
         )
+        # A deck's slides are written into one tool call: room for all of them
+        # (LONG_OUTPUT_MAX_TOKENS). Every other question keeps the spoken-answer limit.
+        max_tokens: Optional[int] = None
+        if any(tool.name == DELEGATE_PUBLISHING for tool in tools) and _asks_for_presentation(_routing_text(user_text)):
+            max_tokens = LONG_OUTPUT_MAX_TOKENS
 
         # Feature 6: greetings and general conversation stop here, answered
         # by the cheap tier without the tool list. Anything else falls
@@ -3927,7 +4168,7 @@ class LLMBrain:
 
         for step in range(1, self._max_steps + 1):
             try:
-                turn = self._call_provider(working, tools, model, effort)
+                turn = self._call_provider(working, tools, model, effort, max_tokens=max_tokens)
             except ProviderError as exc:
                 return exc.spoken
 
@@ -3959,9 +4200,9 @@ class LLMBrain:
                         continue
                     reply = LINK_FALLBACK
 
-                # Web chat: the pictures made for this request are in the reply, as the
-                # Markdown lines the page draws (see _create_image).
-                reply = self._with_images(reply)
+                # Web chat: what was made for this request is in the reply, as the Markdown
+                # lines the page draws - a picture, a download link (_create_image, _publish).
+                reply = self._with_artifacts(reply)
 
                 # The transcript keeps the question and the answer, not
                 # the tool scaffolding - so a backgrounded action would
@@ -4013,6 +4254,7 @@ class LLMBrain:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         system: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> Turn:
         """
         One provider round trip, with a single failover retry.
@@ -4021,6 +4263,8 @@ class LLMBrain:
         ProviderError.is_fatal_for_provider. `system` replaces the
         persona for this one call (the front door has its own prompt);
         `tools=[]` means no tools, where None means the active set.
+        `max_tokens` raises the output limit for this call (LONG_OUTPUT_MAX_TOKENS,
+        for a presentation); None keeps the provider's own (MAX_TOKENS).
         """
         assert self._provider is not None
         tools = self._active_tools() if tools is None else tools
@@ -4039,6 +4283,9 @@ class LLMBrain:
             images = creative_rule(tools, web=caller is not None and caller.is_web)
             if images:
                 context += "\n\n" + images
+            decks = publishing_rule(tools, web=caller is not None and caller.is_web)
+            if decks:
+                context += "\n\n" + decks
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
@@ -4049,24 +4296,45 @@ class LLMBrain:
         else:
             prompt = system
 
-        # The model was chosen when the question was routed (_route), maybe on the
-        # other provider - a failover earlier in this same question. A name meant
-        # for the other provider is dropped ("claude-opus-5" sent to Gemini is a 404),
-        # which leaves this provider's default model.
-        if model is not None and model.startswith("gemini") != (self._provider.name == "gemini"):
-            model = None
+        def once(limit: Optional[int]) -> Turn:
+            assert self._provider is not None
+            # The model was chosen when the question was routed (_route), maybe on the
+            # other provider - a failover earlier in this same question. A name meant
+            # for the other provider is dropped ("claude-opus-5" sent to Gemini is a 404),
+            # which leaves this provider's default model.
+            chosen = model
+            if chosen is not None and chosen.startswith("gemini") != (self._provider.name == "gemini"):
+                chosen = None
+            # Only a raised limit is passed: every other call is made exactly as before.
+            extra: dict[str, Any] = {"max_tokens": limit} if limit else {}
+            try:
+                return self._provider.complete(prompt, working, tools, chosen, effort, context, **extra)
+            except ProviderError as exc:
+                if not exc.standby_can_help:
+                    raise
+                print(f"[Brain] {self._provider.name} cannot answer ({exc.kind}): {exc.spoken}")
+                if not self._failover(exc.kind):
+                    raise
+                # The standby provider names its models differently, so the
+                # override is dropped rather than sent somewhere it means nothing.
+                return self._provider.complete(prompt, working, tools, None, effort, context, **extra)
 
-        try:
-            return self._provider.complete(prompt, working, tools, model, effort, context)
-        except ProviderError as exc:
-            if not exc.standby_can_help:
-                raise
-            print(f"[Brain] {self._provider.name} cannot answer ({exc.kind}): {exc.spoken}")
-            if not self._failover(exc.kind):
-                raise
-            # The standby provider names its models differently, so the
-            # override is dropped rather than sent somewhere it means nothing.
-            return self._provider.complete(prompt, working, tools, None, effort, context)
+        turn = once(max_tokens)
+        # A tool call the output limit cut off - a deck's slides written past MAX_TOKENS -
+        # is half a call (Gemini sends nothing at all then). It is never run: the same call
+        # is made once more with room for all of it, and if even that is cut off, the
+        # answer says so instead.
+        if tools and turn.cut_off and (turn.kind == "tool_calls" or not turn.text):
+            if (max_tokens or 0) < LONG_OUTPUT_MAX_TOKENS:
+                print(
+                    f"[Brain] The answer was cut off at the output limit mid tool call; asking again "
+                    f"with room for {LONG_OUTPUT_MAX_TOKENS} tokens."
+                )
+                turn = once(LONG_OUTPUT_MAX_TOKENS)
+            if turn.cut_off and (turn.kind == "tool_calls" or not turn.text):
+                print("[Brain] Still cut off at the output limit; the half-written tool call is not run.")
+                return Turn(kind="assistant", text=CUT_OFF_REPLY)
+        return turn
 
 
 if __name__ == "__main__":

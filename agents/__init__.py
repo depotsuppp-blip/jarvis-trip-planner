@@ -17,10 +17,13 @@ it; while it works the manager also loses its own send_line_notification, and wh
 it does not, the manager keeps that one (it asks before sending). JARVIS_AGENTS=0
 turns the team off: one model with every built-in tool, as before (no calendar).
 
-Not in the team, though it lives here: the Head of Creative (creative_agent.py), which
-makes images. It is no model loop - one OpenAI Images API call per picture, saved in
-artifacts/ - so the manager holds its delegate_to_creative itself (LLMBrain._creative_tool),
-with or without the team, whenever OPENAI_API_KEY is set.
+Not in the team, though they live here: the Head of Creative (creative_agent.py), which
+makes images, and the Head of Publishing (publishing_agent.py), which builds PowerPoint
+files. Neither is a model loop - one OpenAI Images API call per picture; python-pptx laying
+out the slides the manager planned - and both save what they make in artifacts/, so the
+manager holds delegate_to_creative and delegate_to_publishing itself (LLMBrain._creative_tool,
+_publishing_tool), with or without the team: images whenever OPENAI_API_KEY is set,
+presentations whenever python-pptx is installed.
 
 Keys (.env): GEMINI_API_KEY (data, research, productivity fallback, last resort),
 GROQ_API_KEY (data fallback), OPENAI_API_KEY (productivity primary, images);

@@ -1,28 +1,38 @@
 /**
- * Pictures Jarvis made. The brain (Python, agents/creative_agent.py) saves each one in
- * the Jarvis project's artifacts/ folder as image_YYYYMMDD_HHMMSS.png (_2, _3... when two
- * land in the same second; .jpg or .webp if that is what came back), and a web chat reply
- * shows it as one Markdown image line:
+ * Files Jarvis made. The brain (Python) saves each one in the Jarvis project's artifacts/
+ * folder (_2, _3... after the time when two land in the same second):
  *
- *   ![Generated Image](/artifacts/image_20261029_160717.png)
+ *   - pictures (agents/creative_agent.py): image_YYYYMMDD_HHMMSS.png (.jpg or .webp if that
+ *     is what came back), shown in a web chat reply as one Markdown image line:
+ *       ![Generated Image](/artifacts/image_20261029_160717.png)
+ *   - presentations (agents/publishing_agent.py): presentation_YYYYMMDD_HHMMSS.pptx, offered
+ *     as one Markdown link:
+ *       [Download Presentation](/artifacts/presentation_20261101_103000.pptx)
  *
- * That exact form - a same-origin /artifacts/ address and one of those names - is the only
- * image a reply can draw (MessageText). Nothing else in a reply is Markdown, and an image
- * from anywhere else stays text, so a reply can never make the page load an outside address.
- * GET /artifacts/<name> (app/artifacts/[name]/route.ts) fetches the file from the brain.
+ * Those exact forms - a same-origin /artifacts/ address and one of those names - are the only
+ * Markdown a reply can hold (MessageText): an image line draws the picture, any other link to
+ * such a file becomes a download. Anything else stays text, so a reply can never make the page
+ * load or link an outside address this way. GET /artifacts/<name>
+ * (app/artifacts/[name]/route.ts) fetches the file from the brain.
  *
  * Pure: no React, no network.
  */
 
 export const ARTIFACTS_PATH = "/artifacts";
 
-const NAME = String.raw`image_\d{8}_\d{6}(?:_\d{1,2})?\.(?:png|jpe?g|webp)`;
+const STAMP = String.raw`\d{8}_\d{6}(?:_\d{1,2})?`;
+const IMAGE_NAME = String.raw`image_${STAMP}\.(?:png|jpe?g|webp)`;
+const FILE_NAME = String.raw`presentation_${STAMP}\.pptx`;
 
-/** A file name Jarvis gives a picture - nothing else is ever asked of the brain. */
-export const ARTIFACT_NAME_RE = new RegExp(`^${NAME}$`);
+/** A file name Jarvis gives what it makes - nothing else is ever asked of the brain. */
+export const ARTIFACT_NAME_RE = new RegExp(`^(?:${IMAGE_NAME}|${FILE_NAME})$`);
+const IMAGE_NAME_RE = new RegExp(`^${IMAGE_NAME}$`);
 
-// The alt text is short, on one line, and has no brackets of its own.
-const IMAGE_LINE = new RegExp(String.raw`!\[([^\[\]\n]{0,120})\]\(/artifacts/(${NAME})\)`, "g");
+// "!" for an image, then the label: short, on one line, with no brackets of its own.
+const ARTIFACT_MARKDOWN = new RegExp(
+  String.raw`(!?)\[([^\[\]\n]{0,120})\]\(/artifacts/(${IMAGE_NAME}|${FILE_NAME})\)`,
+  "g"
+);
 
 /** What the browser asks for: /artifacts/<name>. */
 export function artifactPath(name: string): string {
@@ -34,24 +44,42 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
   webp: "image/webp",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 };
 
-/** The content type a picture with this name must have, or null for a name that is not one. */
+/** The content type a file with this name must have, or null for a name Jarvis never gives. */
 export function artifactMime(name: string): string | null {
   if (!ARTIFACT_NAME_RE.test(name)) return null;
   return MIME_BY_EXTENSION[name.slice(name.lastIndexOf(".") + 1).toLowerCase()] ?? null;
 }
 
-export type ReplyPart = { kind: "text"; text: string } | { kind: "image"; name: string; alt: string };
+/** True for a picture, which the page can show; anything else Jarvis made is a download. */
+export function isArtifactImage(name: string): boolean {
+  return IMAGE_NAME_RE.test(name);
+}
 
-/** `text` cut into its plain stretches and the pictures between them, in order. */
-export function splitArtifactImages(text: string): ReplyPart[] {
+export type ReplyPart =
+  | { kind: "text"; text: string }
+  | { kind: "image"; name: string; alt: string }
+  | { kind: "file"; name: string; label: string };
+
+/**
+ * `text` cut into its plain stretches and the files between them, in order. An image line
+ * (`![...]`) naming a picture draws it; every other match - a presentation, or a plain link
+ * to a picture - is offered as a download.
+ */
+export function splitArtifacts(text: string): ReplyPart[] {
   const parts: ReplyPart[] = [];
   let cursor = 0;
-  for (const match of text.matchAll(IMAGE_LINE)) {
+  for (const match of text.matchAll(ARTIFACT_MARKDOWN)) {
     const start = match.index ?? 0;
     if (start > cursor) parts.push({ kind: "text", text: text.slice(cursor, start) });
-    parts.push({ kind: "image", name: match[2], alt: match[1].trim() });
+    const [, bang, label, name] = match;
+    parts.push(
+      bang && isArtifactImage(name)
+        ? { kind: "image", name, alt: label.trim() }
+        : { kind: "file", name, label: label.trim() }
+    );
     cursor = start + match[0].length;
   }
   if (cursor < text.length) parts.push({ kind: "text", text: text.slice(cursor) });

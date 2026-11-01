@@ -74,12 +74,14 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *   from before the agents sends neither, and the sidebar then shows none.
  *   Free text (`why`, `error`) never leaves this file: it can hold local paths.
  *
- * The artifacts door (fetchArtifact) is where a picture Jarvis made comes from. A reply
- * shows one as `![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)`; the browser
- * asks THIS app for that address (app/artifacts/[name]/route.ts), which fetches it from:
+ * The artifacts door (fetchArtifact) is where a file Jarvis made comes from. A reply
+ * shows a picture as `![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)` and offers
+ * a presentation as `[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)`;
+ * the browser asks THIS app for that address (app/artifacts/[name]/route.ts), which
+ * fetches it from:
  *
  *   GET {JARVIS_ARTIFACTS_URL}/<name>   default: JARVIS_BRAIN_URL with its /chat swapped for /artifacts
- *   reply the image file (image/png, image/jpeg or image/webp); 404 when there is none
+ *   reply the file (image/png, image/jpeg, image/webp, or the .pptx type); 404 when there is none
  */
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };
@@ -105,7 +107,7 @@ const BRAIN_URL = process.env.JARVIS_BRAIN_URL ?? "http://127.0.0.1:8000/chat";
 const VOICE_URL = process.env.JARVIS_VOICE_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/voice");
 const HEALTH_URL = process.env.JARVIS_HEALTH_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/health");
 const ARTIFACTS_URL = process.env.JARVIS_ARTIFACTS_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/artifacts");
-// A file on the brain's own disk: a picture of a few MB arrives in well under a second.
+// A file on the brain's own disk: a picture of a few MB, or a deck, arrives in well under a second.
 const ARTIFACT_TIMEOUT_MS = 15_000;
 // The brain answers /health at once, except while it is still starting (it connects its
 // tool servers first, up to ~15 s). A sidebar that waits longer than this just says "not checked".
@@ -403,9 +405,10 @@ export async function getJarvisStatus(): Promise<BrainStatus> {
 }
 
 /**
- * The brain's GET /artifacts/<name>: one picture Jarvis made, as the brain answers it
- * (any status - the caller decides what a 404 means). `name` must already be checked
- * (lib/jarvis/artifacts.ts). Throws JarvisBrainError when the brain cannot be reached.
+ * The brain's GET /artifacts/<name>: one file Jarvis made - a picture, a presentation - as
+ * the brain answers it (any status - the caller decides what a 404 means). `name` must
+ * already be checked (lib/jarvis/artifacts.ts). Throws JarvisBrainError when the brain
+ * cannot be reached.
  */
 export async function fetchArtifact(name: string): Promise<Response> {
   try {
@@ -415,7 +418,7 @@ export async function fetchArtifact(name: string): Promise<Response> {
     });
   } catch (error) {
     const timedOut = error instanceof DOMException && error.name === "TimeoutError";
-    throw new JarvisBrainError(timedOut ? "Jarvis brain took too long to send the image." : "Jarvis brain is offline.");
+    throw new JarvisBrainError(timedOut ? "Jarvis brain took too long to send the file." : "Jarvis brain is offline.");
   }
 }
 

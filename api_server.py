@@ -51,9 +51,11 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  nothing to configure (mcp_client.py). The web hub's sidebar lists them from here
                  (TripPlanner_Web: GET /api/chat/tools).
     GET  /artifacts/<file> -> the file itself: what Jarvis made and saved in artifacts/ - the
-                 images from agents/creative_agent.py (image_YYYYMMDD_HHMMSS.png). A web chat
-                 reply shows one as ![Generated Image](/artifacts/<file>); the web app answers
-                 that address for the browser by fetching it from here
+                 images from agents/creative_agent.py (image_YYYYMMDD_HHMMSS.png) and the
+                 presentations from agents/publishing_agent.py (presentation_YYYYMMDD_HHMMSS.pptx).
+                 A web chat reply shows a picture as ![Generated Image](/artifacts/<file>) and
+                 offers a presentation as [Download Presentation](/artifacts/<file>); the web app
+                 answers that address for the browser by fetching it from here
                  (TripPlanner_Web/app/artifacts/[name]/route.ts), for the signed-in person
                  whose chat it is in. 404 for a file that is not there.
 
@@ -97,6 +99,7 @@ Things that differ from the voice assistant, deliberately:
 
 from __future__ import annotations
 
+import mimetypes
 import threading
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal, Optional
@@ -113,6 +116,7 @@ import request_context
 import rich_reply
 import stt
 from agents.creative_agent import ARTIFACTS_DIR, ARTIFACTS_URL_PATH
+from agents.publishing_agent import PPTX_MIME
 from llm_brain import LLMBrain
 
 HOST = "127.0.0.1"
@@ -213,14 +217,19 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# GET /artifacts/<file>: the folder Jarvis saves what it makes in (agents/creative_agent.py).
-# StaticFiles keeps requests inside it (no ../), and answers 404 for anything missing. The
-# folder is made here when it is not there yet - a fresh clone has it, a Docker volume may
-# not - and a folder that cannot be made only costs the images, never the server's start.
+# GET /artifacts/<file>: the folder Jarvis saves what it makes in (agents/creative_agent.py,
+# agents/publishing_agent.py). StaticFiles keeps requests inside it (no ../), and answers 404
+# for anything missing. The folder is made here when it is not there yet - a fresh clone has
+# it, a Docker volume may not - and a folder that cannot be made only costs the files, never
+# the server's start.
 try:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 except OSError as exc:
-    print(f"[API] The artifacts folder {ARTIFACTS_DIR} could not be made ({exc}); images will not be served.")
+    print(f"[API] The artifacts folder {ARTIFACTS_DIR} could not be made ({exc}); its files will not be served.")
+# StaticFiles names a file's type from Python's mimetypes table, which knows .pptx only where
+# the system does (Windows' registry): the Linux image would send presentations as
+# application/octet-stream, and the web app refuses a file whose type is not the one its name says.
+mimetypes.add_type(PPTX_MIME, ".pptx")
 app.mount(ARTIFACTS_URL_PATH, StaticFiles(directory=ARTIFACTS_DIR, check_dir=False), name="artifacts")
 
 _brain: LLMBrain | None = None
