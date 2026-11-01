@@ -5,8 +5,10 @@
 *.key
 # Credential files such as the Google service account key (GOOGLE_SERVICE_ACCOUNT_FILE in .env)
 .secrets/
-# The Canva session utils/canva_auth.py saves for the Publishing Agent: it signs whoever has it
-# in to the Canva account. Any folder, any copy.
+# Jarvis's Chrome profile for Canva (utils/canva_auth.py; .data/canva_profile by default, and
+# .data/ is ignored below) and the session file of its first version: either signs whoever has
+# it in to the Canva account. Any folder, any copy.
+canva_profile/
 canva_state.json
 
 # --- Python -------------------------------------------------------------

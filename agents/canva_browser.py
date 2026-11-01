@@ -3,7 +3,8 @@ The Head of Publishing's hands in Canva: a browser that builds the deck on canva
 
     PublishingAgent (agents/publishing_agent.py)
         -> make_presentation(slides, target)       blocking; the browser runs on its own thread
-            Playwright opens Canva with the saved session (canva_state.json, utils/canva_auth.py)
+            Playwright opens Jarvis's own Chrome profile, signed in by hand once
+            (.data/canva_profile, utils/canva_auth.py), playwright-stealth applied, hidden
             -> a new presentation: Create a design > Presentation, or JARVIS_CANVA_DESIGN_URL
             -> one page per slide; its heading, subheading or bullet points typed in
             -> Share > Download > PPTX (or PDF) -> saved as `target`
@@ -22,23 +23,29 @@ kept in .data/canva_debug/ (git ignores it; it can show your Canva account). The
 the patterns below need to be fixed against. Watch a run:
     python -m agents.publishing_agent --canva-test --headed
 
-NOT CHECKED AGAINST CANVA ITSELF: written on 2026-11-01 without a Canva account to sign in
-with, and tested against a local stand-in of the editor that has exactly the names and keys
-used here. The one look at canva.com (signed out, headless) met Cloudflare's "Verify you are
-human" check before any of Canva loaded: that page is recognised (BLOCKED) and the run stops.
-Nothing in it hides that a program drives the browser, or tries to get past such a check.
+THE EDITOR IS NOT CHECKED AGAINST CANVA ITSELF: written on 2026-11-01 without a Canva account
+to sign in with, and tested against a local stand-in of the editor that has exactly the names
+and keys used here. What was checked on canva.com itself (signed out): Cloudflare's check lets
+this browser through to the home page (utils/canva_auth.py, STEALTH), and a profile that is
+not signed in is recognised there (stage "session").
+
+CLOUDFLARE. Its "Just a moment..." page often clears itself after a few seconds, as in any
+browser, so a run waits CHALLENGE_WAIT for that; a check still there afterwards stops the run
+(stage "blocked"). Nothing here clicks or solves it. A hidden run that was stopped is tried
+once more in a minimized window when JARVIS_CANVA_HEADLESS=auto. After that it takes a person:
+python -m utils.canva_auth, with the check done by hand in its window.
 
 SETTINGS (.env)
-    JARVIS_CANVA_STATE, JARVIS_CANVA_BROWSER  see utils/canva_auth.py
+    JARVIS_CANVA_PROFILE     see utils/canva_auth.py. The browser is always Google Chrome.
     JARVIS_CANVA_DESIGN_URL  where a new deck starts: a link that makes a NEW one-page design each
                              time it is opened (a template's "use this template" link). Blank =
                              Canva's home page, Create a design > Presentation
     JARVIS_CANVA_FORMAT      pptx or pdf [pptx]
     JARVIS_CANVA_TIMEOUT     seconds for the whole run [75]; the web chat waits 120 in all
-    JARVIS_CANVA_HEADLESS    1 hides the browser window [0: it shows while it works]. Cloudflare's bot
-                             check stopped the headless browser on canva.com (2026-11-01); a visible
-                             one - the browser you signed in with - is the only setup with a chance,
-                             if Canva lets it in at all.
+    JARVIS_CANVA_HEADLESS    auto - hidden; if Cloudflare stops it, once more in a minimized window [default]
+                             1    - hidden only
+                             0    - always a minimized window (opens off screen, sits in the taskbar)
+                             Either way it is Jarvis's own Chrome profile, never your Chrome's windows.
 """
 
 from __future__ import annotations
@@ -66,16 +73,19 @@ STEP_TIMEOUT = 12.0  # seconds to find one control
 # Every step is held to the run's own deadline; this much more is the hard stop, so a run that
 # runs out of time still has the seconds to keep its screenshot and close the browser.
 GRACE = 15.0
-SIGNED_OUT = "the saved Canva session is signed out or has ended - run: python -m utils.canva_auth"
-# Canva sits behind Cloudflare, whose "Verify you are human" check met Playwright's headless browser on
-# canva.com itself (2026-11-01). Jarvis stops there: getting past a site's bot check is not its to do.
+SIGNED_OUT = "Jarvis's Chrome is signed out of Canva or the session has ended - run: python -m utils.canva_auth"
+# Canva sits behind Cloudflare. Its check often clears itself within seconds; this long it may try.
+CHALLENGE_WAIT = 10.0
+# A hidden run that Cloudflare stopped is tried again in a minimized window only with this much time left.
+RETRY_MIN_SECONDS = 25.0
 BLOCKED = (
-    "Canva's bot check (Cloudflare's \"Verify you are human\") stopped the automated browser, and Jarvis "
-    "does not get past it on its own. Sign in again with python -m utils.canva_auth (doing the check by "
-    "hand) and keep the agent's browser visible (JARVIS_CANVA_HEADLESS=0) - if Canva still blocks it, "
-    "python-pptx makes the decks"
+    "Canva's bot check (Cloudflare's \"Verify you are human\") stopped Jarvis's browser. Run "
+    "python -m utils.canva_auth and do the check by hand in its window - Jarvis's next runs use that "
+    "profile; until then python-pptx makes the decks"
 )
 _CHALLENGE = re.compile(r"verify you are human|just a moment|checking your browser|designing again soon", re.I)
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
 
 # JARVIS_CANVA_FORMAT -> (how its entry in Canva's File type list is named, the file's extension)
 FORMATS: dict[str, tuple[str, str]] = {"pptx": (r"pptx|powerpoint", ".pptx"), "pdf": (r"pdf\s*standard|^\s*pdf\s*$", ".pdf")}
@@ -116,17 +126,25 @@ class CanvaSlide:
 
 @dataclass(frozen=True)
 class CanvaSettings:
-    state: Path
-    browser: str
+    profile: Path  # Jarvis's Chrome profile folder (utils/canva_auth.py)
     design_url: str
     fmt: str
     timeout: float
     headless: bool
+    window_fallback: bool = True  # a hidden run that Cloudflare stopped: once more in a minimized window
+    minimized: bool = True  # a visible window opens off screen and minimized (False: in front, to watch)
     slow_mo: int = 0  # milliseconds between browser actions (the --headed test run, to watch it)
 
     @property
     def extension(self) -> str:
         return FORMATS[self.fmt][1]
+
+    @property
+    def window(self) -> str:
+        """How the browser shows, in a few words (describe, --check)."""
+        if self.headless:
+            return "hidden, then a minimized window if Cloudflare stops it" if self.window_fallback else "hidden"
+        return "in a minimized window" if self.minimized else "in a visible window"
 
     @classmethod
     def from_env(cls) -> "CanvaSettings":
@@ -135,26 +153,30 @@ class CanvaSettings:
             timeout = float(canva_auth.setting("JARVIS_CANVA_TIMEOUT", str(DEFAULT_TIMEOUT)))
         except ValueError:
             timeout = DEFAULT_TIMEOUT
+        # Hidden by default: with stealth, Cloudflare let headless Chrome through to canva.com (2026-11-01).
+        mode = canva_auth.setting("JARVIS_CANVA_HEADLESS", "auto").lower()
         return cls(
-            state=canva_auth.state_path(),
-            browser=canva_auth.browser_name(),
+            profile=canva_auth.profile_path(),
             design_url=canva_auth.setting("JARVIS_CANVA_DESIGN_URL"),
             fmt=fmt if fmt in FORMATS else "pptx",
             timeout=min(max(timeout, 20.0), 600.0),
-            # Visible unless told otherwise: Cloudflare stopped the headless browser on canva.com.
-            headless=canva_auth.setting("JARVIS_CANVA_HEADLESS", "0").lower() in ("1", "true", "yes", "on"),
+            headless=mode not in _FALSE,
+            window_fallback=mode not in _TRUE + _FALSE,
         )
 
     def watched(self) -> "CanvaSettings":
-        """The same, in a visible window and slowed down, with time to watch it."""
-        return replace(self, headless=False, slow_mo=250, timeout=max(self.timeout, 240.0))
+        """The same, in a window in front of you and slowed down, with time to watch it."""
+        return replace(self, headless=False, minimized=False, window_fallback=False, slow_mo=250, timeout=max(self.timeout, 240.0))
 
 
 def readiness(settings: CanvaSettings) -> str:
     """"" when a Canva run can be tried; else why not, in a few words."""
     if importlib.util.find_spec("playwright") is None:
         return "Playwright is not installed (pip install -r requirements.txt)"
-    if not settings.state.is_file():
+    problem = canva_auth.stealth_problem()
+    if problem:
+        return problem
+    if not canva_auth.signed_in_file(settings.profile).is_file():
         return "not signed in to Canva yet (run: python -m utils.canva_auth)"
     return ""
 
@@ -176,6 +198,7 @@ class _Run:
         self.settings = settings
         self.deadline = deadline
         self.stage = "open"
+        self.blocked_since: Optional[float] = None
 
     def ms(self, cap: float = STEP_TIMEOUT) -> int:
         """Milliseconds a browser action may take: `cap` seconds, never past the run's deadline."""
@@ -234,6 +257,16 @@ class _Run:
         except Exception:  # noqa: BLE001 - a page that is navigating: not known to be blocked
             return False
 
+    async def stopped_by_bot_check(self) -> bool:
+        """True once Cloudflare's check has stood for CHALLENGE_WAIT seconds; it often clears itself first."""
+        if not await self.blocked():
+            self.blocked_since = None
+            return False
+        now = time.monotonic()
+        if self.blocked_since is None:
+            self.blocked_since = now
+        return now - self.blocked_since >= CHALLENGE_WAIT
+
     # -- the steps ---------------------------------------------------------------------
 
     async def open_design(self) -> None:
@@ -248,7 +281,7 @@ class _Run:
             log_in = self.control(r"^\s*(log in|sign in)\s*$", ("button", "link"))
             give_up = min(time.monotonic() + EDITOR_TIMEOUT, self.deadline)
             while not await self.visible(create):
-                if await self.blocked():
+                if await self.stopped_by_bot_check():
                     raise CanvaError("blocked", BLOCKED)
                 if self.signed_out() or await self.visible(log_in):
                     raise CanvaError("session", SIGNED_OUT)
@@ -279,7 +312,7 @@ class _Run:
                 tabs_before = list(self.page.context.pages)
             if await self.visible(self.control(r"^\s*share\s*$", ("button",))):
                 return
-            if await self.blocked():
+            if await self.stopped_by_bot_check():
                 raise CanvaError("blocked", BLOCKED)
             if self.signed_out():
                 raise CanvaError("session", SIGNED_OUT)
@@ -407,22 +440,22 @@ async def _make(slides: list[CanvaSlide], target: Path, settings: CanvaSettings,
     deadline = time.monotonic() + settings.timeout
     async with async_playwright() as playwright:
         try:
-            browser = await canva_auth.launch(playwright, settings.headless, slow_mo=settings.slow_mo)
+            # Jarvis's own profile: the sign-in lives there, and Chrome renews Canva's cookies in it as it goes.
+            context = await canva_auth.open_profile(
+                playwright,
+                headless=settings.headless,
+                minimized=settings.minimized,
+                slow_mo=settings.slow_mo,
+                viewport={"width": 1600, "height": 1000},
+                accept_downloads=True,
+                profile=settings.profile,
+            )
         except RuntimeError as exc:
             raise CanvaError("browser", str(exc)) from exc
         run: Optional[_Run] = None
         try:
-            try:
-                context = await browser.new_context(
-                    storage_state=str(settings.state),
-                    accept_downloads=True,
-                    locale="en-US",
-                    viewport={"width": 1600, "height": 1000},
-                )
-            except PlaywrightError as exc:
-                raise CanvaError("session", f"the saved session file cannot be used ({_first_line(exc)}) - run: python -m utils.canva_auth") from exc
             context.set_default_timeout(STEP_TIMEOUT * 1000)
-            page = await context.new_page()
+            page = context.pages[0] if context.pages else await context.new_page()
             if settings.slow_mo:
                 page.set_default_timeout(STEP_TIMEOUT * 1000 * 3)
             run = _Run(page, settings, deadline)
@@ -433,11 +466,6 @@ async def _make(slides: list[CanvaSlide], target: Path, settings: CanvaSettings,
                 if settings.slow_mo:
                     await asyncio.sleep(settings.slow_mo / 1000)
             await run.download(target)
-            # Canva renews its cookies as it is used: keep the newer ones for next time.
-            try:
-                await context.storage_state(path=str(settings.state))
-            except Exception:  # noqa: BLE001 - the old session file still works
-                pass
             return target
         except CanvaError as err:
             if run is not None and err.debug is None:
@@ -461,7 +489,7 @@ async def _make(slides: list[CanvaSlide], target: Path, settings: CanvaSettings,
             raise
         finally:
             try:
-                await browser.close()
+                await context.close()  # ends Jarvis's Chrome and writes the profile; yours is not touched
             except Exception:  # noqa: BLE001
                 pass
 
@@ -480,11 +508,27 @@ def make_presentation(slides: list[CanvaSlide], target: Path, settings: Optional
     from anywhere - the brain's tool handlers are plain functions, and a thread that already
     runs an event loop (or one whose loop cannot start a browser: the selector loop uvicorn
     may set on Windows) cannot host Playwright's.
+
+    A hidden run that Cloudflare's check stopped is tried once more in a minimized window
+    (settings.window_fallback), in the time that is left.
     """
     settings = settings or CanvaSettings.from_env()
     problem = readiness(settings)
     if problem:
         raise CanvaError("setup", problem)
+    started = time.monotonic()
+    try:
+        return _run_on_a_thread(slides, target, settings)
+    except CanvaError as err:
+        left = settings.timeout - (time.monotonic() - started)
+        if err.stage != "blocked" or not (settings.headless and settings.window_fallback) or left < RETRY_MIN_SECONDS:
+            raise
+    print(f"[Agent:publishing] Cloudflare stopped the hidden browser; once more in a minimized window ({left:.0f} s left).")
+    return _run_on_a_thread(slides, target, replace(settings, headless=False, minimized=True, window_fallback=False, timeout=left))
+
+
+def _run_on_a_thread(slides: list[CanvaSlide], target: Path, settings: CanvaSettings) -> Path:
+    """One Canva run in one browser, on a thread of its own (make_presentation). Raises CanvaError only."""
     progress: dict[str, Any] = {}
     outcome: dict[str, Any] = {}
 
@@ -520,19 +564,25 @@ def make_presentation(slides: list[CanvaSlide], target: Path, settings: Optional
     raise CanvaError("error", f"{type(error).__name__}: {_first_line(error)}")
 
 
-async def _browser_check(settings: CanvaSettings) -> str:
+async def _browser_check() -> str:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as playwright:
-        browser = await canva_auth.launch(playwright, headless=True)
+        try:
+            # A throwaway browser, not the profile: a check must not fail because the sign-in window is open.
+            browser = await playwright.chromium.launch(channel=canva_auth.CHANNEL, headless=True)
+        except Exception as exc:  # noqa: BLE001
+            problem = canva_auth.launch_problem(exc)
+            if problem:
+                raise RuntimeError(problem) from exc
+            raise
         version = browser.version
         await browser.close()
     return version
 
 
 def check_browser(settings: Optional[CanvaSettings] = None) -> str:
-    """The browser's version when it starts, else why it does not (for --check). Opens no website."""
-    settings = settings or CanvaSettings.from_env()
+    """Chrome's version when it starts, else why it does not (for --check). Opens no website."""
     if importlib.util.find_spec("playwright") is None:
         return "Playwright is not installed (pip install -r requirements.txt)"
     outcome: dict[str, Any] = {}
@@ -540,7 +590,7 @@ def check_browser(settings: Optional[CanvaSettings] = None) -> str:
     def work() -> None:
         loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
         try:
-            outcome["version"] = loop.run_until_complete(asyncio.wait_for(_browser_check(settings), 60))
+            outcome["version"] = loop.run_until_complete(asyncio.wait_for(_browser_check(), 60))
         except BaseException as exc:  # noqa: BLE001
             outcome["error"] = exc
         finally:
@@ -550,6 +600,6 @@ def check_browser(settings: Optional[CanvaSettings] = None) -> str:
     worker.start()
     worker.join(75)
     if "version" in outcome:
-        return f"{settings.browser} {outcome['version']} starts"
+        return f"Google Chrome {outcome['version']} starts"
     error = outcome.get("error")
-    return f"{settings.browser} does not start ({_first_line(error) if error else 'timed out'})"
+    return f"Google Chrome does not start ({_first_line(error) if error else 'timed out'})"

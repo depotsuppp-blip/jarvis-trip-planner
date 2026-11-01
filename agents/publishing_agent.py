@@ -8,10 +8,10 @@ to Canva - with python-pptx kept as the engine that always works.
     manager (llm_brain) --delegate_to_publishing(presentation_data)--> PublishingAgent
         -> the JSON read and checked against the shape below (parse_deck)
         -> a text size chosen for every slide, or an ERROR when it cannot fit (plan_deck)
-        -> CANVA (agents/canva_browser.py), when a Canva session is saved
-           (python -m utils.canva_auth): a new presentation on canva.com, one page per
-           slide, Share > Download > PPTX (or PDF), checked: every slide there, every title
-           in it
+        -> CANVA (agents/canva_browser.py), when Jarvis's own Chrome profile is signed in
+           (python -m utils.canva_auth): a new presentation on canva.com in a hidden Chrome
+           with playwright-stealth, one page per slide, Share > Download > PPTX (or PDF),
+           checked: every slide there, every title in it
         -> PYTHON-PPTX, when Canva is not set up or its run fails (the reason goes back
            with the deck): a 16:9 deck laid out here, opened again and checked
         -> saved as artifacts/presentation_YYYYMMDD_HHMMSS.pptx (or .pdf from Canva)
@@ -31,8 +31,8 @@ link (TripPlanner_Web/app/artifacts/[name]).
 
 NOT A LANGUAGE-MODEL LOOP, like the Head of Creative. The manager plans the content -
 with the Head of Research when it needs facts - and writes the JSON; this lays it out.
-No API key. Canva decks are made in the Canva account whose session is saved - every web
-user's included - so they are in that account's designs too.
+No API key. Canva decks are made in the Canva account Jarvis's Chrome is signed in to - every
+web user's included - so they are in that account's designs too.
 
 THE DATA. One JSON object, as a string or as the dict itself:
 
@@ -626,8 +626,8 @@ def _dark(slide: Any) -> None:
 
 ENGINES = ("auto", "canva", "pptx")
 # After a Canva run that needs a person - the session ended, Canva's bot check stopped the browser -
-# Canva is not tried again for this long (python-pptx makes the decks meanwhile, at once), unless the
-# session file changes: signing in again (python -m utils.canva_auth) ends the pause.
+# Canva is not tried again for this long (python-pptx makes the decks meanwhile, at once), unless
+# you sign in again (python -m utils.canva_auth rewrites its note in the profile): that ends the pause.
 CANVA_REST_SECONDS = 30 * 60
 NEEDS_A_PERSON = ("session", "blocked")
 # A web request tells how much of its wait is left (llm_brain, WEB_CHAT_SECONDS): Canva gets at most
@@ -645,8 +645,8 @@ def _engine_from_env() -> str:
 
 class PublishingAgent:
     """
-    Builds one presentation file per call and saves it in artifacts/: in Canva when a Canva
-    session is saved (and JARVIS_PUBLISHING_ENGINE allows it), else - or when Canva fails -
+    Builds one presentation file per call and saves it in artifacts/: in Canva when Jarvis's
+    Chrome is signed in to it (and JARVIS_PUBLISHING_ENGINE allows it), else - or when Canva fails -
     with python-pptx. Building one makes no network call.
     """
 
@@ -671,7 +671,7 @@ class PublishingAgent:
         self.engine = engine if engine in ENGINES else _engine_from_env()
         self.canva = canva or CanvaSettings.from_env()
         self._canva_runner = canva_runner or canva_browser.make_presentation
-        # (until, why, the session file's mtime then) while Canva rests after needing a person.
+        # (until, why, the sign-in note's mtime then) while Canva rests after needing a person.
         self._canva_rest: Optional[tuple[float, str, float]] = None
 
     @property
@@ -697,8 +697,7 @@ class PublishingAgent:
         if not self.available:
             return f"off ({self.unavailable_reason})"
         local = f"python-pptx {getattr(pptx, '__version__', '?')}"
-        window = "" if self.canva.headless else ", in a visible window"
-        canva = f"Canva ({self.canva.browser}, {self.canva.fmt.upper()}, up to {self.canva.timeout:.0f} s{window})"
+        canva = f"Canva (Chrome {self.canva.window}, {self.canva.fmt.upper()}, up to {self.canva.timeout:.0f} s)"
         if self.engine == "canva":
             where = f"{canva} only"
         elif self.canva_problem:
@@ -779,8 +778,8 @@ class PublishingAgent:
             kept = f" Screenshot and page outline: {err.debug}.png / .txt" if err.debug else ""
             print(f"[Agent:publishing] Canva stopped at {err.stage} ({time.monotonic() - started:.0f} s): {_shown(err.message, 200)}.{kept}")
             if err.stage in NEEDS_A_PERSON:
-                self._canva_rest = (time.monotonic() + CANVA_REST_SECONDS, err.message, _mtime(self.canva.state))
-                print(f"[Agent:publishing] Canva rests for {CANVA_REST_SECONDS // 60} min, or until the session is saved again.")
+                self._canva_rest = (time.monotonic() + CANVA_REST_SECONDS, err.message, _mtime(self._signed_in_note))
+                print(f"[Agent:publishing] Canva rests for {CANVA_REST_SECONDS // 60} min, or until you sign in again.")
             return None, f"it stopped at {err.stage}: {err.message}"
         except Exception as exc:  # noqa: BLE001 - a fault in the browser code must not cost the deck
             target.unlink(missing_ok=True)
@@ -800,11 +799,15 @@ class PublishingAgent:
         if self._canva_rest is None:
             return ""
         until, why, mtime = self._canva_rest
-        if time.monotonic() >= until or _mtime(self.canva.state) != mtime:
+        if time.monotonic() >= until or _mtime(self._signed_in_note) != mtime:
             self._canva_rest = None
             return ""
         minutes = max(1, round((until - time.monotonic()) / 60))
-        return f"{why} (Canva is tried again in {minutes} min, or as soon as the Canva session is saved again)"
+        return f"{why} (Canva is tried again in {minutes} min, or as soon as you sign in again)"
+
+    @property
+    def _signed_in_note(self) -> Path:
+        return canva_auth.signed_in_file(self.canva.profile)
 
     def _with_pptx(self, deck: DeckSpec, planned: list[PlannedSlide], summary: str, fingerprint: str, canva_note: str) -> str:
         """The deck laid out here with python-pptx, saved and checked; SUCCESS or ERROR."""
@@ -910,8 +913,9 @@ class PublishingAgent:
         if self.engine == "pptx":
             lines.append("  Canva: off (JARVIS_PUBLISHING_ENGINE=pptx)")
             return lines
-        lines.append(f"  Canva session: {_session_note(self.canva.state)}")
-        lines.append(f"  Canva browser: {canva_browser.check_browser(self.canva)}")
+        lines.append(f"  Canva sign-in: {_session_note(self.canva.profile)}")
+        lines.append(f"  Canva browser: {canva_browser.check_browser(self.canva)}, {self.canva.window}")
+        lines.append(f"  Canva stealth: {_stealth_note()}")
         return lines
 
 
@@ -922,17 +926,30 @@ def _mtime(path: Path) -> float:
         return 0.0
 
 
-def _session_note(path: Path) -> str:
-    """Whether the saved Canva session is there, how old and how many Canva cookies - never the cookies themselves."""
-    if not path.is_file():
-        return f"none at {path} - sign in once: python -m utils.canva_auth"
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return f"{path} cannot be read ({type(exc).__name__}) - sign in again: python -m utils.canva_auth"
-    hours = max(0.0, (time.time() - path.stat().st_mtime) / 3600)
+def _session_note(profile: Path) -> str:
+    """Whether Jarvis's Chrome profile is signed in to Canva, and since when - never a cookie."""
+    note = canva_auth.signed_in_file(profile)
+    if not note.is_file():
+        return f"not signed in (profile {profile}) - sign in once: python -m utils.canva_auth"
+    record = canva_auth.signed_in_record(profile)
+    if record is None:
+        return f"{note} cannot be read - sign in again: python -m utils.canva_auth"
+    hours = max(0.0, (time.time() - note.stat().st_mtime) / 3600)
     age = f"{hours:.0f} hours" if hours < 48 else f"{hours / 24:.0f} days"
-    return f"{path}, saved {age} ago, {canva_auth.canva_cookie_count(state)} Canva cookies"
+    return f"profile {profile}, signed in {age} ago, {record.get('canva_cookies', '?')} Canva cookies then"
+
+
+def _stealth_note() -> str:
+    """playwright-stealth's version, or what to install."""
+    problem = canva_auth.stealth_problem()
+    if problem:
+        return f"NOT AVAILABLE - {problem}"
+    try:
+        from importlib.metadata import version
+
+        return f"playwright-stealth {version('playwright-stealth')}"
+    except Exception:  # noqa: BLE001 - installed without metadata
+        return "playwright-stealth (version unknown)"
 
 
 def _verify(path: Path, titles: list[str]) -> str:

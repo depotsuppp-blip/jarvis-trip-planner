@@ -129,9 +129,9 @@ Several things were added to this module beyond plain tool calling:
   PRESENTATIONS  delegate_to_publishing(presentation_data) hands a slide
       plan - JSON the manager writes after planning the content, with the
       Head of Research first when it needs facts - to the Head of Publishing
-      (agents/publishing_agent.py). When a Canva session is saved
+      (agents/publishing_agent.py). When Jarvis's Chrome is signed in to Canva
       (python -m utils.canva_auth) it builds the deck on canva.com in a
-      browser it drives (agents/canva_browser.py, Playwright, up to
+      hidden browser it drives (agents/canva_browser.py, Playwright, up to
       JARVIS_CANVA_TIMEOUT seconds on a thread of its own, so this tool stays
       a plain call) and downloads it; without one, or when that run fails, it
       lays the deck out itself with python-pptx. Either way the file is
