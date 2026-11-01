@@ -4,13 +4,15 @@
  * means focus, selection and the caret - never decoration.
  */
 
-/** Keyboard focus: a 2px rose outline, offset from the control. */
-export const focusRing =
-  "outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600";
+/**
+ * Keyboard focus: a 2px rose outline, offset from the control. No `outline-none` beside it:
+ * in Tailwind v4 that sets --tw-outline-style to none, which `outline-2` then reads, so the
+ * ring never showed. A mouse click draws nothing either way (it does not match :focus-visible).
+ */
+export const focusRing = "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600";
 
 /** Keyboard focus drawn inside the control, for controls that touch an edge that clips outlines. */
-export const focusRingInset =
-  "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-rose-600";
+export const focusRingInset = "focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-rose-600";
 
 /** A quiet scrollbar in the hairline colour instead of the browser's grey slab. */
 export const thinScroll = "[scrollbar-color:#cad5e2_transparent] [scrollbar-width:thin]";

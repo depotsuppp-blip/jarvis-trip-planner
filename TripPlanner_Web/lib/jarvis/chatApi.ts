@@ -13,6 +13,7 @@ import type { ReplyAudio } from "./replyAudio";
  *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?)   one typed turn with a file
  *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
  *   GET  /api/chat/tools                    the manager's model, the specialist agents and the tool servers
+ *   DELETE /api/chat/messages/<id>          deletes one saved message (the person's own)
  *
  * `speak: true` asks for the reply to come back with audio too (`audio` in the answer)
  * when it is short enough to be read aloud - see replyAudio.ts.
@@ -171,6 +172,12 @@ export const chatApi = {
 
   tools: () =>
     request<ToolsData>("/api/chat/tools", { cache: "no-store", signal: AbortSignal.timeout(READ_TIMEOUT_MS) }),
+
+  deleteMessage: (id: string) =>
+    request<{ deleted: string }>(`/api/chat/messages/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+    }),
 
   // No client timeout: the brain may run a whole trip plan (tens of seconds) and the server enforces its own limit.
   // With a file the turn goes as multipart (no Content-Type set, so the browser adds the boundary); without, as JSON.

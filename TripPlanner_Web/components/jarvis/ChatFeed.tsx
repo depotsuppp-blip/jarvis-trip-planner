@@ -27,6 +27,7 @@ export const ChatFeed = memo(function ChatFeed() {
   const access = useChat((state) => state.access);
   const epoch = useChat((state) => state.epoch);
   const waiting = useChat((state) => state.pending !== null);
+  const sendingId = useChat((state) => state.sendingId);
 
   const scroller = useRef<HTMLDivElement | null>(null);
   const seenEpoch = useRef(epoch);
@@ -50,7 +51,7 @@ export const ChatFeed = memo(function ChatFeed() {
 
         <ol role="log" aria-label="Conversation" className="flex flex-col gap-8">
           {messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
+            <MessageBubble key={message.id} message={message} locked={message.id === sendingId} />
           ))}
         </ol>
         {/* Outside the log: it is not a message, and its own status line is what gets announced. */}

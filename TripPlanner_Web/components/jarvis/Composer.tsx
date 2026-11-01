@@ -3,7 +3,7 @@
 import { memo, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { ArrowUp, Mic, Paperclip, Square, X } from "lucide-react";
 import { ACCEPTED_FILE_TYPES, attachmentProblem } from "@/lib/jarvis/attachments";
-import { useChatActions, useOrb } from "@/lib/jarvis/JarvisProvider";
+import { useChatActions, useDraftRequests, useOrb } from "@/lib/jarvis/JarvisProvider";
 import { isFocalMode } from "@/lib/jarvis/types";
 import { AttachmentChip } from "./AttachmentChip";
 import { focusRing } from "./styles";
@@ -31,10 +31,14 @@ import { focusRing } from "./styles";
  * The draft - words and file - lives here, in this component's own state, and
  * nowhere else. Every keystroke re-renders this form and only this form - not the
  * conversation, not the orb (which has its own store) - so typing never costs the
- * animation a frame.
+ * animation a frame. Edit on one of the person's messages puts its words here (in
+ * place of the draft, with the caret at the end), through the controller's
+ * onDraftRequest; a file waiting in the chip stays. While Jarvis is still answering,
+ * the words wait in the switched-off field and get the keyboard once the turn is over.
  */
 export const Composer = memo(function Composer() {
   const actions = useChatActions();
+  const onDraftRequest = useDraftRequests();
   // A turn is in progress: recording, or waiting for the answer to a spoken or typed message.
   const busy = useOrb((state) => isFocalMode(state.mode));
   const listening = useOrb((state) => state.mode === "listening");
@@ -48,6 +52,8 @@ export const Composer = memo(function Composer() {
   const picker = useRef<HTMLInputElement>(null);
   const wasBusy = useRef(false);
   const wasVoice = useRef(false);
+  // Edit put words in the field while it was switched off: it takes the keyboard when the turn ends.
+  const focusFieldWhenFree = useRef(false);
 
   const canSend = (draft.trim().length > 0 || file !== null) && !busy;
 
@@ -79,14 +85,40 @@ export const Composer = memo(function Composer() {
     return () => document.removeEventListener("keydown", onKey);
   }, [busy, actions]);
 
+  // Edit on a message: its words replace the draft, and the field takes the keyboard with the
+  // caret at the end - at once, or (switched off while Jarvis answers) when the turn is over.
+  useEffect(
+    () =>
+      onDraftRequest((text) => {
+        setDraft(text);
+        setFileProblem(null);
+        window.requestAnimationFrame(() => {
+          const input = field.current;
+          if (!input || input.disabled) {
+            focusFieldWhenFree.current = true;
+            return;
+          }
+          input.focus();
+          input.setSelectionRange(input.value.length, input.value.length);
+        });
+      }),
+    [onDraftRequest]
+  );
+
   // A turn is over and the control that held focus is gone or was switched off (Cancel, Stop
   // generating, or the field while it waited): put the keyboard back where the next turn starts - Talk after a
-  // spoken one, the field after a typed one - unless the person already went elsewhere.
+  // spoken one, the field after a typed one - unless the person already went elsewhere. Words that
+  // Edit put in the field meanwhile win: the field it is.
   useEffect(() => {
     if (busy) {
       wasVoice.current = voice;
-    } else if (wasBusy.current && document.activeElement === document.body) {
-      (wasVoice.current ? talk.current : field.current)?.focus();
+    } else if (wasBusy.current && (focusFieldWhenFree.current || document.activeElement === document.body)) {
+      const target = focusFieldWhenFree.current ? field.current : wasVoice.current ? talk.current : field.current;
+      target?.focus();
+      if (focusFieldWhenFree.current && field.current) {
+        field.current.setSelectionRange(field.current.value.length, field.current.value.length);
+      }
+      focusFieldWhenFree.current = false;
     }
     wasBusy.current = busy;
   }, [busy, voice]);

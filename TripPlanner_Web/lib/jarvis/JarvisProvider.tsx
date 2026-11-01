@@ -67,6 +67,11 @@ export function useChatActions(): ChatActions {
   return useJarvis().controller.actions;
 }
 
+/** Subscribes to Edit's requests for the message field (ChatController.onDraftRequest). Stable. */
+export function useDraftRequests(): ChatController["onDraftRequest"] {
+  return useJarvis().controller.onDraftRequest;
+}
+
 /** The shell's own actions (collapse, open and close the drawer). Stable. */
 export function useShellActions(): ShellStore {
   return useJarvis().shell;

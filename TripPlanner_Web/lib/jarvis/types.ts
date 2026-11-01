@@ -41,6 +41,10 @@ export interface MessageContent {
 export type MessageOrigin = "server" | "demo";
 
 export interface ChatMessage {
+  /**
+   * The saved message's id - or `local-N` for one made on this page: a notice, a sample, or the
+   * person's typed message until its turn comes back and the saved copy replaces it.
+   */
   id: string;
   role: MessageRole;
   /** For the person's own message, `text` is null when they sent only a file. */
@@ -107,6 +111,8 @@ export interface ChatState {
   agents: AgentStatus[];
   /** A reply is on its way: the feed ends in Jarvis's "thinking" bubble (PendingReply). Null when none is. */
   pending: PendingReply | null;
+  /** The person's typed message whose turn is on its way: it cannot be deleted until the turn ends. */
+  sendingId: string | null;
 }
 
 /**

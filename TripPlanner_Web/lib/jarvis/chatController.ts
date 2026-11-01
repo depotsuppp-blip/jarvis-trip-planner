@@ -47,6 +47,14 @@ import {
  * change bumps it, so a finished request does not drag the orb back to idle),
  * and `epoch` says which session the message list belongs to (a request that
  * finishes after the person has opened another session is not appended to it).
+ *
+ * Message actions. Edit hands a message's words to the composer (onDraftRequest): the
+ * draft stays the composer's own state, so typing still re-renders nothing else. Delete
+ * takes the message off the page at once and deletes the saved copy (DELETE
+ * /api/chat/messages/<id>), so it is gone from the brain's history too; if the server
+ * refuses, it comes back where it was, with a notice. A typed message is `local-N` until
+ * its turn comes back with the saved copy, which replaces it; one whose turn never came
+ * back (stopped, or the brain failed) is looked up by its words when it is deleted.
  */
 
 // How long the widget previews "think" for.
@@ -115,7 +123,17 @@ export interface ChatActions {
   forceOrb(mode: OrbMode): void;
   /** Test bench: reply with a made-up widget. */
   previewWidget(tool: DemoTool): void;
+  /** Puts the words of one of the person's messages in the message field, to change and send again. */
+  editMessage(id: string): void;
+  /**
+   * Deletes one message - from the page at once, and its saved copy on the server, so Jarvis
+   * no longer sees it either. Not the message whose answer is still on its way (`sendingId`).
+   */
+  deleteMessage(id: string): Promise<void>;
 }
+
+/** Where to find the saved copy of a typed message whose turn never came back with it. */
+type SavedCopy = { found: string } | { none: true } | { failed: ApiFailure };
 
 /** A reply that may be read aloud: the audio the server sent (if any) and the reply's own words. */
 interface SpokenReply {
@@ -133,7 +151,28 @@ function initialChat(): ChatState {
     epoch: 0,
     agents: initialAgents(),
     pending: null,
+    sendingId: null,
   };
+}
+
+const LOCAL_ID = "local-";
+
+/** Made on this page and never saved as such (a notice, a sample, a typed message not yet confirmed). */
+function isLocal(message: ChatMessage): boolean {
+  return message.id.startsWith(LOCAL_ID);
+}
+
+/** The same words and files: how a typed message is matched with its saved copy. */
+function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
+  const names = (message: ChatMessage) => (message.attachments ?? []).map((file) => file.name).join("\n");
+  return a.role === b.role && (a.content.text ?? "") === (b.content.text ?? "") && names(a) === names(b);
+}
+
+/** `messages` with `message` put back in time order (it was deleted, and the server said no). */
+function restore(messages: ChatMessage[], message: ChatMessage): ChatMessage[] {
+  if (messages.some((item) => item.id === message.id)) return messages;
+  const at = messages.findIndex((item) => item.createdAt > message.createdAt);
+  return at < 0 ? [...messages, message] : [...messages.slice(0, at), message, ...messages.slice(at)];
 }
 
 function toSessionSummary(session: { id: string; title: string | null; updatedAt: string }): SessionSummary {
@@ -169,6 +208,8 @@ export class ChatController {
   private toolsTimer: number | null = null;
   /** The current turn's request to the server: what "Stop generating" aborts. */
   private request: AbortController | null = null;
+  /** The composer's ear for Edit (onDraftRequest). */
+  private readonly draftListeners = new Set<(text: string) => void>();
 
   /** Stable for the life of the controller: pass them around freely, nothing re-renders because of them. */
   readonly actions: ChatActions = {
@@ -183,6 +224,19 @@ export class ChatController {
     toggleSpeech: () => this.toggleSpeech(),
     forceOrb: (mode) => this.forceOrb(mode),
     previewWidget: (tool) => this.previewWidget(tool),
+    editMessage: (id) => this.editMessage(id),
+    deleteMessage: (id) => this.deleteMessage(id),
+  };
+
+  /**
+   * The composer listens here for Edit: `listener` gets the words to put in the message field.
+   * Returns the way to stop listening. Stable, like `actions`.
+   */
+  readonly onDraftRequest = (listener: (text: string) => void): (() => void) => {
+    this.draftListeners.add(listener);
+    return () => {
+      this.draftListeners.delete(listener);
+    };
   };
 
   // ---------------------------------------------------------------- lifecycle
@@ -338,12 +392,13 @@ export class ChatController {
     this.player.stop();
     const demo = file ? null : parseDemoCommand(text);
 
-    this.append({
+    const sentId = this.append({
       role: "user",
       content: { text: text || null, widgets: [] },
       origin: demo ? "demo" : "server",
       ...(file ? { attachments: [{ name: file.name, size: file.size }] } : {}),
     });
+    if (!demo) this.chat.setState({ sendingId: sentId });
     this.orb.setState({ mode: "thinking", voice: false });
     this.showPending();
 
@@ -377,18 +432,21 @@ export class ChatController {
     // Stopped: endVoice has already put everything back; the answer is dropped on purpose.
     if (!result.ok && result.kind === "cancelled") return;
     this.hidePending(mine);
+    if (this.chat.getState().sendingId === sentId) this.chat.setState({ sendingId: null });
 
     let toSpeak: SpokenReply | null = null;
     if (result.ok) {
       this.setAgent("brain", "ready");
       const reply = toChatMessage(result.data.reply);
+      // The saved copy of what was sent: its real id is what Delete needs.
+      const sent = toChatMessage(result.data.userMessage);
       const { conversationId } = result.data;
       if (epoch === this.epoch) {
         toSpeak = { audio: result.data.audio, text: reply.content.text };
         this.chat.setState((state) => ({
           access: "signed-in",
           activeSessionId: conversationId,
-          messages: [...state.messages, reply],
+          messages: [...state.messages.map((message) => (message.id === sentId ? sent : message)), reply],
           sessions: {
             status: "ready",
             // A file sent with no words titles its session with its name, as the server does.
@@ -651,6 +709,70 @@ export class ChatController {
     });
   }
 
+  // --------------------------------------------------------- message actions
+
+  editMessage(id: string): void {
+    const message = this.chat.getState().messages.find((item) => item.id === id);
+    const text = message?.role === "user" ? message.content.text : null;
+    if (!text) return;
+    for (const listener of [...this.draftListeners]) listener(text);
+  }
+
+  async deleteMessage(id: string): Promise<void> {
+    const { messages, sendingId, activeSessionId } = this.chat.getState();
+    const message = messages.find((item) => item.id === id);
+    if (!message || id === sendingId) return;
+
+    const epoch = this.epoch;
+    this.chat.setState((state) => ({ messages: state.messages.filter((item) => item.id !== id) }));
+
+    let savedId: string | null = isLocal(message) ? null : id;
+    // A typed message whose turn never came back with its saved copy may still have been saved.
+    if (!savedId && message.role === "user" && message.origin === "server" && activeSessionId) {
+      const copy = await this.findSavedCopy(activeSessionId, message);
+      if ("failed" in copy) return this.undoDelete(message, epoch, copy.failed);
+      savedId = "found" in copy ? copy.found : null;
+    }
+    // Never saved (a notice, a sample, a turn that did not reach the server): off the page is all there is.
+    if (!savedId) return;
+
+    const result = await chatApi.deleteMessage(savedId);
+    // Gone already (deleted in another tab) is as good as deleted.
+    if (result.ok || result.kind === "not-found") return;
+    this.undoDelete(message, epoch, result);
+  }
+
+  /** The server would not delete it: back where it was, and say why. */
+  private undoDelete(message: ChatMessage, epoch: number, failure: ApiFailure): void {
+    if (failure.kind === "signed-out") this.chat.setState({ access: "signed-out" });
+    if (this.disposed || epoch !== this.epoch) return;
+    this.chat.setState((state) => ({ messages: restore(state.messages, message) }));
+    this.notify(
+      failure.kind === "signed-out"
+        ? failure.message
+        : failure.kind === "network"
+          ? "Couldn't delete that message - check your connection, then try again."
+          : failure.message
+    );
+  }
+
+  /**
+   * The saved copy of `message`, a typed message the page only knows as `local-N` (its turn was
+   * stopped, or the brain failed, so the saved copy never came back): the session's saved user
+   * message with the same words that the page does not already show, closest in time.
+   */
+  private async findSavedCopy(conversationId: string, message: ChatMessage): Promise<SavedCopy> {
+    const result = await chatApi.conversation(conversationId);
+    if (!result.ok) return result.kind === "not-found" ? { none: true } : { failed: result };
+    const shown = new Set(this.chat.getState().messages.map((item) => item.id));
+    let best: ChatMessage | null = null;
+    for (const saved of result.data.messages.map(toChatMessage)) {
+      if (shown.has(saved.id) || !sameMessage(saved, message)) continue;
+      if (!best || Math.abs(saved.createdAt - message.createdAt) < Math.abs(best.createdAt - message.createdAt)) best = saved;
+    }
+    return best ? { found: best.id } : { none: true };
+  }
+
   // ------------------------------------------------------------------ helpers
 
   /**
@@ -669,6 +791,7 @@ export class ChatController {
     this.player.stop();
     this.orb.setState({ mode: "idle", voice: false });
     if (this.chat.getState().pending) this.chat.setState({ pending: null });
+    if (this.chat.getState().sendingId) this.chat.setState({ sendingId: null });
     this.resetVoiceAgent();
     // A stopped typed turn will never hear back: the manager is not working on it any more as far as this page knows.
     if (!keepRequest && this.chat.getState().agents.find((agent) => agent.id === "brain")?.state === "working") {
@@ -727,15 +850,17 @@ export class ChatController {
     this.hidePending(turn);
   }
 
+  /** Adds a message made on this page; returns its `local-N` id. */
   private append(
     message: Pick<ChatMessage, "role" | "origin" | "attachments"> & { content: MessageContent; tone?: "error" }
-  ): void {
+  ): string {
     const next: ChatMessage = {
-      id: `local-${this.nextId++}`,
+      id: `${LOCAL_ID}${this.nextId++}`,
       createdAt: Date.now(),
       ...message,
     };
     this.chat.setState((state) => ({ messages: [...state.messages, next] }));
+    return next.id;
   }
 
   private setAgent(id: string, state: AgentState, detail?: string): void {
