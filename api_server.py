@@ -52,7 +52,8 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  (TripPlanner_Web: GET /api/chat/tools).
     GET  /artifacts/<file> -> the file itself: what Jarvis made and saved in artifacts/ - the
                  images from agents/creative_agent.py (image_YYYYMMDD_HHMMSS.png) and the
-                 presentations from agents/publishing_agent.py (presentation_YYYYMMDD_HHMMSS.pptx).
+                 presentations from agents/publishing_agent.py (presentation_YYYYMMDD_HHMMSS.pptx,
+                 or .pdf when Canva sends PDFs).
                  A web chat reply shows a picture as ![Generated Image](/artifacts/<file>) and
                  offers a presentation as [Download Presentation](/artifacts/<file>); the web app
                  answers that address for the browser by fetching it from here

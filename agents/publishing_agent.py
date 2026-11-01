@@ -1,16 +1,28 @@
 """
-The Head of Publishing: PowerPoint presentations (.pptx), built from a slide plan.
+The Head of Publishing: presentations as real files, built from a slide plan.
 
-Phase 2 of the capability orchestrator, the second native capability after images
-(creative_agent.py): Jarvis hands over a real file, not only text.
+Phase 2 of the capability orchestrator gave Jarvis python-pptx decks; Phase 4 (browser
+agents) has it build them in Canva instead, in a browser it drives, whenever it is signed in
+to Canva - with python-pptx kept as the engine that always works.
 
     manager (llm_brain) --delegate_to_publishing(presentation_data)--> PublishingAgent
         -> the JSON read and checked against the shape below (parse_deck)
         -> a text size chosen for every slide, or an ERROR when it cannot fit (plan_deck)
-        -> python-pptx lays out a 16:9 deck: an opening slide, then one slide per entry
-        -> saved as artifacts/presentation_YYYYMMDD_HHMMSS.pptx, opened again and checked
+        -> CANVA (agents/canva_browser.py), when a Canva session is saved
+           (python -m utils.canva_auth): a new presentation on canva.com, one page per
+           slide, Share > Download > PPTX (or PDF), checked: every slide there, every title
+           in it
+        -> PYTHON-PPTX, when Canva is not set up or its run fails (the reason goes back
+           with the deck): a 16:9 deck laid out here, opened again and checked
+        -> saved as artifacts/presentation_YYYYMMDD_HHMMSS.pptx (or .pdf from Canva)
         <- "SUCCESS: ...\nPath: <absolute path>\nURL: /artifacts/<file name>"
            or "ERROR: <what was wrong and what to change>"
+
+JARVIS_PUBLISHING_ENGINE picks: auto (Canva when signed in, else python-pptx) [default],
+canva (Canva only: its failure is the answer) or pptx (python-pptx only). Why python-pptx
+stays: a website's editor changes without notice, a Canva session ends, the Docker image has
+no browser, and a Canva run takes a minute where python-pptx takes a tenth of a second - none
+of which may cost Jarvis the ability to hand over a deck.
 
 In the web chat the brain swaps the Path and URL lines for a Markdown download link,
 [Download Presentation](/artifacts/<file name>) (markdown_link): api_server.py serves the
@@ -19,7 +31,8 @@ link (TripPlanner_Web/app/artifacts/[name]).
 
 NOT A LANGUAGE-MODEL LOOP, like the Head of Creative. The manager plans the content -
 with the Head of Research when it needs facts - and writes the JSON; this lays it out.
-No API, no key and no cost: it is there whenever python-pptx is installed.
+No API key. Canva decks are made in the Canva account whose session is saved - every web
+user's included - so they are in that account's designs too.
 
 THE DATA. One JSON object, as a string or as the dict itself:
 
@@ -53,8 +66,9 @@ for again within SAME_REQUEST_SECONDS returns the file already made.
 
 NEVER RAISES. Every failure comes back as one sentence starting "ERROR:".
 
-    python -m agents.publishing_agent --check        python-pptx, a test deck in memory, the folder
-    python -m agents.publishing_agent deck.json      builds one deck from a JSON file
+    python -m agents.publishing_agent --check            both engines, a test deck in memory, the folder
+    python -m agents.publishing_agent deck.json          builds one deck from a JSON file
+    python -m agents.publishing_agent --canva-test       a two-slide deck in Canva only (add --headed to watch)
 """
 
 from __future__ import annotations
@@ -67,11 +81,15 @@ import sys
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from utils import canva_auth
+
+from . import canva_browser
+from .canva_browser import CanvaError, CanvaSettings, CanvaSlide
 from .creative_agent import ARTIFACTS_DIR, web_url
 
 try:
@@ -606,33 +624,97 @@ def _dark(slide: Any) -> None:
 # ---------------------------------------------------------------------------------------
 
 
+ENGINES = ("auto", "canva", "pptx")
+# After a Canva run that needs a person - the session ended, Canva's bot check stopped the browser -
+# Canva is not tried again for this long (python-pptx makes the decks meanwhile, at once), unless the
+# session file changes: signing in again (python -m utils.canva_auth) ends the pause.
+CANVA_REST_SECONDS = 30 * 60
+NEEDS_A_PERSON = ("session", "blocked")
+# A web request tells how much of its wait is left (llm_brain, WEB_CHAT_SECONDS): Canva gets at most
+# that, and is not started with less than this - python-pptx answers at once instead.
+MIN_CANVA_SECONDS = 30.0
+
+
+def _engine_from_env() -> str:
+    value = canva_auth.setting("JARVIS_PUBLISHING_ENGINE", "auto").lower()
+    if value not in ENGINES:
+        print(f"[Agent:publishing] JARVIS_PUBLISHING_ENGINE={value!r} is not auto, canva or pptx; using auto.")
+        return "auto"
+    return value
+
+
 class PublishingAgent:
-    """Builds one PowerPoint file per call and saves it in artifacts/. Building one makes no network call."""
+    """
+    Builds one presentation file per call and saves it in artifacts/: in Canva when a Canva
+    session is saved (and JARVIS_PUBLISHING_ENGINE allows it), else - or when Canva fails -
+    with python-pptx. Building one makes no network call.
+    """
 
     name = "publishing"
     title = "Head of Publishing"
     tool_name = "delegate_to_publishing"
 
-    def __init__(self, *, artifacts_dir: Optional[Path | str] = None, now: Optional[Callable[[], datetime]] = None) -> None:
+    def __init__(
+        self,
+        *,
+        artifacts_dir: Optional[Path | str] = None,
+        now: Optional[Callable[[], datetime]] = None,
+        engine: Optional[str] = None,
+        canva: Optional[CanvaSettings] = None,
+        canva_runner: Optional[Callable[[list[CanvaSlide], Path, CanvaSettings], Path]] = None,
+    ) -> None:
         self.artifacts_dir = Path(artifacts_dir) if artifacts_dir else ARTIFACTS_DIR
         self._now = now or datetime.now
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # the list of recent decks, and python-pptx's saving
+        self._canva_lock = threading.Lock()  # one Canva run at a time: one account, one browser
         self._recent: dict[str, tuple[float, Path]] = {}  # the deck's fingerprint -> (when, file)
-        self.unavailable_reason = "" if pptx is not None else f"python-pptx is not installed ({_PPTX_IMPORT_ERROR})"
+        self.engine = engine if engine in ENGINES else _engine_from_env()
+        self.canva = canva or CanvaSettings.from_env()
+        self._canva_runner = canva_runner or canva_browser.make_presentation
+        # (until, why, the session file's mtime then) while Canva rests after needing a person.
+        self._canva_rest: Optional[tuple[float, str, float]] = None
+
+    @property
+    def canva_problem(self) -> str:
+        """"" when a deck would be tried in Canva first; else why not, in a few words."""
+        if self.engine == "pptx":
+            return "turned off (JARVIS_PUBLISHING_ENGINE=pptx)"
+        return canva_browser.readiness(self.canva)
+
+    @property
+    def unavailable_reason(self) -> str:
+        if pptx is None:
+            return f"python-pptx is not installed ({_PPTX_IMPORT_ERROR})"
+        if self.engine == "canva" and self.canva_problem:
+            return f"JARVIS_PUBLISHING_ENGINE=canva, and Canva cannot be used: {self.canva_problem}"
+        return ""
 
     @property
     def available(self) -> bool:
-        return pptx is not None
+        return not self.unavailable_reason
 
     def describe(self) -> str:
         if not self.available:
             return f"off ({self.unavailable_reason})"
-        return f"python-pptx {getattr(pptx, '__version__', '?')}, 16:9 decks, into {self.artifacts_dir}"
+        local = f"python-pptx {getattr(pptx, '__version__', '?')}"
+        window = "" if self.canva.headless else ", in a visible window"
+        canva = f"Canva ({self.canva.browser}, {self.canva.fmt.upper()}, up to {self.canva.timeout:.0f} s{window})"
+        if self.engine == "canva":
+            where = f"{canva} only"
+        elif self.canva_problem:
+            where = f"{local} (Canva: {self.canva_problem})"
+        else:
+            where = f"{canva}, then {local} when Canva fails"
+        return f"{where}; into {self.artifacts_dir}"
 
     # -- the work ------------------------------------------------------------
 
-    def build_presentation(self, presentation_data: Any) -> str:
-        """Builds a deck from `presentation_data` and saves it. Returns SUCCESS + its path and URL, or ERROR + why."""
+    def build_presentation(self, presentation_data: Any, time_left: Optional[float] = None) -> str:
+        """
+        Builds a deck from `presentation_data` and saves it. Returns SUCCESS + its path and URL,
+        or ERROR + why. `time_left` - seconds the caller can still wait (a web chat request) -
+        caps a Canva run; None means no limit beyond JARVIS_CANVA_TIMEOUT (the voice assistant).
+        """
         if not self.available:
             return f"ERROR: presentations are not set up ({self.unavailable_reason}). Tell the user; do not try again."
         try:
@@ -646,14 +728,89 @@ class PublishingAgent:
             json.dumps([deck.title, deck.subtitle, [[s.title, s.bullets] for s in deck.slides]], ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         summary = _summary(planned)
-        # One deck at a time, so the same deck asked for twice at once is made once.
         with self._lock:
             again = self._already_made(fingerprint)
-            if again:
-                return again
+        if again:
+            return again
 
+        canva_note = ""
+        if not self.canva_problem:
+            resting = self._canva_resting()
+            if resting:
+                canva_note = f"it was not tried: {resting}"
+            elif time_left is not None and time_left < MIN_CANVA_SECONDS:
+                canva_note = f"there was not enough time left in this request for Canva ({max(0.0, time_left):.0f} s)"
+            # Not blocking: a second deck asked for while Canva works on one is built here instead.
+            elif self._canva_lock.acquire(blocking=False):
+                try:
+                    made, canva_note = self._in_canva(planned, summary, time_left)
+                finally:
+                    self._canva_lock.release()
+                if made is not None:
+                    with self._lock:
+                        self._recent[fingerprint] = (time.monotonic(), made)
+                    kind = "a PDF" if made.suffix == ".pdf" else "a PowerPoint file"
+                    return self._answer(made, f"made in Canva and downloaded as {kind}", summary, deck)
+            else:
+                canva_note = "Canva was busy making another presentation"
+            if self.engine == "canva":
+                return (
+                    f"ERROR: Canva could not make the presentation ({canva_note}). Tell the user in one sentence; "
+                    "asking again later may work."
+                )
+        return self._with_pptx(deck, planned, summary, fingerprint, canva_note)
+
+    def _in_canva(self, planned: list[PlannedSlide], summary: str, time_left: Optional[float] = None) -> tuple[Optional[Path], str]:
+        """(the checked file Canva made, "") or (None, why it did not). The run never outlasts `time_left`."""
+        started = time.monotonic()
+        settings = self.canva
+        if time_left is not None and time_left < settings.timeout:
+            settings = replace(settings, timeout=time_left)
+        try:
+            target = self._reserve(settings.extension)
+        except OSError as exc:
+            return None, f"no file could be made in {self.artifacts_dir} ({exc})"
+        slides = [CanvaSlide(item.kind, item.title, item.subtitle, item.bullets) for item in planned]
+        print(f"[Agent:publishing] Building {summary} in Canva (up to {settings.timeout:.0f} s): {_shown(planned[0].title)}")
+        try:
+            self._canva_runner(slides, target, settings)
+        except CanvaError as err:
+            target.unlink(missing_ok=True)
+            kept = f" Screenshot and page outline: {err.debug}.png / .txt" if err.debug else ""
+            print(f"[Agent:publishing] Canva stopped at {err.stage} ({time.monotonic() - started:.0f} s): {_shown(err.message, 200)}.{kept}")
+            if err.stage in NEEDS_A_PERSON:
+                self._canva_rest = (time.monotonic() + CANVA_REST_SECONDS, err.message, _mtime(self.canva.state))
+                print(f"[Agent:publishing] Canva rests for {CANVA_REST_SECONDS // 60} min, or until the session is saved again.")
+            return None, f"it stopped at {err.stage}: {err.message}"
+        except Exception as exc:  # noqa: BLE001 - a fault in the browser code must not cost the deck
+            target.unlink(missing_ok=True)
+            print(f"[Agent:publishing] Canva run failed: {type(exc).__name__}: {exc}")
+            return None, f"{type(exc).__name__}: {_shown(str(exc), 160)}"
+        problem = _verify_download(target, planned)
+        if problem:
+            print(f"[Agent:publishing] Canva's file {target.name} failed its check ({problem}); deleted.")
+            target.unlink(missing_ok=True)
+            return None, f"the file it made did not check out ({problem})"
+        size_kb = max(1, round(target.stat().st_size / 1024))
+        print(f"[Agent:publishing] Saved {target} from Canva ({size_kb} KB, {time.monotonic() - started:.0f} s).")
+        return target, ""
+
+    def _canva_resting(self) -> str:
+        """Why Canva is skipped for now (a run that needed a person failed lately), or ""."""
+        if self._canva_rest is None:
+            return ""
+        until, why, mtime = self._canva_rest
+        if time.monotonic() >= until or _mtime(self.canva.state) != mtime:
+            self._canva_rest = None
+            return ""
+        minutes = max(1, round((until - time.monotonic()) / 60))
+        return f"{why} (Canva is tried again in {minutes} min, or as soon as the Canva session is saved again)"
+
+    def _with_pptx(self, deck: DeckSpec, planned: list[PlannedSlide], summary: str, fingerprint: str, canva_note: str) -> str:
+        """The deck laid out here with python-pptx, saved and checked; SUCCESS or ERROR."""
+        with self._lock:
             started = time.monotonic()
-            print(f"[Agent:publishing] Building {summary}: {_shown(planned[0].title)}")
+            print(f"[Agent:publishing] Building {summary} with python-pptx: {_shown(planned[0].title)}")
             try:
                 prs = build_deck(deck, planned)
             except Exception as exc:  # noqa: BLE001 - python-pptx/lxml refusing something unexpected
@@ -673,18 +830,20 @@ class PublishingAgent:
             self._recent[fingerprint] = (time.monotonic(), path)
             size_kb = max(1, round(path.stat().st_size / 1024))
             print(f"[Agent:publishing] Saved {path} ({size_kb} KB, {time.monotonic() - started:.1f} s).")
-            lines = [
-                f"SUCCESS: the presentation was created and saved as a PowerPoint file ({summary}, 16:9).",
-                f"Path: {path}",
-                f"URL: {web_url(path)}",
-            ]
-            if deck.left_out:
-                lines.append(
-                    "Left out (a slide only has a title and bullet points; the deck a title and subtitle): "
-                    + ", ".join(deck.left_out)
-                    + "."
-                )
-            return "\n".join(lines)
+            return self._answer(path, "created and saved as a PowerPoint file", f"{summary}, 16:9", deck, canva_note)
+
+    @staticmethod
+    def _answer(path: Path, how: str, summary: str, deck: DeckSpec, canva_note: str = "") -> str:
+        lines = [f"SUCCESS: the presentation was {how} ({summary}).", f"Path: {path}", f"URL: {web_url(path)}"]
+        if canva_note:
+            lines.append(f"Canva could not make it, so it was built with python-pptx instead: {canva_note}.")
+        if deck.left_out:
+            lines.append(
+                "Left out (a slide only has a title and bullet points; the deck a title and subtitle): "
+                + ", ".join(deck.left_out)
+                + "."
+            )
+        return "\n".join(lines)
 
     def _already_made(self, fingerprint: str) -> str:
         """The answer for the same deck made moments ago (the file still there), or ""."""
@@ -701,41 +860,45 @@ class PublishingAgent:
             f"made again.\nPath: {hit[1]}\nURL: {web_url(hit[1])}"
         )
 
-    def _save(self, prs: Any) -> Path:
-        """Writes `prs` as artifacts/presentation_YYYYMMDD_HHMMSS.pptx (_2, _3... if taken) and returns its absolute path."""
+    def _reserve(self, extension: str) -> Path:
+        """A new, empty artifacts/presentation_YYYYMMDD_HHMMSS<extension> (_2, _3... if taken): never another file's name."""
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         stamp = self._now().strftime("%Y%m%d_%H%M%S")
         for number in range(1, 100):
             path = self.artifacts_dir / (
-                f"{FILE_PREFIX}_{stamp}.pptx" if number == 1 else f"{FILE_PREFIX}_{stamp}_{number}.pptx"
+                f"{FILE_PREFIX}_{stamp}{extension}" if number == 1 else f"{FILE_PREFIX}_{stamp}_{number}{extension}"
             )
             try:
-                handle = open(path, "xb")  # never overwrites
+                open(path, "xb").close()  # claims the name; never overwrites
             except FileExistsError:
                 continue
-            try:
-                with handle:
-                    prs.save(handle)
-            except BaseException:
-                path.unlink(missing_ok=True)
-                raise
             return path.resolve()
         raise OSError(f"no free file name for {FILE_PREFIX}_{stamp}")
+
+    def _save(self, prs: Any) -> Path:
+        """Writes `prs` as a new artifacts/presentation_YYYYMMDD_HHMMSS.pptx and returns its absolute path."""
+        path = self._reserve(".pptx")
+        try:
+            with open(path, "wb") as handle:
+                prs.save(handle)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return path
 
     # -- setup check (python -m agents.publishing_agent --check) ---------------
 
     def check(self) -> list[str]:
-        """Lines on the setup: python-pptx, a two-slide test deck built in memory, the folder. Saves nothing."""
+        """Lines on the setup: python-pptx and a test deck built in memory, the folder, Canva. Saves nothing."""
         lines = [f"Presentations: {self.describe()}"]
-        if not self.available:
-            return lines
-        try:
-            sample = parse_deck({"title": "Setup check", "slides": [{"title": "It works", "bullet_points": ["ทดสอบภาษาไทย", "English"]}]})
-            buffer = io.BytesIO()
-            build_deck(sample, plan_deck(sample)).save(buffer)
-            lines.append(f"  test deck: built in memory ({len(buffer.getvalue()) // 1024} KB)")
-        except Exception as exc:  # noqa: BLE001
-            lines.append(f"  test deck: FAILED ({type(exc).__name__}: {exc})")
+        if pptx is not None:
+            try:
+                sample = parse_deck({"title": "Setup check", "slides": [{"title": "It works", "bullet_points": ["ทดสอบภาษาไทย", "English"]}]})
+                buffer = io.BytesIO()
+                build_deck(sample, plan_deck(sample)).save(buffer)
+                lines.append(f"  python-pptx test deck: built in memory ({len(buffer.getvalue()) // 1024} KB)")
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"  python-pptx test deck: FAILED ({type(exc).__name__}: {exc})")
         try:
             self.artifacts_dir.mkdir(parents=True, exist_ok=True)
             probe = self.artifacts_dir / ".write-check"
@@ -744,7 +907,32 @@ class PublishingAgent:
             lines.append(f"  folder: {self.artifacts_dir} is writable")
         except OSError as exc:
             lines.append(f"  folder: {self.artifacts_dir} is NOT writable ({exc})")
+        if self.engine == "pptx":
+            lines.append("  Canva: off (JARVIS_PUBLISHING_ENGINE=pptx)")
+            return lines
+        lines.append(f"  Canva session: {_session_note(self.canva.state)}")
+        lines.append(f"  Canva browser: {canva_browser.check_browser(self.canva)}")
         return lines
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _session_note(path: Path) -> str:
+    """Whether the saved Canva session is there, how old and how many Canva cookies - never the cookies themselves."""
+    if not path.is_file():
+        return f"none at {path} - sign in once: python -m utils.canva_auth"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"{path} cannot be read ({type(exc).__name__}) - sign in again: python -m utils.canva_auth"
+    hours = max(0.0, (time.time() - path.stat().st_mtime) / 3600)
+    age = f"{hours:.0f} hours" if hours < 48 else f"{hours / 24:.0f} days"
+    return f"{path}, saved {age} ago, {canva_auth.canva_cookie_count(state)} Canva cookies"
 
 
 def _verify(path: Path, titles: list[str]) -> str:
@@ -763,6 +951,72 @@ def _verify(path: Path, titles: list[str]) -> str:
         if got != wanted:
             return f"slide {number}'s title came out different from the one asked for"
     return ""
+
+
+def _verify_download(path: Path, planned: list[PlannedSlide]) -> str:
+    """
+    "" when the file Canva sent holds one slide (or PDF page) per planned slide, each with its
+    title in it; else what is wrong. Canva lays text out its own way, so a title is looked for
+    anywhere in its slide's text, spaces ignored.
+    """
+    try:
+        if path.stat().st_size == 0:
+            return "it is empty"
+    except OSError as exc:
+        return f"it is not there ({exc})"
+    if path.suffix == ".pdf":
+        texts = _pdf_page_texts(path)
+        if isinstance(texts, str):
+            return texts
+        if texts is None:  # PyMuPDF missing: a PDF header is all that can be checked
+            return ""
+    else:
+        try:
+            saved = Presentation(str(path))
+        except Exception as exc:  # noqa: BLE001
+            return f"it does not open as a presentation ({type(exc).__name__})"
+        texts = [" ".join(_shape_texts(slide.shapes)) for slide in saved.slides]
+    if len(texts) != len(planned):
+        return f"it has {len(texts)} slides instead of {len(planned)}"
+    for number, (text, item) in enumerate(zip(texts, planned), start=1):
+        if _squeeze(item.title) not in _squeeze(text):
+            return f"slide {number} does not hold its title"
+    return ""
+
+
+def _shape_texts(shapes: Any) -> list[str]:
+    """The text of every shape, groups included."""
+    texts: list[str] = []
+    for shape in shapes:
+        if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+            texts.append(shape.text_frame.text)
+        inner = getattr(shape, "shapes", None)
+        if inner is not None:
+            texts.extend(_shape_texts(inner))
+    return texts
+
+
+def _pdf_page_texts(path: Path) -> "list[str] | str | None":
+    """Each page's text; a string saying what is wrong; or None when PyMuPDF is not installed."""
+    with open(path, "rb") as handle:
+        if handle.read(5) != b"%PDF-":
+            return "it is not a PDF"
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf  # type: ignore[no-redef]  # PyMuPDF before 1.24.3
+        except ImportError:
+            return None
+    try:
+        with pymupdf.open(str(path)) as document:
+            return [page.get_text() for page in document]
+    except Exception as exc:  # noqa: BLE001
+        return f"it does not open as a PDF ({type(exc).__name__})"
+
+
+def _squeeze(text: str) -> str:
+    return "".join(unicodedata.normalize("NFC", text).split()).casefold()
 
 
 def _summary(planned: list[PlannedSlide]) -> str:
@@ -795,12 +1049,27 @@ def build() -> PublishingAgent:
     return PublishingAgent()
 
 
+CANVA_TEST_DECK = {
+    "title": "Jarvis Canva test",
+    "subtitle": "Made by the Publishing Agent",
+    "slides": [{"title": "It works", "bullet_points": ["Typed into Canva by Jarvis", "Downloaded as a file"]}],
+}
+
+
 if __name__ == "__main__":
     agent = build()
     arguments = sys.argv[1:]
     if not arguments or arguments == ["--check"]:
         print("\n".join(agent.check()))
         raise SystemExit(0 if agent.available else 1)
+    if arguments[0] == "--canva-test":
+        settings = agent.canva.watched() if "--headed" in arguments else agent.canva
+        tester = PublishingAgent(engine="canva", canva=settings)
+        result = tester.build_presentation(CANVA_TEST_DECK)
+        print(_shown(result, 2000))
+        if not result.startswith("SUCCESS"):
+            print(f"Where it stopped: the newest screenshot and page outline in {canva_browser.DEBUG_DIR}")
+        raise SystemExit(0 if result.startswith("SUCCESS") else 1)
     source = Path(arguments[0])
     result = agent.build_presentation(source.read_text(encoding="utf-8"))
     print(_shown(result, 2000))

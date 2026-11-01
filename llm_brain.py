@@ -129,9 +129,14 @@ Several things were added to this module beyond plain tool calling:
   PRESENTATIONS  delegate_to_publishing(presentation_data) hands a slide
       plan - JSON the manager writes after planning the content, with the
       Head of Research first when it needs facts - to the Head of Publishing
-      (agents/publishing_agent.py), which lays it out as a 16:9 PowerPoint
-      file with python-pptx, checks the saved file and keeps it as
-      artifacts/presentation_YYYYMMDD_HHMMSS.pptx. By voice the reply names
+      (agents/publishing_agent.py). When a Canva session is saved
+      (python -m utils.canva_auth) it builds the deck on canva.com in a
+      browser it drives (agents/canva_browser.py, Playwright, up to
+      JARVIS_CANVA_TIMEOUT seconds on a thread of its own, so this tool stays
+      a plain call) and downloads it; without one, or when that run fails, it
+      lays the deck out itself with python-pptx. Either way the file is
+      checked and kept as artifacts/presentation_YYYYMMDD_HHMMSS.pptx (.pdf
+      when JARVIS_CANVA_FORMAT=pdf). By voice the reply names
       the folder and the file; in the web chat it carries a download link,
       [Download Presentation](/artifacts/<file>) (PUBLISHING_RULE, _publish,
       _with_artifacts). The slides travel inside the tool call, so a
@@ -391,6 +396,13 @@ MAX_TOKENS = 1024
 # (LLMBrain._call_provider). A ceiling, not a target - only what is written is billed -
 # and kept within what the Anthropic SDK allows a request that is not streamed.
 LONG_OUTPUT_MAX_TOKENS = 8192
+
+# The web chat waits this long for a whole answer (TripPlanner_Web/lib/jarvisBrain.ts,
+# BRAIN_TIMEOUT_MS). A deck made in Canva gets only what is left of it, less
+# PUBLISHING_REPLY_SECONDS for the reply written after it (LLMBrain._publish): research before
+# it can take most of the two minutes, and a reply that arrives after the page gave up is lost.
+WEB_CHAT_SECONDS = 120.0
+PUBLISHING_REPLY_SECONDS = 15.0
 
 # The answer when a tool call is cut off even with that much room: never half of it run.
 CUT_OFF_REPLY = (
@@ -3171,6 +3183,9 @@ class LLMBrain:
         # The Markdown lines for what was made during the current web request - a picture,
         # a presentation's download link (see _with_artifacts).
         self._artifacts_this_turn: list[str] = []
+        # When the question being answered arrived (time.monotonic()): a deck made in Canva
+        # gets what is left of the web chat's wait (_publish).
+        self._turn_started = time.monotonic()
 
         # Feature 2 bookkeeping: what went to the background, so the same
         # side effect cannot be fired twice (see _execute).
@@ -3543,13 +3558,15 @@ class LLMBrain:
             self._publishing_spec = ToolSpec(
                 name=DELEGATE_PUBLISHING,
                 description=(
-                    "Hand a finished slide plan to your Head of Publishing, who builds a real PowerPoint file "
-                    "(.pptx, 16:9) from it and saves it on this computer. Use it whenever the user asks for a "
-                    "presentation, slides, a slide deck or a PowerPoint, after you have planned the content "
-                    "(research first when it needs facts). It writes nothing itself: it lays out exactly the "
-                    "slides you send, as an opening slide from the title and subtitle, then one slide per entry. "
-                    "Returns SUCCESS with where the file is - the saved file's path, or in the web chat a Markdown "
-                    "download link - or ERROR with what to change in the data."
+                    "Hand a finished slide plan to your Head of Publishing, who builds a real presentation file "
+                    "from it - in Canva when it is signed in there (up to about a minute and a half), otherwise "
+                    "as a 16:9 PowerPoint file in seconds - and saves it on this computer. Use it whenever the "
+                    "user asks for a presentation, slides, a slide deck or a PowerPoint, after you have planned "
+                    "the content (research first when it needs facts). It writes nothing itself: it lays out "
+                    "exactly the slides you send, as an opening slide from the title and subtitle, then one "
+                    "slide per entry. Returns SUCCESS with where the file is - the saved file's path, or in the "
+                    "web chat a Markdown download link - or ERROR with what to change in the data. Call it once "
+                    "per deck: a slow answer is Canva working, not a failure."
                 ),
                 input_schema={
                     "type": "object",
@@ -3586,14 +3603,21 @@ class LLMBrain:
         offers as a download (api_server.py serves the folder, the web app passes it on) -
         remembered so the reply is sure to carry it (_with_artifacts). By voice the path
         stays and the URL goes: a web address means nothing through a speaker.
+
+        A web request has a clock (WEB_CHAT_SECONDS): the agent is told how much of it is left
+        for a Canva run, and builds the deck with python-pptx when that is too little.
         """
         size = len(presentation_data) if isinstance(presentation_data, str) else len(json.dumps(presentation_data, default=str))
-        print(f"[Brain] Delegating to the Head of Publishing: {size:,} characters of slides.")
-        result = self._publishing.build_presentation(presentation_data)
-        if not result.startswith("SUCCESS"):
-            return result
         caller = request_context.current()
         web = caller is not None and caller.is_web
+        time_left = None
+        if web:
+            time_left = WEB_CHAT_SECONDS - (time.monotonic() - self._turn_started) - PUBLISHING_REPLY_SECONDS
+        later = f", {time_left:.0f} s left for it" if time_left is not None else ""
+        print(f"[Brain] Delegating to the Head of Publishing: {size:,} characters of slides{later}.")
+        result = self._publishing.build_presentation(presentation_data, time_left=time_left)
+        if not result.startswith("SUCCESS"):
+            return result
 
         from agents.publishing_agent import markdown_link  # the agents package imports this module
 
@@ -4098,6 +4122,7 @@ class LLMBrain:
         """
         if not user_text or not user_text.strip():
             return "I didn't catch a question."
+        self._turn_started = time.monotonic()
 
         # Checked before any routing or provider work happens at all -
         # see llm_budget's module docstring: a no-op unless

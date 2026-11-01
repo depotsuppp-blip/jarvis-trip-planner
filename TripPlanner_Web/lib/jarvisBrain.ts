@@ -81,7 +81,7 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  * fetches it from:
  *
  *   GET {JARVIS_ARTIFACTS_URL}/<name>   default: JARVIS_BRAIN_URL with its /chat swapped for /artifacts
- *   reply the file (image/png, image/jpeg, image/webp, or the .pptx type); 404 when there is none
+ *   reply the file (image/png, image/jpeg, image/webp, the .pptx type or application/pdf); 404 when there is none
  */
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };

@@ -11,7 +11,7 @@ const ARTIFACT_RATE_LIMIT = 120;
 const ARTIFACT_RATE_WINDOW_MS = 60_000;
 // The brain never saves anything bigger: pictures are capped at this size
 // (agents/creative_agent.py, MAX_IMAGE_BYTES), and a deck of text slides is a few
-// dozen KB (agents/publishing_agent.py).
+// dozen KB from python-pptx, a few MB at most from Canva (agents/publishing_agent.py).
 const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
 
 // params is a Promise in this Next.js version, not a plain object.
@@ -25,7 +25,7 @@ function notFound() {
  * GET /artifacts/<name> - a file Jarvis made, for the chat reply that shows it
  * (lib/jarvis/artifacts.ts): a picture for its <img>
  * (`![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)`), or a presentation for its
- * download link (`[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)`).
+ * download link (`[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)`, or .pdf).
  *
  * The file lives in the Jarvis project's artifacts/ folder, next to the brain, and the
  * browser never talks to the brain: this route fetches it from the brain's own

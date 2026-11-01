@@ -19,9 +19,10 @@ turns the team off: one model with every built-in tool, as before (no calendar).
 
 Not in the team, though they live here: the Head of Creative (creative_agent.py), which
 makes images, and the Head of Publishing (publishing_agent.py), which builds PowerPoint
-files. Neither is a model loop - one OpenAI Images API call per picture; python-pptx laying
-out the slides the manager planned - and both save what they make in artifacts/, so the
-manager holds delegate_to_creative and delegate_to_publishing itself (LLMBrain._creative_tool,
+files. Neither is a model loop - one OpenAI Images API call per picture; a browser building
+the planned slides in Canva (canva_browser.py, once signed in with utils/canva_auth.py), or
+python-pptx laying them out - and both save what they make in artifacts/, so the manager
+holds delegate_to_creative and delegate_to_publishing itself (LLMBrain._creative_tool,
 _publishing_tool), with or without the team: images whenever OPENAI_API_KEY is set,
 presentations whenever python-pptx is installed.
 

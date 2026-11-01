@@ -282,4 +282,18 @@ beautifulsoup4>=4.12
 # Pillow declared above: no key, no service, nothing billed. 1.0 is the first
 # release with type hints; the API used here is the same as 0.6's. Without it
 # the brain simply offers no presentation tool and everything else runs.
+# It is also the fallback when the Canva browser agent below cannot make a deck,
+# and what checks the files Canva sends back.
 python-pptx>=1.0.0
+
+# --- Canva in a browser (agents/canva_browser.py, utils/canva_auth.py) ---
+# Playwright drives canva.com for the Head of Publishing once you have signed in
+# by hand (python -m utils.canva_auth saves the session as canva_state.json).
+# Its browsers are a separate download, once per machine:
+#     python -m playwright install chromium
+# (or set JARVIS_CANVA_BROWSER=chrome to use the Google Chrome already installed).
+# 1.49 is the first release with Locator.aria_snapshot, which the agent keeps when
+# a run fails so its locators can be fixed against Canva's real control names.
+# Without a Canva session - and in the Docker image, which has no browser - decks
+# are built with python-pptx above, exactly as before.
+playwright>=1.49.0

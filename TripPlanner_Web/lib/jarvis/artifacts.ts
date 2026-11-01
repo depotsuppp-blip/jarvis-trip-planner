@@ -5,8 +5,8 @@
  *   - pictures (agents/creative_agent.py): image_YYYYMMDD_HHMMSS.png (.jpg or .webp if that
  *     is what came back), shown in a web chat reply as one Markdown image line:
  *       ![Generated Image](/artifacts/image_20261029_160717.png)
- *   - presentations (agents/publishing_agent.py): presentation_YYYYMMDD_HHMMSS.pptx, offered
- *     as one Markdown link:
+ *   - presentations (agents/publishing_agent.py): presentation_YYYYMMDD_HHMMSS.pptx (.pdf when
+ *     the brain downloads them from Canva as PDFs), offered as one Markdown link:
  *       [Download Presentation](/artifacts/presentation_20261101_103000.pptx)
  *
  * Those exact forms - a same-origin /artifacts/ address and one of those names - are the only
@@ -22,7 +22,7 @@ export const ARTIFACTS_PATH = "/artifacts";
 
 const STAMP = String.raw`\d{8}_\d{6}(?:_\d{1,2})?`;
 const IMAGE_NAME = String.raw`image_${STAMP}\.(?:png|jpe?g|webp)`;
-const FILE_NAME = String.raw`presentation_${STAMP}\.pptx`;
+const FILE_NAME = String.raw`presentation_${STAMP}\.(?:pptx|pdf)`;
 
 /** A file name Jarvis gives what it makes - nothing else is ever asked of the brain. */
 export const ARTIFACT_NAME_RE = new RegExp(`^(?:${IMAGE_NAME}|${FILE_NAME})$`);
@@ -45,6 +45,7 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   jpeg: "image/jpeg",
   webp: "image/webp",
   pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  pdf: "application/pdf",
 };
 
 /** The content type a file with this name must have, or null for a name Jarvis never gives. */
