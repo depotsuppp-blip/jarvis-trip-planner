@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+import request_context
 from llm_brain import _env, load_api_key
 
 try:
@@ -288,6 +289,8 @@ class CreativeAgent:
             first: Optional[ImageError] = None
             others: list[str] = []
             for index, model in enumerate(self.models):
+                # A request stopped meanwhile (the web hub's Stop) pays for no image, and no fallback.
+                request_context.check_cancelled()
                 started = time.monotonic()
                 print(f"[Agent:creative] {model}: {_shown(description)}")
                 try:

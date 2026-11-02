@@ -10,7 +10,19 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *           history: [{ role: "user" | "jarvis", content, attachments? }],
  *           user_id?: string, app_url?: string, speak?: true,
  *           attachments?: [{ path, name, mime, size }] }
- *   reply { reply: string | object, audio?: { mime, base64 } | null }
+ *   reply text/event-stream - the brain's state machine as it works, one JSON per `data:`:
+ *           { type: "progress", node?, status: "Delegating to Head of Analytics..." }   any number
+ *           { type: "final", status: "Done", message: string | object, audio?: { mime, base64 } | null }
+ *           { type: "error", status: "Failed", message, code }                            instead of final
+ *         (a brain from before the stream answers { reply, audio } as JSON, and that is read too)
+ *
+ *   progress = what Jarvis is doing right now, in a few words, for the hub's thinking bubble
+ *           (askJarvis hands it to `onProgress`). Free text from the brain: it is trimmed and
+ *           capped here, and never stored.
+ *
+ *   Stopping: when the person stops the turn (`signal`), the connection to the brain closes and
+ *           the brain stops the turn itself - the model request in flight is closed, no further
+ *           tool starts, nothing is kept - and is free for the next message at once.
  *
  *   attachments = files the person attached to this message, already saved under
  *           the Jarvis project's uploads/ folder (lib/uploads.ts); `path` is
@@ -90,13 +102,16 @@ export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?:
 /**
  * Who is asking, where this app lives, and whether to voice the reply - see the contract above.
  * `signal` is the person's own request: when they stop it (the hub's "Stop generating"), the
- * call to the brain is dropped and a JarvisBrainCancelled is thrown, so nothing is saved. The
- * brain itself finishes the turn it started - this only stops waiting for it.
+ * call to the brain is dropped and a JarvisBrainCancelled is thrown, so nothing is saved - and
+ * the brain, seeing its connection close, stops the turn too (see Stopping above).
  */
 export type ChatContext = { userId?: string; appUrl?: string; speak?: boolean; signal?: AbortSignal };
 
-/** A typed turn's extras: the files attached to it (see `attachments` in the contract above). */
-export type AskContext = ChatContext & { attachments?: Attachment[] };
+/**
+ * A typed turn's extras: the files attached to it (see `attachments` in the contract above), and
+ * `onProgress`, told each step the brain reports while it works ("Searching the web...").
+ */
+export type AskContext = ChatContext & { attachments?: Attachment[]; onProgress?: (status: string) => void };
 
 /** What the brain said, and its voice if it was asked for one and could give it. */
 export interface BrainAnswer {
@@ -142,7 +157,7 @@ export async function askJarvis(
   try {
     response = await fetch(BRAIN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
       body: JSON.stringify({
         prompt: message,
         history,
@@ -169,11 +184,92 @@ export async function askJarvis(
     throw new JarvisBrainError(`Jarvis brain returned an error (${response.status}).`);
   }
 
-  const data = (await response.json().catch(() => null)) as { reply?: unknown; audio?: unknown } | null;
+  const streamed = (response.headers.get("content-type") ?? "").includes("text/event-stream");
+  const data =
+    streamed && response.body
+      ? await readBrainStream(response.body, context)
+      : ((await response.json().catch(() => null)) as { reply?: unknown; audio?: unknown } | null);
   if (context.signal?.aborted) throw new JarvisBrainCancelled();
   const reply = replyAsText(data?.reply);
   if (!reply) throw new JarvisBrainError("Jarvis brain sent an empty reply.");
   return { reply, audio: context.speak ? parseReplyAudio(data?.audio) : null };
+}
+
+// One progress line as the page may show it: one line, no control characters, a sensible length.
+const MAX_PROGRESS_CHARS = 120;
+
+function progressText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  return text.length > MAX_PROGRESS_CHARS ? `${text.slice(0, MAX_PROGRESS_CHARS - 1).trimEnd()}…` : text;
+}
+
+/** One server-sent event's JSON (its `data:` lines joined), or null for a comment or anything unreadable. */
+function parseEvent(block: string): Record<string, unknown> | null {
+  const data = block
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(line.startsWith("data: ") ? 6 : 5))
+    .join("\n");
+  if (!data) return null;
+  try {
+    return record(JSON.parse(data));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the brain's server-sent events (see the contract above) until its final event: each
+ * progress step goes to `onProgress`, and the final event's message and audio come back as
+ * `{ reply, audio }`. An error event, a stream that ends without an answer, or a read that
+ * fails throw a JarvisBrainError - JarvisBrainCancelled when the person stopped it.
+ */
+async function readBrainStream(
+  body: ReadableStream<Uint8Array>,
+  context: AskContext
+): Promise<{ reply?: unknown; audio?: unknown }> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        if (context.signal?.aborted) throw new JarvisBrainCancelled();
+        const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+        console.error("Jarvis brain stream broke off:", error);
+        throw new JarvisBrainError(timedOut ? "Jarvis brain took too long to answer." : "Jarvis brain stopped answering.");
+      }
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      for (let end = buffer.search(/\r?\n\r?\n/); end !== -1; end = buffer.search(/\r?\n\r?\n/)) {
+        const block = buffer.slice(0, end);
+        buffer = buffer.slice(end).replace(/^\r?\n\r?\n/, "");
+        const event = parseEvent(block);
+        if (!event) continue;
+        if (event.type === "progress") {
+          const status = progressText(event.status);
+          if (status) context.onProgress?.(status);
+        } else if (event.type === "final") {
+          return { reply: event.message, audio: event.audio };
+        } else if (event.type === "error") {
+          const code = typeof event.code === "number" ? event.code : 502;
+          console.error(`Jarvis brain reported an error (${code}) mid-turn.`);
+          // The brain's own words are for its console; the person gets the same sentences as before.
+          throw new JarvisBrainError(code === 502 ? "Jarvis brain sent an empty reply." : `Jarvis brain returned an error (${code}).`);
+        }
+      }
+    }
+  } finally {
+    // After the final event (or a failure) nothing more is read: let the connection go.
+    reader.cancel().catch(() => {});
+  }
+  if (context.signal?.aborted) throw new JarvisBrainCancelled();
+  throw new JarvisBrainError("Jarvis brain stopped before it answered.");
 }
 
 /** A spoken turn that did not produce an answer. `message` is safe to show the person as it stands. */

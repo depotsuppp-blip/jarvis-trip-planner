@@ -86,6 +86,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import request_context
 from utils import canva_auth
 
 from . import canva_browser
@@ -773,6 +774,10 @@ class PublishingAgent:
         print(f"[Agent:publishing] Building {summary} in Canva (up to {settings.timeout:.0f} s): {_shown(planned[0].title)}")
         try:
             self._canva_runner(slides, target, settings)
+        except request_context.Cancelled:
+            # The request was stopped: Canva's browser is closed; no python-pptx deck either.
+            target.unlink(missing_ok=True)
+            raise
         except CanvaError as err:
             target.unlink(missing_ok=True)
             kept = f" Screenshot and page outline: {err.debug}.png / .txt" if err.debug else ""

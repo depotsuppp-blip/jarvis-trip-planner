@@ -6,12 +6,32 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                    "user_id": "...", "app_url": "...", "speak": false,
                    "attachments": [{ "path": "uploads/...", "name": "report.pdf",
                                      "mime": "application/pdf", "size": 48213 }] }
-              -> { "reply": "...", "audio": null }
-                 reply is a plain sentence, or - when a tool showed the person a widget -
-                 a JSON string, see rich_reply.py. audio is {"mime": "audio/mpeg",
+              -> text/event-stream: server-sent events as the brain's state machine works
+                 (llm_brain.py, THE STATE MACHINE), each `event: <type>` + `data: <JSON>`:
+
+                   progress  {"type": "progress", "node": "Delegate_to_Agent",
+                              "status": "Delegating to Head of Analytics..."}
+                             as each step starts; "node" is left out of the finer steps a
+                             specialist agent reports ("Head of Research: Searching the web...")
+                   final     {"type": "final", "node": "Final_Response", "status": "Done",
+                              "message": "...", "audio": null}           once, last
+                   error     {"type": "error", "status": "Failed", "message": "...",
+                              "code": 502}                    instead of final, last
+                 plus a ": keep-alive" comment line after 10 s without an event.
+
+                 message is a plain sentence, or - when a tool showed the person a widget -
+                 a JSON string, see rich_reply.py; a picture or a file Jarvis made is in it
+                 as its Markdown line (see GET /artifacts). audio is {"mime": "audio/mpeg",
                  "base64": "..."} only when "speak" was true AND the reply's plain text is at
                  most 200 characters AND the voice worked (reply_audio.py, Edge-TTS); in every
-                 other case it is null and the reply is just text.
+                 other case it is null and the reply is just text. A provider failure is not
+                 an error event: it is a final message saying what went wrong, as before.
+                 Before the stream opens, the usual HTTP errors: 422 a bad body, 503 no model.
+
+                 STOP. Closing the connection stops the turn (a watcher checks every 0.25 s):
+                 the model request in flight is closed, no further tool starts, a specialist
+                 agent ends after its current step, Canva's browser is shut, nothing is kept
+                 in the brain's history, and the brain is free for the next message at once.
                  attachments are files the person attached in the web hub, which the web
                  app has already saved in this folder's uploads/ (path is relative to this
                  folder). The model is not sent the file: a line is added after the prompt
@@ -23,7 +43,9 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
               -> { "transcript": "...", "reply": "...", "engine": "openai"|"local", "audio": null }
                  Speech-to-text (stt.py: OpenAI Whisper with OPENAI_API_KEY, otherwise
                  faster-whisper on this machine) first, then the transcript is asked
-                 exactly as a typed /chat prompt would be. 422 when nothing was heard.
+                 exactly as a typed /chat prompt would be - the same state machine,
+                 collected into this one JSON answer, and stopped the same way when the
+                 connection closes. 422 when nothing was heard.
     GET  /health -> { "ok": true, "provider": "...", "model": "...",
                       "stt": "openai"|"local", "stt_ready": true|false,
                       "tts": true|false, "mcp_tools": ["mcp__web_search__web_search", ...],
@@ -83,9 +105,12 @@ wait for them.
 
 Things that differ from the voice assistant, deliberately:
 
-* One LLMBrain, one request at a time. The brain keeps per-turn state
-  (history, background-dispatch bookkeeping) and is not thread-safe, so
-  requests queue on a lock instead of interleaving.
+* One LLMBrain, one turn at a time. The brain keeps its history per turn
+  and is not thread-safe, so turns queue on an asyncio lock instead of
+  interleaving (a waiting turn streams "Waiting for the previous request to
+  finish..."). Each turn runs as its own task on the event loop: model calls
+  are awaited on the providers' async clients and tools run on worker
+  threads (LLMBrain.run), so a stopped turn lets go of the lock at once.
 * Tools that ask for spoken confirmation (n8n webhooks, the manager's own
   send_line_notification, starting/stopping servers, creating tools) are
   DECLINED. There is no human at a microphone here, and a web request must
@@ -102,14 +127,16 @@ Things that differ from the voice assistant, deliberately:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import mimetypes
 import threading
-from contextlib import asynccontextmanager
-from typing import Annotated, Literal, Optional
+from contextlib import aclosing, asynccontextmanager
+from typing import Annotated, Any, AsyncIterator, Literal, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
@@ -134,6 +161,11 @@ MAX_HISTORY_TURNS = 100
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 # Per message. The web hub attaches one; the limit is headroom.
 MAX_ATTACHMENTS = 5
+# A streamed turn sends a comment line after this long without an event, so nothing in between
+# takes a long tool call for a dead connection.
+HEARTBEAT_SECONDS = 10.0
+# How often a turn checks that its client is still there (and stops it when it is not).
+DISCONNECT_POLL_SECONDS = 0.25
 
 
 class Attachment(BaseModel):
@@ -171,11 +203,6 @@ class ChatRequest(BaseModel):
 class ReplyAudio(BaseModel):
     mime: str
     base64: str
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    audio: Optional[ReplyAudio] = None
 
 
 class VoiceResponse(BaseModel):
@@ -239,7 +266,10 @@ mimetypes.add_type(XLSX_MIME, ".xlsx")
 app.mount(ARTIFACTS_URL_PATH, StaticFiles(directory=ARTIFACTS_DIR, check_dir=False), name="artifacts")
 
 _brain: LLMBrain | None = None
-_lock = threading.Lock()
+# One turn at a time: the brain keeps per-turn state (its history) and is not thread-safe.
+# An asyncio lock, held by the turn's task on the event loop - a stopped turn lets go of it
+# the moment it is cancelled.
+_turn_lock = asyncio.Lock()
 # Held while the brain is being built, so the start-up thread and a request that arrives
 # meanwhile share one brain (two would start the MCP tool servers twice).
 _build_lock = threading.Lock()
@@ -272,7 +302,40 @@ def health() -> dict:
     }
 
 
-def _answer(
+def _prepare(
+    brain: LLMBrain,
+    prompt: str,
+    history: list[HistoryTurn],
+    files: list[Attachment] | None,
+) -> tuple[str, list[tuple[str, str]]]:
+    """
+    The prompt as the brain is asked it, and the history as (role, text) pairs. Attached
+    files are pointed at, not pasted in: a line after the words says where each file is and
+    which tool reads it (attachments.py). Built while the turn holds the brain, because it
+    asks the brain which tools it has right now. A .csv/.tsv/.json/.jsonl file is pointed at
+    the data tool (load it into a table, answer with SQL) when that server is connected.
+    """
+    attached = bool(files) or any(t.attachments for t in history)
+    tool = attachments.read_tool(brain.tool_names) if attached else None
+    data = attachments.data_tool(brain.tool_names) if attached else None
+    if files:
+        print(f"[API] Attachments: {', '.join(f.path for f in files)} (reader: {tool or 'none'}, data: {data or 'none'}).")
+        prompt = attachments.with_context(prompt, files, tool, current=True, data=data)
+    # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
+    turns = [
+        (
+            "user",
+            attachments.with_context(t.content, t.attachments, tool, data=data) if t.attachments else t.content,
+        )
+        if t.role == "user"
+        else ("assistant", rich_reply.history_text(t.content))
+        for t in history
+    ]
+    return prompt, turns
+
+
+async def _turn(
+    request: Request,
     brain: LLMBrain,
     prompt: str,
     history: list[HistoryTurn],
@@ -280,8 +343,20 @@ def _answer(
     app_url: str,
     speak: bool = False,
     files: list[Attachment] | None = None,
-) -> str:
-    """One turn through the brain, as /chat and /voice both ask it. May return ''."""
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    One turn through the brain's state machine (LLMBrain.run), as /chat and /voice both
+    ask it: its events as they happen - progress, then one final (or error) - with a
+    {"type": "heartbeat"} after every HEARTBEAT_SECONDS of quiet.
+
+    The turn runs as a task of its own, holding the brain (one turn at a time); a turn
+    that has to wait for another says so. A watcher asks the server every
+    DISCONNECT_POLL_SECONDS whether the client is still there, and when it is not - the
+    person pressed Stop, the web app gave up - the turn is cancelled on the spot: the
+    model request in flight is closed, the run's worker threads stop at their next step,
+    nothing is added to the history, and the brain is free for the next message at once.
+    Closing this generator early (a streamed response the server cancelled) does the same.
+    """
     caller = request_context.RequestContext(
         channel=request_context.CHANNEL_WEB,
         user_id=user_id.strip(),
@@ -289,43 +364,93 @@ def _answer(
         # Only asked to keep answers short when they can actually be spoken.
         voice_reply=speak and reply_audio.enabled(),
     )
-    with _lock:
-        # Attached files are pointed at, not pasted in: a line after the words says where each
-        # file is and which tool reads it (attachments.py). Built under the lock because it asks
-        # the brain which tools it has right now. A .csv/.tsv/.json/.jsonl file is pointed at
-        # the data tool (load it into a table, answer with SQL) when that server is connected.
-        attached = bool(files) or any(t.attachments for t in history)
-        tool = attachments.read_tool(brain.tool_names) if attached else None
-        data = attachments.data_tool(brain.tool_names) if attached else None
-        if files:
-            print(f"[API] Attachments: {', '.join(f.path for f in files)} (reader: {tool or 'none'}, data: {data or 'none'}).")
-            prompt = attachments.with_context(prompt, files, tool, current=True, data=data)
-        # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
-        turns = [
-            (
-                "user",
-                attachments.with_context(t.content, t.attachments, tool, data=data) if t.attachments else t.content,
-            )
-            if t.role == "user"
-            else ("assistant", rich_reply.history_text(t.content))
-            for t in history
-        ]
-        brain.set_history(turns)
-        # The context is current only while this request is being answered, on
-        # this thread - see request_context.py.
-        with request_context.use(caller):
-            reply = brain.ask(prompt).strip()
-        # Nothing is carried to the next request; the caller owns the transcript.
-        brain.set_history([])
-    return reply
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    cancel = threading.Event()
+    end = object()
+
+    def push(event: Any) -> None:
+        # From the loop and from the run's worker threads alike, in the order they happen.
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+        except RuntimeError:  # the loop is closing: nobody is left to read it
+            pass
+
+    def progress(text: str) -> None:
+        push({"type": "progress", "status": text})
+
+    async def drive() -> None:
+        try:
+            if _turn_lock.locked():
+                progress("Waiting for the previous request to finish...")
+            async with _turn_lock:
+                question, turns = _prepare(brain, prompt, history, files)
+                brain.set_history(turns)
+                try:
+                    # The context is current only while this request is being answered, on
+                    # this task and the worker threads it starts - see request_context.py.
+                    with request_context.use(caller):
+                        async for event in brain.run(question, cancel=cancel, progress=progress):
+                            push(event)
+                finally:
+                    # Nothing is carried to the next request; the caller owns the transcript.
+                    brain.set_history([])
+        except Exception as exc:  # noqa: BLE001 - a fault in the brain itself; provider and tool failures are final messages
+            print(f"[API] The turn failed: {type(exc).__name__}: {exc}")
+            push({"type": "error", "status": "Failed", "message": "Jarvis hit an internal error.", "code": 500})
+        finally:
+            push(end)
+
+    task = asyncio.create_task(drive(), name="jarvis-turn")
+
+    async def watch() -> None:
+        while not task.done():
+            if await request.is_disconnected():
+                print("[API] The client went away; stopping its turn.")
+                cancel.set()
+                task.cancel()
+                return
+            await asyncio.sleep(DISCONNECT_POLL_SECONDS)
+
+    watcher = asyncio.create_task(watch(), name="jarvis-turn-watch")
+    getter: Optional[asyncio.Future[Any]] = None
+    answered = False
+    try:
+        while True:
+            if getter is None:
+                getter = asyncio.ensure_future(queue.get())
+            done, _ = await asyncio.wait({getter}, timeout=HEARTBEAT_SECONDS)
+            if not done:
+                yield {"type": "heartbeat"}
+                continue
+            event, getter = getter.result(), None
+            if event is end:
+                return
+            answered = answered or event.get("type") == "final"
+            yield event
+    finally:
+        if getter is not None:
+            getter.cancel()
+        watcher.cancel()
+        # A turn that has answered is only letting go of the brain: it is left to finish that.
+        if not task.done() and not answered:
+            cancel.set()
+            task.cancel()
+
+
+def _sse(event: dict[str, Any]) -> str:
+    """One server-sent event: `event: <type>` and its JSON as `data:`; a heartbeat is a comment line."""
+    if event.get("type") == "heartbeat":
+        return ": keep-alive\n\n"
+    return f"event: {event.get('type', 'message')}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 def _audio_for(reply: str, speak: bool) -> Optional[ReplyAudio]:
     """
     The spoken version of `reply`, or None: not asked for, longer than the voice limit,
-    or the voice is unavailable. Called after _answer has released the brain's lock - the
-    network round trip to the voice must not hold up anyone else's message - and it never
-    raises, so a voice failure leaves the person with the text.
+    or the voice is unavailable. Called once the reply is out of the brain - the network
+    round trip to the voice must not hold up anyone else's message - and it never raises,
+    so a voice failure leaves the person with the text.
     """
     if not speak:
         return None
@@ -337,37 +462,77 @@ def _audio_for(reply: str, speak: bool) -> Optional[ReplyAudio]:
         return None
 
 
-# A plain `def`, not async: ask() blocks for seconds on the network, and
-# FastAPI runs sync endpoints in its thread pool so the event loop stays free.
-@app.post("/chat", response_model=ChatResponse)
-def chat(body: ChatRequest) -> ChatResponse:
-    brain = _get_brain()
+async def _ready_brain() -> LLMBrain:
+    """The brain, built if it is not yet - off the event loop: the start-up build may still be running."""
+    brain = await asyncio.to_thread(_get_brain)
     if not brain.available:
         raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
-
-    reply = _answer(brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments)
-    if not reply:
-        raise HTTPException(status_code=502, detail="The brain returned an empty reply.")
-    return ChatResponse(reply=reply, audio=_audio_for(reply, body.speak))
+    return brain
 
 
-# Sync for the same reason as /chat: transcription and the brain both block on the network.
-# Speech-to-text runs OUTSIDE the brain's lock, so a slow upload to the STT provider never
-# holds up another person's typed message.
+@app.post("/chat")
+async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
+    """
+    One typed turn, answered as server-sent events (see the top of this file). Errors found
+    before the turn starts are plain HTTP errors (422, 503); once the stream is open, a turn
+    that fails says so in an `error` event.
+    """
+    brain = await _ready_brain()
+
+    async def stream() -> AsyncIterator[str]:
+        async with aclosing(
+            _turn(request, brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments)
+        ) as events:
+            async for event in events:
+                kind = event.get("type")
+                if kind == "cancelled":
+                    return
+                if kind != "final":
+                    yield _sse(event)
+                    if kind == "error":
+                        return
+                    continue
+                reply = str(event.get("message") or "").strip()
+                if not reply:
+                    yield _sse({"type": "error", "status": "Failed", "message": "The brain returned an empty reply.", "code": 502})
+                    return
+                if body.speak and reply_audio.enabled():
+                    yield _sse({"type": "progress", "status": "Recording the spoken reply..."})
+                audio = await asyncio.to_thread(_audio_for, reply, body.speak)
+                yield _sse({
+                    "type": "final",
+                    "node": event.get("node"),
+                    "status": "Done",
+                    "message": reply,
+                    "audio": audio.model_dump() if audio else None,
+                })
+                return
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        # No caching, and no buffering by a proxy in between: each event is meant to arrive as it happens.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# Speech-to-text runs OUTSIDE the brain's turn (on a worker thread), so a slow upload to the STT
+# provider never holds up another person's typed message. The turn itself is the same state
+# machine as /chat's, collected into one JSON answer, and stopped the same way when the client
+# goes away.
 @app.post("/voice", response_model=VoiceResponse)
-def voice(
+async def voice(
+    request: Request,
     audio: UploadFile = File(),
     history: str = Form("[]"),
     user_id: str = Form("", max_length=128),
     app_url: str = Form("", max_length=300),
     speak: bool = Form(False),
-) -> VoiceResponse | JSONResponse:
-    brain = _get_brain()
+) -> VoiceResponse | JSONResponse | Response:
     # Checked first: no point paying for a transcription nobody can answer.
-    if not brain.available:
-        raise HTTPException(status_code=503, detail="No language model is configured (see .env).")
+    brain = await _ready_brain()
 
-    data = audio.file.read(MAX_AUDIO_BYTES + 1)
+    data = await audio.read(MAX_AUDIO_BYTES + 1)
     if not data:
         raise HTTPException(status_code=400, detail="The recording was empty.")
     if len(data) > MAX_AUDIO_BYTES:
@@ -380,7 +545,7 @@ def voice(
 
     print(f"[API] Voice: {len(data):,} bytes of {audio.content_type or 'unknown-type'} audio.")
     try:
-        heard = stt.transcribe(data, audio.content_type)
+        heard = await asyncio.to_thread(stt.transcribe, data, audio.content_type)
     except stt.SttError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -388,14 +553,25 @@ def voice(
     if not transcript:
         raise HTTPException(status_code=422, detail="I couldn't hear anything in that recording.")
 
-    reply = _answer(brain, transcript, turns, user_id, app_url, speak)
+    reply = ""
+    async with aclosing(_turn(request, brain, transcript, turns, user_id, app_url, speak)) as events:
+        async for event in events:
+            if event.get("type") == "final":
+                reply = str(event.get("message") or "").strip()
+                break
+            if event.get("type") in ("cancelled", "error"):
+                break
+    if await request.is_disconnected():
+        # Stopped: nobody is waiting for this answer (499 is "client closed request").
+        return Response(status_code=499)
     if not reply:
         # The words WERE heard: the caller gets them back so the person's message is not lost.
         return JSONResponse(
             status_code=502,
             content={"detail": "The brain returned an empty reply.", "transcript": transcript, "engine": heard.engine},
         )
-    return VoiceResponse(transcript=transcript, reply=reply, engine=heard.engine, audio=_audio_for(reply, speak))
+    spoken = await asyncio.to_thread(_audio_for, reply, speak)
+    return VoiceResponse(transcript=transcript, reply=reply, engine=heard.engine, audio=spoken)
 
 
 if __name__ == "__main__":

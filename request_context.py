@@ -9,20 +9,30 @@ person at a text chat: a tool should return what that person needs to SEE
 which of the two it is in, and the model must not be trusted to - so the
 caller states it here, once per request, and the tools read it.
 
-A ContextVar, not a global: api_server.py handles each request on its own
-worker thread, and a tool runs on the thread that asked the model (foreground
-tools - the only ones that read this - are never handed to the task
-dispatcher), so each request sees exactly its own context and an unrelated one
-can never leak into it. Dependency-free on purpose, like tool_spec.py, so the
-brain, the plugins and the server can all import it without a cycle.
+A ContextVar, not a global: api_server.py runs each request as its own asyncio
+task, and a tool runs on a worker thread started from that task with a copy of
+its context (asyncio.to_thread; foreground tools - the only ones that read this -
+are never handed to the task dispatcher), so each request sees exactly its own
+context and an unrelated one can never leak into it. Dependency-free on purpose,
+like tool_spec.py, so the brain, the plugins and the server can all import it
+without a cycle.
+
+RUNS (cancellation and progress). The same module also carries what one run of the
+brain's state machine (llm_brain.py) shares with the code it calls on worker threads:
+whether the run was stopped, and where a step reports what it is doing. A web request
+whose person pressed Stop sets the run's cancel event; code that can stop between two
+steps (a specialist agent's loop, the Canva browser, a tool call that has not started)
+calls check_cancelled() and gets Cancelled. The voice assistant's runs are never
+cancelled and report progress nowhere, so for it both are no-ops.
 """
 
 from __future__ import annotations
 
 import contextvars
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 CHANNEL_WEB = "web"
 
@@ -92,3 +102,70 @@ def use(context: RequestContext) -> Iterator[RequestContext]:
         yield context
     finally:
         _CURRENT.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Runs: cancellation and progress (see RUNS at the top)
+# ---------------------------------------------------------------------------
+
+
+class Cancelled(BaseException):
+    """
+    The run this code works for was stopped (the person pressed Stop, or the web
+    request went away). A BaseException, like asyncio.CancelledError, so the
+    `except Exception` that turns a tool's failure into a result the model reads
+    does not catch it: a stopped run must end, not be told about it.
+    """
+
+
+@dataclass(frozen=True)
+class RunScope:
+    """One run's cancel event and progress reporter. Absent (None) outside a run."""
+
+    cancel: threading.Event
+    # Called with a short sentence ("Head of Research: searching the web..."); thread-safe,
+    # never raises. None when nobody is listening (the voice assistant).
+    progress: Optional[Callable[[str], None]] = None
+
+
+_RUN: contextvars.ContextVar[Optional[RunScope]] = contextvars.ContextVar("jarvis_run_scope", default=None)
+
+
+@contextmanager
+def run_scope(cancel: threading.Event, progress: Optional[Callable[[str], None]] = None) -> Iterator[RunScope]:
+    """Makes a run's cancel event and progress reporter current for the with-block."""
+    scope = RunScope(cancel=cancel, progress=progress)
+    token = _RUN.set(scope)
+    try:
+        yield scope
+    finally:
+        _RUN.reset(token)
+
+
+def cancel_event() -> Optional[threading.Event]:
+    """The current run's cancel event, or None outside a run."""
+    scope = _RUN.get()
+    return scope.cancel if scope is not None else None
+
+
+def cancelled() -> bool:
+    """True when the current run was stopped."""
+    scope = _RUN.get()
+    return scope is not None and scope.cancel.is_set()
+
+
+def check_cancelled() -> None:
+    """Raises Cancelled when the current run was stopped; call it between two steps of work."""
+    if cancelled():
+        raise Cancelled()
+
+
+def report_progress(text: str) -> None:
+    """Tells whoever follows the current run what is happening now. A no-op when nobody does."""
+    scope = _RUN.get()
+    if scope is None or scope.progress is None or not text:
+        return
+    try:
+        scope.progress(text)
+    except Exception:  # noqa: BLE001 - a status line must never cost the work its result
+        pass

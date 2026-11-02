@@ -61,6 +61,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import request_context
 from utils import canva_auth
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,6 +74,8 @@ STEP_TIMEOUT = 12.0  # seconds to find one control
 # Every step is held to the run's own deadline; this much more is the hard stop, so a run that
 # runs out of time still has the seconds to keep its screenshot and close the browser.
 GRACE = 15.0
+# After a stop (the person pressed Stop in the web hub): how long Chrome gets to close.
+STOP_GRACE = 15.0
 SIGNED_OUT = "Jarvis's Chrome is signed out of Canva or the session has ended - run: python -m utils.canva_auth"
 # Canva sits behind Cloudflare. Its check often clears itself within seconds; this long it may try.
 CHALLENGE_WAIT = 10.0
@@ -484,7 +487,8 @@ async def _make(slides: list[CanvaSlide], target: Path, settings: CanvaSettings,
             debug = await run.keep_debug(_first_line(exc)) if run else None
             raise CanvaError(stage, _first_line(exc), debug) from exc
         except asyncio.CancelledError:
-            if run is not None:
+            # Out of time - not a stop the person asked for, which needs no screenshot.
+            if run is not None and not progress.get("stopping"):
                 progress["debug"] = await run.keep_debug("ran out of time")
             raise
         finally:
@@ -502,7 +506,8 @@ def _first_line(exc: BaseException) -> str:
 def make_presentation(slides: list[CanvaSlide], target: Path, settings: Optional[CanvaSettings] = None) -> Path:
     """
     Builds `slides` in Canva and saves the download as `target`. Blocks until it is done or
-    settings.timeout has passed. Raises CanvaError, never anything else.
+    settings.timeout has passed. Raises CanvaError - or request_context.Cancelled when the
+    request it works for was stopped (the browser is closed first).
 
     The browser runs on a thread of its own with its own event loop, so this can be called
     from anywhere - the brain's tool handlers are plain functions, and a thread that already
@@ -516,6 +521,7 @@ def make_presentation(slides: list[CanvaSlide], target: Path, settings: Optional
     problem = readiness(settings)
     if problem:
         raise CanvaError("setup", problem)
+    request_context.check_cancelled()  # a stopped request opens no browser
     started = time.monotonic()
     try:
         return _run_on_a_thread(slides, target, settings)
@@ -523,25 +529,36 @@ def make_presentation(slides: list[CanvaSlide], target: Path, settings: Optional
         left = settings.timeout - (time.monotonic() - started)
         if err.stage != "blocked" or not (settings.headless and settings.window_fallback) or left < RETRY_MIN_SECONDS:
             raise
+    request_context.check_cancelled()
     print(f"[Agent:publishing] Cloudflare stopped the hidden browser; once more in a minimized window ({left:.0f} s left).")
     return _run_on_a_thread(slides, target, replace(settings, headless=False, minimized=True, window_fallback=False, timeout=left))
 
 
 def _run_on_a_thread(slides: list[CanvaSlide], target: Path, settings: CanvaSettings) -> Path:
-    """One Canva run in one browser, on a thread of its own (make_presentation). Raises CanvaError only."""
+    """
+    One Canva run in one browser, on a thread of its own (make_presentation). Raises
+    CanvaError - or request_context.Cancelled when the brain's run this belongs to was
+    stopped meanwhile: the browser task is cancelled at once, which closes Jarvis's Chrome
+    (_make's finally), so a stopped request never leaves a browser working on its own.
+    """
     progress: dict[str, Any] = {}
     outcome: dict[str, Any] = {}
+    # Read here, on the caller's thread: the browser's own thread starts with no run context.
+    cancel = request_context.cancel_event()
 
     def work() -> None:
         loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
-            outcome["path"] = loop.run_until_complete(
+            task = loop.create_task(
                 asyncio.wait_for(_make(slides, target, settings, progress), timeout=settings.timeout + GRACE)
             )
+            progress["stop"] = lambda: loop.call_soon_threadsafe(task.cancel)
+            outcome["path"] = loop.run_until_complete(task)
         except BaseException as exc:  # noqa: BLE001 - handed to the caller's thread below
             outcome["error"] = exc
         finally:
+            progress.pop("stop", None)
             try:
                 loop.run_until_complete(loop.shutdown_asyncgens())
             finally:
@@ -549,7 +566,22 @@ def _run_on_a_thread(slides: list[CanvaSlide], target: Path, settings: CanvaSett
 
     worker = threading.Thread(target=work, name="canva-browser", daemon=True)
     worker.start()
-    worker.join(settings.timeout + GRACE + 20)  # the browser's own shutdown after a hard stop gets a little more
+    # The browser's own shutdown after a hard stop gets a little more than the run's time.
+    give_up = time.monotonic() + settings.timeout + GRACE + 20
+    while worker.is_alive() and time.monotonic() < give_up:
+        worker.join(0.25)
+        if cancel is not None and cancel.is_set() and worker.is_alive():
+            stop = progress.get("stop")
+            if stop is not None and not progress.get("stopping"):
+                progress["stopping"] = True
+                print("[Agent:publishing] The request was stopped; closing Canva's browser.")
+                try:
+                    stop()
+                except RuntimeError:  # the loop closed in between: the run has just ended anyway
+                    pass
+                give_up = min(give_up, time.monotonic() + STOP_GRACE)
+    if cancel is not None and cancel.is_set():
+        raise request_context.Cancelled()
     if worker.is_alive():
         raise CanvaError("timeout", f"Canva took longer than {settings.timeout:.0f} seconds and did not stop")
     error = outcome.get("error")

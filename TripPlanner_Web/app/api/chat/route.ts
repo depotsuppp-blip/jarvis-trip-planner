@@ -108,10 +108,21 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  * failure never loses it: that case answers 502 and the message stays in
  * the history.
  *
- * "Stop generating" in the hub aborts this request. The call to the brain is
- * dropped with it (request.signal), and the reply - if it still arrives - is not
- * saved: the person's message stays, unanswered, exactly as they saw it. The
- * brain itself (Python) finishes the turn it started; this only stops waiting.
+ * Streamed: a request with `Accept: application/x-ndjson` (the hub) gets the answer as
+ * lines of JSON instead, one per step, while the brain works on it:
+ *
+ *   { "type": "progress", "status": "Delegating to Head of Analytics..." }   any number
+ *   { "type": "final", conversationId, userMessage, reply, audio? }         the JSON answer's body
+ *   { "type": "error", "status": 502 | 500, error, conversationId?, userMessage? }
+ *
+ * Everything refused before the brain is asked (401, 429, 400, 404, 413, 415, 503,
+ * 500 saving the message) is still a plain JSON response with its status.
+ *
+ * "Stop generating" in the hub aborts this request (or closes the stream). The call
+ * to the brain is dropped with it (request.signal), and the reply - if it still
+ * arrives - is not saved: the person's message stays, unanswered, exactly as they
+ * saw it. The brain (Python) sees its connection close and stops the turn too: the
+ * model request in flight is closed and no further tool starts.
  *
  * The brain is told who is asking (the session's user id) and which origin
  * this app is served from: its trip tool plans a trip FOR that person
@@ -197,37 +208,122 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Couldn't save your message. Please try again." }, { status: 500 });
   }
 
+  const turn: TurnToAnswer = {
+    conversationId: conversation.id,
+    userMessage,
+    message,
+    history,
+    attachments,
+    userId,
+    appUrl: request.nextUrl.origin,
+    speak,
+  };
+
+  if (!wantsStream(request)) {
+    const outcome = await answerTurn(turn, request.signal);
+    if (outcome.kind === "stopped") return stopped(conversation.id);
+    return NextResponse.json(outcome.body, outcome.kind === "failed" ? { status: outcome.status } : undefined);
+  }
+
+  // Streamed: the brain's steps go out as they happen, then the same body as the JSON answer.
+  // Closing the stream (the page's "Stop generating") aborts the brain call, like request.signal.
+  const encoder = new TextEncoder();
+  const closed = new AbortController();
+  const signal = AbortSignal.any([request.signal, closed.signal]);
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (line: Record<string, unknown>) => {
+        try {
+          controller.enqueue(encoder.encode(`${JSON.stringify(line)}\n`));
+        } catch {
+          // The page is gone; the outcome below is saved (or not) all the same.
+        }
+      };
+      const outcome = await answerTurn(turn, signal, (status) => send({ type: "progress", status }));
+      if (outcome.kind === "stopped") logStopped(conversation.id);
+      else if (outcome.kind === "answered") send({ type: "final", ...outcome.body });
+      else send({ type: "error", status: outcome.status, ...outcome.body });
+      try {
+        controller.close();
+      } catch {
+        // Already cancelled by the page.
+      }
+    },
+    cancel() {
+      closed.abort();
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      // no-transform: compression would hold the lines back until the end.
+      "Cache-Control": "no-cache, no-transform",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
+/** The page asked for the turn as a stream of lines (lib/jarvis/chatApi.ts, `send` with progress). */
+function wantsStream(request: NextRequest): boolean {
+  return (request.headers.get("accept") ?? "").includes("application/x-ndjson");
+}
+
+interface TurnToAnswer {
+  conversationId: string;
+  userMessage: unknown;
+  message: string;
+  history: ChatTurn[];
+  attachments: Attachment[];
+  userId: string;
+  appUrl: string;
+  speak?: boolean;
+}
+
+type TurnOutcome =
+  | { kind: "answered"; body: Record<string, unknown> }
+  | { kind: "failed"; status: number; body: Record<string, unknown> }
+  | { kind: "stopped" };
+
+/**
+ * Asks the brain for the reply to a saved message and saves it: the answer's body, a failure's
+ * status and body (502 the brain, 500 saving), or "stopped" - the person stopped the turn
+ * (`signal`), and nothing is saved. `onProgress` hears the brain's steps on the way.
+ */
+async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, onProgress?: (status: string) => void): Promise<TurnOutcome> {
+  const { conversationId, userMessage } = turn;
   let replyText: string;
   let audio: ReplyAudio | null = null;
   try {
-    const answer = await askJarvis(message, history, {
-      userId,
-      appUrl: request.nextUrl.origin,
-      speak,
-      attachments,
-      signal: request.signal,
+    const answer = await askJarvis(turn.message, turn.history, {
+      userId: turn.userId,
+      appUrl: turn.appUrl,
+      speak: turn.speak,
+      attachments: turn.attachments,
+      signal,
+      onProgress,
     });
     replyText = answer.reply.trim();
     if (!replyText) throw new Error("The brain returned an empty reply.");
     audio = speakableAudio(replyText, answer.audio);
   } catch (error) {
-    if (error instanceof JarvisBrainCancelled || request.signal.aborted) return stopped(conversation.id);
-    console.error(`POST /api/chat: the brain failed for conversation ${conversation.id}:`, error);
-    return NextResponse.json(
-      { error: error instanceof JarvisBrainError ? error.message : "Jarvis couldn't answer just now.", conversationId: conversation.id, userMessage },
-      { status: 502 }
-    );
+    if (error instanceof JarvisBrainCancelled || signal.aborted) return { kind: "stopped" };
+    console.error(`POST /api/chat: the brain failed for conversation ${conversationId}:`, error);
+    return {
+      kind: "failed",
+      status: 502,
+      body: { error: error instanceof JarvisBrainError ? error.message : "Jarvis couldn't answer just now.", conversationId, userMessage },
+    };
   }
 
   // Stopped while the answer was on its way in: the person never sees it, so it is not kept either.
-  if (request.signal.aborted) return stopped(conversation.id);
+  if (signal.aborted) return { kind: "stopped" };
 
   try {
-    const reply = await saveReply(conversation.id, replyText);
-    return NextResponse.json({ conversationId: conversation.id, userMessage, reply, ...(audio ? { audio } : {}) });
+    const reply = await saveReply(conversationId, replyText);
+    return { kind: "answered", body: { conversationId, userMessage, reply, ...(audio ? { audio } : {}) } };
   } catch (error) {
     console.error("POST /api/chat failed saving the reply:", error);
-    return NextResponse.json({ error: "Couldn't save Jarvis's reply. Please try again." }, { status: 500 });
+    return { kind: "failed", status: 500, body: { error: "Couldn't save Jarvis's reply. Please try again." } };
   }
 }
 
@@ -246,8 +342,12 @@ export async function POST(request: NextRequest) {
  * request), so it only has to be honest: 499, the code proxies use for "client closed".
  */
 function stopped(conversationId: string) {
-  console.info(`POST /api/chat: stopped by the person (conversation ${conversationId}); the reply is not saved.`);
+  logStopped(conversationId);
   return NextResponse.json({ error: "Stopped.", conversationId }, { status: 499 });
+}
+
+function logStopped(conversationId: string) {
+  console.info(`POST /api/chat: stopped by the person (conversation ${conversationId}); the reply is not saved.`);
 }
 
 export async function GET(request: NextRequest) {

@@ -11,6 +11,8 @@ import type { ReplyAudio } from "./replyAudio";
  *   GET  /api/chat/sessions                 the signed-in person's sessions, newest first
  *   POST /api/chat { message, conversationId?, newConversation?, speak? }   one typed turn
  *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?)   one typed turn with a file
+ *        - asked for as lines of JSON (Accept: application/x-ndjson) when the caller wants Jarvis's
+ *          steps on the way ("Searching the web..."): `send` with `onProgress`
  *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
  *   GET  /api/chat/tools                    the manager's model, the specialist agents and the tool servers
  *   DELETE /api/chat/messages/<id>          deletes one saved message (the person's own)
@@ -141,13 +143,17 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<ApiResul
   const data: unknown = await response.json().catch(() => null);
   if (init.signal?.aborted && !isTimeout(init.signal)) return { ok: false, kind: "cancelled", status: 0, message: "" };
   if (response.ok) return { ok: true, data: data as T };
+  return failure(response.status, data);
+}
 
-  const kind = kindFor(response.status);
+/** A refused or failed request as the controller reads it: `data` is the server's JSON body. */
+function failure(status: number, data: unknown): ApiFailure {
+  const kind = kindFor(status);
   const serverMessage = (data as { error?: unknown } | null)?.error;
   return {
     ok: false,
     kind,
-    status: response.status,
+    status,
     message:
       kind === "signed-out"
         ? SIGNED_OUT_MESSAGE
@@ -155,6 +161,68 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<ApiResul
           ? serverMessage
           : FALLBACK_MESSAGE,
   };
+}
+
+/**
+ * A typed turn asked for as lines of JSON (app/api/chat/route.ts): each `progress` line goes to
+ * `onProgress` as it arrives, the `final` line is the answer (the JSON answer's body), an `error`
+ * line is a failure with its status. Everything refused before the turn started comes back as a
+ * plain JSON response and is read like any other request; so is the answer of a server that does
+ * not stream. Never throws: a stream that breaks off is a network failure, a stopped one "cancelled".
+ */
+async function streamedTurn(url: string, init: RequestInit, onProgress: (status: string) => void): Promise<ApiResult<TurnData>> {
+  const signal = init.signal ?? undefined;
+  const cancelled = (): ApiFailure | null =>
+    signal?.aborted && !isTimeout(signal) ? { ok: false, kind: "cancelled", status: 0, message: "" } : null;
+  const headers = new Headers(init.headers);
+  headers.set("Accept", "application/x-ndjson");
+
+  let response: Response;
+  try {
+    response = await fetch(url, { credentials: "same-origin", ...init, headers });
+  } catch {
+    return cancelled() ?? { ok: false, kind: "network", status: 0, message: FALLBACK_MESSAGE };
+  }
+  const lines = (response.headers.get("content-type") ?? "").includes("application/x-ndjson");
+  if (!response.ok || !lines || !response.body) {
+    const data: unknown = await response.json().catch(() => null);
+    const stopped = cancelled();
+    if (stopped) return stopped;
+    return response.ok ? { ok: true, data: data as TurnData } : failure(response.status, data);
+  }
+
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += chunk.value;
+      for (let end = buffer.indexOf("\n"); end !== -1; end = buffer.indexOf("\n")) {
+        const line = buffer.slice(0, end).trim();
+        buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (event.type === "progress" && typeof event.status === "string") {
+          onProgress(event.status);
+        } else if (event.type === "final") {
+          return cancelled() ?? { ok: true, data: event as unknown as TurnData };
+        } else if (event.type === "error") {
+          return failure(typeof event.status === "number" ? event.status : 502, event);
+        }
+      }
+    }
+  } catch {
+    // The read failed: stopped by the page, or the connection broke.
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  return cancelled() ?? { ok: false, kind: "network", status: 0, message: FALLBACK_MESSAGE };
 }
 
 export const chatApi = {
@@ -181,23 +249,22 @@ export const chatApi = {
 
   // No client timeout: the brain may run a whole trip plan (tens of seconds) and the server enforces its own limit.
   // With a file the turn goes as multipart (no Content-Type set, so the browser adds the boundary); without, as JSON.
-  // `signal` is "Stop generating": aborting it answers { ok: false, kind: "cancelled" }, and the server saves no reply.
-  send: ({ file, ...turn }: TurnRequest, signal?: AbortSignal) => {
+  // `signal` is "Stop generating": aborting it answers { ok: false, kind: "cancelled" }, and the server saves no reply
+  // (and the brain stops working on it). `onProgress` hears each step Jarvis reports on the way (streamedTurn).
+  send: ({ file, ...turn }: TurnRequest, signal?: AbortSignal, onProgress?: (status: string) => void) => {
+    let init: RequestInit;
     if (!file) {
-      return request<TurnData>("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(turn),
-        signal,
-      });
+      init = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(turn), signal };
+    } else {
+      const form = new FormData();
+      form.append("message", turn.message);
+      form.append("file", file, file.name);
+      if (turn.conversationId) form.append("conversationId", turn.conversationId);
+      else if (turn.newConversation) form.append("newConversation", "true");
+      if (turn.speak) form.append("speak", "true");
+      init = { method: "POST", body: form, signal };
     }
-    const form = new FormData();
-    form.append("message", turn.message);
-    form.append("file", file, file.name);
-    if (turn.conversationId) form.append("conversationId", turn.conversationId);
-    else if (turn.newConversation) form.append("newConversation", "true");
-    if (turn.speak) form.append("speak", "true");
-    return request<TurnData>("/api/chat", { method: "POST", body: form, signal });
+    return onProgress ? streamedTurn("/api/chat", init, onProgress) : request<TurnData>("/api/chat", init);
   },
 
   // The recording goes as multipart, and no Content-Type is set so the browser adds the boundary.

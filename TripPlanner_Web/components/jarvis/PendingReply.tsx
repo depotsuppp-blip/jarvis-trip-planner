@@ -15,8 +15,8 @@ const THINKING = "Jarvis is thinking";
  * it; nothing is laid over the conversation, which stays readable and scrollable.
  *
  * The words come from the chat store's `pending.status` ("Searching the web",
- * "Generating an image") whenever something reports one (ChatController.reportStatus);
- * until then, "Jarvis is thinking". Only the words are a live region, so a change of
+ * "Delegating to Head of Analytics") - each step the brain streams for a typed turn
+ * (ChatController.reportStatus); until the first one, "Jarvis is thinking". Only the words are a live region, so a change of
  * status is announced once and the dots never are. Under reduced motion the dots hold still.
  *
  * Stop generating aborts the turn's request (ChatController: endVoice): the reply is

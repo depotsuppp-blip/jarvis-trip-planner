@@ -425,7 +425,11 @@ export class ChatController {
         ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
         ...(this.speech.getState().enabled ? { speak: true } : {}),
       },
-      request.signal
+      request.signal,
+      // Jarvis's steps on the way, into the thinking bubble - only while this turn is the one waiting.
+      (status) => {
+        if (this.turn === mine && this.request === request) this.reportStatus(status);
+      }
     );
     if (this.request === request) this.request = null;
     if (this.disposed) return;
@@ -817,13 +821,15 @@ export class ChatController {
   }
 
   /**
-   * What Jarvis is doing, in words ("Searching the web", "Generating an image"), for the thinking
-   * bubble - for whatever can tell while a turn is on its way; null goes back to "thinking".
-   * Nothing calls it yet: the brain answers a turn in one response, with no progress before it.
-   * A streamed status (server-sent events from the brain's tool calls) would call it per step.
+   * What Jarvis is doing, in words ("Searching the web", "Delegating to Head of Analytics"), for
+   * the thinking bubble while a turn is on its way; null goes back to "thinking". A typed turn
+   * calls it for each step the brain streams (send -> chatApi.send's onProgress). The bubble's
+   * own dots say "working", so a trailing "..." is dropped.
    */
   reportStatus(status: string | null): void {
-    if (this.chat.getState().pending) this.chat.setState({ pending: { status } });
+    if (!this.chat.getState().pending) return;
+    const words = status?.replace(/\s*(?:\.{3}|…)\s*$/, "").trim() || null;
+    this.chat.setState({ pending: { status: words } });
   }
 
   /** A cancelled recording or upload must not leave the sidebar saying Voice is working. */

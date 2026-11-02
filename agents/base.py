@@ -36,6 +36,13 @@ agent works, the manager has neither, nor the built-ins the agent `replaces`. A 
 that changes something outside Jarvis records what happened in `actions`, in the
 tool's own words, and the manager is told that alongside the report - so "sent" in a
 reply comes from the tool, not from the agent saying so.
+
+STOPPING. An agent works on a worker thread of the brain's run (LLMBrain.run). When that
+run is stopped - the person pressed Stop in the web hub - the agent ends before its next
+model call and before acting on an answer that arrived meanwhile
+(request_context.check_cancelled raises Cancelled), so a stopped task costs at most the one
+model call that was already on its way. Each step is reported to whoever follows the run
+("Head of Research: Searching the web...", request_context.report_progress).
 """
 
 from __future__ import annotations
@@ -46,7 +53,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from llm_brain import GEMINI_MODEL, GeminiProvider, ProviderError, ToolCall, ToolResult, Turn, _Provider, _env, turn_context
+import request_context
+from llm_brain import GEMINI_MODEL, GeminiProvider, ProviderError, ToolCall, ToolResult, Turn, _Provider, _env, tool_activity, turn_context
 from tool_spec import ToolSpec
 
 # Seconds a failed route is passed over, by ProviderError.kind. None = until restart.
@@ -222,7 +230,10 @@ class SpecialistAgent:
                 print(f"[Agent:{self.name}] Done in {step} step(s), {time.monotonic() - started:.1f} s.")
                 return _cut(report)
             print(f"[Agent:{self.name}] Step {step}/{self.max_steps}: {', '.join(c.name for c in turn.calls)}")
+            doing = list(dict.fromkeys(tool_activity(_named(tools, call), call) for call in turn.calls))
+            request_context.report_progress(f"{self.title}: {', '.join(doing)}...")
             transcript.append(turn)
+            # execute() (LLMBrain._execute) refuses to start a call once the run was stopped.
             transcript.append(Turn(kind="tool_results", results=[execute(call) for call in turn.calls]))
 
         print(f"[Agent:{self.name}] Hit its {self.max_steps}-step ceiling; asking for what it has.")
@@ -247,7 +258,17 @@ class SpecialistAgent:
             return self.finish(again.text)  # a second ValueError reaches the manager as a tool error
 
     def _complete(self, transcript: list[Turn], tools: list[ToolSpec], context: str, json_ok: bool = True) -> Turn:
-        """One model call on the first route that can take it (see ROUTES at the top)."""
+        """
+        One model call on the first route that can take it (see ROUTES at the top). Not made
+        for a stopped run, and not acted on when the run was stopped while it was on its way
+        (see STOPPING): both raise request_context.Cancelled.
+        """
+        request_context.check_cancelled()
+        turn = self._call_route(transcript, tools, context, json_ok)
+        request_context.check_cancelled()
+        return turn
+
+    def _call_route(self, transcript: list[Turn], tools: list[ToolSpec], context: str, json_ok: bool) -> Turn:
         now = time.monotonic()
         tried: list[str] = []
         for index, route in enumerate(self.routes):
@@ -290,6 +311,10 @@ class SpecialistAgent:
             + "; ".join(tried + off)
             + "). Tell the user this part could not be done right now."
         )
+
+
+def _named(tools: list[ToolSpec], call: ToolCall) -> Optional[ToolSpec]:
+    return next((tool for tool in tools if tool.name == call.name), None)
 
 
 def _cut(text: str) -> str:

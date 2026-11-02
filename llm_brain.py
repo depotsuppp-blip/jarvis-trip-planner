@@ -71,7 +71,7 @@ Several things were added to this module beyond plain tool calling:
       ran during the same request (or from the user's own message), never
       from the earlier conversation: a model that has seen last week's trip
       link will sometimes hand it out for a new trip. link_guard.py finds
-      the references; LLMBrain.ask gives the model one chance to fix a bad
+      the references; Review_Artifact gives the model one chance to fix a bad
       reply and otherwise says it has no link - the guarantee behind the
       prompt rule, because a prompt is only a request.
 
@@ -142,7 +142,7 @@ Several things were added to this module beyond plain tool calling:
       _with_artifacts). The slides travel inside the tool call, so a
       presentation question may write up to LONG_OUTPUT_MAX_TOKENS instead
       of MAX_TOKENS, and a tool call cut off by the limit is asked for again
-      with that room (_call_provider). No key and no cost: there whenever
+      with that room (_call_model). No key and no cost: there whenever
       python-pptx is installed, JARVIS_PUBLISHING=0 turns it off.
 
   SPREADSHEETS  delegate_to_analytics(tabular_data) hands a table - JSON the
@@ -158,6 +158,48 @@ Several things were added to this module beyond plain tool calling:
       travels inside the tool call, so a spreadsheet question may write up to
       LONG_OUTPUT_MAX_TOKENS. No key and no cost: there whenever pandas and
       openpyxl are installed, JARVIS_ANALYTICS=0 turns it off.
+
+-------------------------------------------------------------------
+THE STATE MACHINE
+-------------------------------------------------------------------
+Every question is one run through these nodes (LLMBrain._machine):
+
+    Analyze_Intent     a question at all? budget, key, this turn's tools,
+                       the routing tier - and the front door, which may
+                       answer greetings on its own (-> Final_Response)
+    Plan               one call to the manager's model: an answer
+                       (-> Review_Artifact) or tool calls
+    Delegate_to_Agent  the calls, when any hands work to a specialist
+                       (Research, Data, Productivity, Creative, Publishing,
+                       Analytics, Classroom)                     (-> Plan)
+    Use_Tools          the calls, when none does: MCP tools, built-ins (-> Plan)
+    Review_Artifact    the link guard (one correction back through Plan),
+                       the Markdown line of every file made during the run,
+                       the background-dispatch note, widgets
+    Final_Response     the exchange goes into the history; the reply goes out
+
+Each node announces itself as it starts - {"type": "progress", "node": ...,
+"status": "Delegating to Head of Analytics..."} - and the run ends with
+{"type": "final", "status": "Done", "message": <the reply>}. Two ways through
+the same nodes:
+
+    LLMBrain.run(text, cancel)   async, for the web (api_server.py streams the
+                                 events as server-sent events). Model calls are
+                                 awaited on the providers' async clients, tools
+                                 run on worker threads. Cancelling the task (the
+                                 person pressed Stop, the request went away) or
+                                 setting `cancel` ends the run at once: the model
+                                 request in flight is closed, no further tool
+                                 starts (_execute), a specialist agent stops after
+                                 its current step, a Canva browser is shut, and
+                                 nothing is added to the history.
+    LLMBrain.ask(text)           the voice assistant: the same run on the caller's
+                                 thread with no event loop (events()), every call
+                                 made in turn exactly as before; returns the reply.
+
+Per-question state (what was made, what went to the background, when it
+started) lives on the run (TurnRun), never on the brain, so a stopped run's
+leftover worker thread cannot leak into the next question.
 
 -------------------------------------------------------------------
 PROVIDERS
@@ -227,15 +269,18 @@ Setup (one time) - see .env.example. At least one of:
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextvars
 import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
-from typing import Any, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Optional
 
 import link_guard
 import llm_budget
@@ -408,7 +453,7 @@ MAX_TOKENS = 1024
 # deck of any size off in the middle: Claude then hands back half a tool call, Gemini
 # an empty answer. A presentation question may write this much instead (LLMBrain.ask),
 # and a tool call that still comes back cut off is asked for once more with it
-# (LLMBrain._call_provider). A ceiling, not a target - only what is written is billed -
+# (LLMBrain._call_model). A ceiling, not a target - only what is written is billed -
 # and kept within what the Anthropic SDK allows a request that is not streamed.
 LONG_OUTPUT_MAX_TOKENS = 8192
 
@@ -658,7 +703,7 @@ instead of inventing one.\
 """
 
 # Appended to SYSTEM_PROMPT when a question comes from the web chat rather than
-# a microphone (request_context says which - see LLMBrain._call_provider).
+# a microphone (request_context says which - see LLMBrain._call_model).
 # SYSTEM_PROMPT is written for speakers, and one of its rules would defeat a
 # chat whose answer is often a link: never speak URLs. The rest of it (plain
 # text, short) fits a chat as well as a call, so only that rule is lifted.
@@ -777,7 +822,7 @@ def realtime_rule(tools: list[ToolSpec]) -> str:
 # The specialist agents' delegation tools (agents/; LLMBrain._team_tools builds them).
 DELEGATE_RESEARCH = "delegate_to_research"
 
-# Added to the manager's per-turn context while it has a team (LLMBrain._call_provider).
+# Added to the manager's per-turn context while it has a team (LLMBrain._call_model).
 TEAM_RULE = (
     "Your team, and what only they can do: {members}. You cannot do those things yourself - "
     "the tools belong to them. Hand a task to the right one instead of guessing or saying you "
@@ -2747,9 +2792,52 @@ class _Provider:
         """
         raise NotImplementedError
 
+    async def acomplete(
+        self,
+        system: str,
+        transcript: list[Turn],
+        tools: list[ToolSpec],
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        context: str = "",
+        json_output: bool = False,
+        max_tokens: Optional[int] = None,
+    ) -> Turn:
+        """
+        complete(), awaited: what the brain's state machine calls when it runs for the web
+        (LLMBrain.run). A provider with its own async client (Anthropic, Gemini) sends the
+        request on the event loop, so cancelling the awaiting task closes the HTTP request
+        itself - the model stops working on an answer nobody will read. This default runs
+        complete() on a worker thread: the run stops waiting at once, but that one request
+        finishes in the background.
+        """
+        return await asyncio.to_thread(
+            self.complete, system, transcript, tools, model, effort, context, json_output, max_tokens
+        )
+
     def describe_image(self, question: str, image_b64: str, media_type: str) -> str:
         """One-shot vision call. Returns a spoken sentence."""
         raise NotImplementedError
+
+
+class _PerLoopClient:
+    """
+    An async SDK client for the event loop that is running now. An async HTTP client's
+    pooled connections belong to the loop that opened them, so a loop of its own (a test,
+    a second server) gets a client of its own instead of one whose connections are dead.
+    """
+
+    def __init__(self, make: Callable[[], Any]) -> None:
+        self._make = make
+        self._client: Any = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def get(self) -> Any:
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._loop is not loop:
+            self._client = self._make()
+            self._loop = loop
+        return self._client
 
 
 class AnthropicProvider(_Provider):
@@ -2768,6 +2856,8 @@ class AnthropicProvider(_Provider):
         self._max_tokens = max_tokens
         self._effort = effort
         self._client = None
+        # The same key's async client, for acomplete (made per event loop, on first use).
+        self._async = _PerLoopClient(lambda: anthropic.AsyncAnthropic(api_key=key))
         self.unavailable_reason = ""
 
         if not _ANTHROPIC_AVAILABLE:
@@ -2858,7 +2948,45 @@ class AnthropicProvider(_Provider):
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Anthropic model isn't configured.")
+        request = self._request(system, transcript, tools, model, effort, context, max_tokens)
+        try:
+            response = self._client.messages.create(**request)
+        except Exception as exc:  # noqa: BLE001 - classified immediately below
+            raise self._classify(exc) from exc
+        return self._parse(response)
 
+    async def acomplete(
+        self,
+        system: str,
+        transcript: list[Turn],
+        tools: list[ToolSpec],
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        context: str = "",
+        json_output: bool = False,
+        max_tokens: Optional[int] = None,
+    ) -> Turn:
+        """complete() on the async client: cancelling the awaiting task closes the request (see _Provider.acomplete)."""
+        if self._client is None:
+            raise ProviderError("no_key", "My Anthropic model isn't configured.")
+        request = self._request(system, transcript, tools, model, effort, context, max_tokens)
+        try:
+            response = await self._async.get().messages.create(**request)
+        except Exception as exc:  # noqa: BLE001 - classified immediately below; a cancellation is not an Exception
+            raise self._classify(exc) from exc
+        return self._parse(response)
+
+    def _request(
+        self,
+        system: str,
+        transcript: list[Turn],
+        tools: list[ToolSpec],
+        model: Optional[str],
+        effort: Optional[str],
+        context: str,
+        max_tokens: Optional[int],
+    ) -> dict[str, Any]:
+        """The Messages API request for one call (complete, acomplete)."""
         # `model`/`effort` come from the intent router, per question.
         # Nothing is stored on self: the next question re-decides.
         target = model or self._model
@@ -2902,12 +3030,11 @@ class AnthropicProvider(_Provider):
             # this one breakpoint covers the whole tools array.
             schemas[-1] = {**schemas[-1], "cache_control": {"type": "ephemeral"}}
             request["tools"] = schemas
+        return request
 
-        try:
-            response = self._client.messages.create(**request)
-        except Exception as exc:  # noqa: BLE001 - classified immediately below
-            raise self._classify(exc) from exc
-
+    @staticmethod
+    def _parse(response: Any) -> Turn:
+        """One Messages API response as a neutral Turn (complete, acomplete)."""
         usage = getattr(response, "usage", None)
         if usage is not None:
             llm_budget.record_usage(
@@ -3059,19 +3186,24 @@ class GeminiProvider(_Provider):
             self.unavailable_reason = "no GEMINI_API_KEY configured"
             return
 
-        try:
+        def client() -> Any:
             # The SDK's own retry backs off for minutes on a busy model (a single
             # "hi" took 218 s on 2026-10-26). A standby has to answer now: no
             # SDK retry, a bounded wait, and the next model is the retry (complete()).
-            self._client = genai.Client(
+            return genai.Client(
                 api_key=key,
                 http_options=genai_types.HttpOptions(
                     timeout=GEMINI_TIMEOUT_MS,
                     retry_options=genai_types.HttpRetryOptions(attempts=1),
                 ),
             )
+
+        try:
+            self._client = client()
         except Exception as exc:  # noqa: BLE001
             self.unavailable_reason = f"could not create the Gemini client: {exc}"
+        # The async side (client.aio) for acomplete, made per event loop on first use.
+        self._async = _PerLoopClient(lambda: client().aio)
 
     @property
     def available(self) -> bool:
@@ -3154,7 +3286,71 @@ class GeminiProvider(_Provider):
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Gemini model isn't configured.")
+        config = self._config(system, tools, context, json_output, max_tokens)
+        contents = self._to_contents(transcript)
+        targets = self._targets(model)
+        for target in targets:
+            try:
+                response = self._client.models.generate_content(model=target, contents=contents, config=config)
+            except Exception as exc:  # noqa: BLE001 - classified immediately below
+                self._next_target(exc, target, targets)
+                continue
+            return self._parse(response)
+        raise AssertionError("unreachable: the last target raises")  # pragma: no cover
 
+    async def acomplete(
+        self,
+        system: str,
+        transcript: list[Turn],
+        tools: list[ToolSpec],
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        context: str = "",
+        json_output: bool = False,
+        max_tokens: Optional[int] = None,
+    ) -> Turn:
+        """complete() on the async client: cancelling the awaiting task closes the request (see _Provider.acomplete)."""
+        if self._client is None:
+            raise ProviderError("no_key", "My Gemini model isn't configured.")
+        config = self._config(system, tools, context, json_output, max_tokens)
+        contents = self._to_contents(transcript)
+        targets = self._targets(model)
+        for target in targets:
+            try:
+                response = await self._async.get().models.generate_content(model=target, contents=contents, config=config)
+            except Exception as exc:  # noqa: BLE001 - classified immediately below; a cancellation is not an Exception
+                self._next_target(exc, target, targets)
+                continue
+            return self._parse(response)
+        raise AssertionError("unreachable: the last target raises")  # pragma: no cover
+
+    def _targets(self, model: Optional[str]) -> list[str]:
+        """
+        The models one call tries, in order: the asked-for model first; if it is out of
+        quota (a free key has no Pro), withdrawn or overloaded (503 "high demand", 504),
+        the default, then the last resort - rather than no answer at all. Only the asked-for
+        one for a strict route (fallthrough=False).
+        """
+        targets = list(dict.fromkeys([model or self._model, self._model, GEMINI_MODEL_LAST_RESORT]))
+        return targets if self._fallthrough else targets[:1]
+
+    def _next_target(self, exc: Exception, target: str, targets: list[str]) -> None:
+        """After `target` failed with `exc`: returns to try the next one, or raises the ProviderError."""
+        error = self._classify(exc)
+        if target == targets[-1] or error.kind not in ("rate_limit", "not_found", "server"):
+            raise error from exc
+        following = targets[targets.index(target) + 1]
+        print(f"[Brain] Gemini {target} unavailable ({error.kind}); trying {following}.")
+
+    def _config(
+        self,
+        system: str,
+        tools: list[ToolSpec],
+        context: str,
+        json_output: bool,
+        max_tokens: Optional[int],
+    ) -> Any:
+        """The GenerateContentConfig for one call (complete, acomplete)."""
         config_kwargs: dict[str, Any] = {
             "system_instruction": f"{system}\n\n{context}" if context else system,
             "max_output_tokens": max_tokens or self._max_tokens,
@@ -3169,30 +3365,11 @@ class GeminiProvider(_Provider):
             config_kwargs["automatic_function_calling"] = (
                 genai_types.AutomaticFunctionCallingConfig(disable=True)
             )
+        return genai_types.GenerateContentConfig(**config_kwargs)
 
-        # The asked-for model first; if it is out of quota (a free key has no Pro),
-        # withdrawn or overloaded (503 "high demand", 504), the default, then the
-        # last resort - rather than no answer at all.
-        response = None
-        targets = list(dict.fromkeys([model or self._model, self._model, GEMINI_MODEL_LAST_RESORT]))
-        if not self._fallthrough:
-            targets = targets[:1]
-        for target in targets:
-            try:
-                response = self._client.models.generate_content(
-                    model=target,
-                    contents=self._to_contents(transcript),
-                    config=genai_types.GenerateContentConfig(**config_kwargs),
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 - classified immediately below
-                error = self._classify(exc)
-                if target == targets[-1] or error.kind not in ("rate_limit", "not_found", "server"):
-                    raise error from exc
-                following = targets[targets.index(target) + 1]
-                print(f"[Brain] Gemini {target} unavailable ({error.kind}); trying {following}.")
-        assert response is not None
-
+    @staticmethod
+    def _parse(response: Any) -> Turn:
+        """One generate_content response as a neutral Turn (complete, acomplete)."""
         usage = getattr(response, "usage_metadata", None)
         if usage is not None:
             llm_budget.record_usage(
@@ -3293,6 +3470,161 @@ class GeminiProvider(_Provider):
 
 
 # =====================================================================
+# The state machine's parts (LLMBrain.run, LLMBrain.ask)
+# =====================================================================
+
+
+class Node:
+    """The states one question passes through (see THE STATE MACHINE at the top)."""
+
+    ANALYZE_INTENT = "Analyze_Intent"
+    PLAN = "Plan"
+    DELEGATE_TO_AGENT = "Delegate_to_Agent"
+    USE_TOOLS = "Use_Tools"
+    REVIEW_ARTIFACT = "Review_Artifact"
+    FINAL_RESPONSE = "Final_Response"
+    DONE = "Done"
+
+
+@dataclass
+class TurnRun:
+    """
+    Everything one question's run carries from node to node. Per run, never on the
+    brain: a stopped run's worker thread may still be finishing a step while the
+    next question is answered, and it must only ever touch its own run.
+    """
+
+    user_text: str
+    # True: the voice assistant's run (LLMBrain.events) - every call on the caller's
+    # thread, no event loop. False: the web's (LLMBrain.run) - async model calls,
+    # tools on worker threads, cancellable.
+    inline: bool
+    cancel: threading.Event = field(default_factory=threading.Event)
+    progress: Optional[Callable[[str], None]] = None
+    started: float = field(default_factory=time.monotonic)
+    node: str = Node.ANALYZE_INTENT
+    next: str = Node.DONE
+    trail: list[str] = field(default_factory=list)
+    # Plan: model calls made so far (at most the brain's max_steps).
+    step: int = 0
+    tools: list[ToolSpec] = field(default_factory=list)
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    max_tokens: Optional[int] = None
+    working: list[Turn] = field(default_factory=list)
+    # What a reply may quote a trip link or id from (link_guard.py).
+    evidence: list[str] = field(default_factory=list)
+    corrected: bool = False
+    # The model's latest turn (Plan), read by Delegate_to_Agent / Use_Tools and Review_Artifact.
+    turn: Optional[Turn] = None
+    # Final_Response: what is sent, and what the history keeps of it (when it keeps it).
+    reply: str = ""
+    remember: bool = False
+    remembered: str = ""
+    finished: bool = False
+    # What went to the background during this run (_execute) - the replay note in the history.
+    dispatched: list[str] = field(default_factory=list)
+    # The Markdown lines for what was made during this run - a picture, a presentation's or a
+    # spreadsheet's download link - so the reply is sure to carry them (_with_artifacts).
+    artifacts: list[str] = field(default_factory=list)
+
+
+# The run being answered, for code a node calls (a tool on a worker thread gets a copy of the
+# context, so it sees the same run). None outside a run.
+_CURRENT_RUN: contextvars.ContextVar[Optional[TurnRun]] = contextvars.ContextVar("jarvis_turn_run", default=None)
+
+
+def _current_run() -> TurnRun:
+    """The run being answered - or, for a tool called outside one (a test), a throwaway."""
+    return _CURRENT_RUN.get() or TurnRun(user_text="", inline=True)
+
+
+def _resolve(awaitable: Awaitable[Any]) -> Any:
+    """
+    Runs `awaitable` to its end on this thread with no event loop. Only for code that
+    never actually waits on one - an inline run, where every await is a plain call.
+    """
+    step = awaitable.__await__()
+    try:
+        step.send(None)
+    except StopIteration as done:
+        return done.value
+    step.close()
+    raise RuntimeError("An inline run waited on the event loop; use LLMBrain.run for that.")
+
+
+def _drive_inline(machine: AsyncIterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """
+    Iterates the state machine (an async generator) as a plain generator, on this
+    thread and without an event loop: the voice assistant's way through it (LLMBrain.events).
+    Its nodes only await plain calls when run.inline is set (_blocking, _send), so
+    nothing here ever has to wait on a loop.
+    """
+    try:
+        while True:
+            try:
+                event = _resolve(machine.__anext__())
+            except StopAsyncIteration:
+                return
+            yield event
+    finally:
+        try:
+            _resolve(machine.aclose())
+        except (RuntimeError, StopAsyncIteration):  # pragma: no cover - already closed
+            pass
+
+
+def _is_delegation(tool: Optional[ToolSpec], call: ToolCall) -> bool:
+    """A call that hands work to a specialist (agents/, the Heads of Creative, Publishing, Analytics, Classroom)."""
+    return (tool is not None and tool.source == "agent") or call.name.startswith("delegate_to_")
+
+
+# What a tool call is doing, in a few words for the person waiting (the web hub's
+# thinking bubble). Without its trailing "...": the caller adds that.
+_ACTIVITY_BY_TOOL = {
+    "delegate_to_classroom_courses": "Checking Google Classroom",
+    "delegate_to_classroom_assignments": "Checking Google Classroom assignments",
+    "get_todays_agenda": "Checking your calendar",
+    "push_line_notification": "Sending a LINE message",
+    "send_line_notification": "Sending a LINE message",
+    "get_system_status": "Checking the system status",
+    "analyze_screen": "Looking at the screen",
+    "list_capabilities": "Listing what I can do",
+    "create_new_tool": "Writing a new tool",
+}
+_ACTIVITY_BY_SERVER = {
+    "web_search": "Searching the web",
+    "fetch": "Reading a web page",
+    "memory": "Checking my memory",
+    "data": "Working through the data",
+    "local_fs": "Reading the file",
+}
+_MCP_NAME = re.compile(r"^mcp__([A-Za-z0-9_-]+?)__(.+)$")
+
+
+def tool_activity(tool: Optional[ToolSpec], call: ToolCall) -> str:
+    """
+    "Delegating to Head of Analytics", "Searching the web", "Working on the trip plan
+    to Chiang Mai": what `call` is doing, for a progress line. Never raises.
+    """
+    if call.name in _ACTIVITY_BY_TOOL:
+        return _ACTIVITY_BY_TOOL[call.name]
+    if tool is not None and tool.source == "agent":
+        who = re.sub(r"^the\s+", "", tool.label or call.name.replace("_", " "))
+        return f"Delegating to {who}"
+    match = _MCP_NAME.match(call.name)
+    if match:
+        server, name = match.groups()
+        return _ACTIVITY_BY_SERVER.get(server) or f"Using {name.replace('_', ' ')} on {server.replace('_', ' ')}"
+    try:
+        label = tool.spoken_label(call.args) if tool is not None else ""
+    except Exception:  # noqa: BLE001 - a label template the model's arguments do not fit
+        label = ""
+    label = label or call.name.replace("_", " ")
+    return f"Working on the {label}"[:120]
+
+
+# =====================================================================
 # The supervisor
 # =====================================================================
 
@@ -3368,17 +3700,17 @@ class LLMBrain:
         # Excel files (agents/analytics_agent.py): delegate_to_analytics while pandas and openpyxl are there.
         self._analytics: Any = self._start_analytics()
         self._analytics_spec: Optional[ToolSpec] = None
-        # The Markdown lines for what was made during the current web request - a picture,
-        # a presentation's or a spreadsheet's download link (see _with_artifacts).
-        self._artifacts_this_turn: list[str] = []
-        # When the question being answered arrived (time.monotonic()): a deck made in Canva
-        # gets what is left of the web chat's wait (_publish).
-        self._turn_started = time.monotonic()
+        # What was made during a question, what went to the background and when it arrived
+        # live on its run (TurnRun), not here: a stopped run's worker thread can still be
+        # finishing while the next question is answered.
+
+        # One task at a time per specialist agent: it keeps per-task state (agents/base.py),
+        # and a task a stopped run abandoned finishes its step before the next one starts.
+        self._agent_locks: dict[str, threading.Lock] = {}
 
         # Feature 2 bookkeeping: what went to the background, so the same
         # side effect cannot be fired twice (see _execute).
         self._recent_dispatches: dict[str, float] = {}
-        self._dispatched_this_turn: list[str] = []
 
         # Anthropic first, Gemini as the alternative. Both are built so a
         # runtime failover has somewhere to go without a reconnect.
@@ -3618,14 +3950,23 @@ class LLMBrain:
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
         shown = task[:160].encode(encoding, errors="backslashreplace").decode(encoding)
         print(f"[Brain] Delegating to the {agent.title}: {shown}")
+        lock = self._agent_locks.setdefault(agent.name, threading.Lock())
+        # A task a stopped run left behind ends at its next step (it checks the cancel
+        # event); this waits for that, and gives up as soon as THIS run is stopped too.
+        while not lock.acquire(timeout=0.25):
+            request_context.check_cancelled()
         try:
             report = agent.run(task, tools, lambda call: self._execute(call, tools))
+            # Read while this task still holds the agent: the next task starts with a clean list.
+            done = agent.actions_note()
         except Exception as exc:
             if not agent.actions:
                 raise
             raise RuntimeError(
                 f"{type(exc).__name__}: {exc}\nWHAT ITS TOOLS DID BEFORE THAT:\n{agent.actions_note()}"
             ) from exc
+        finally:
+            lock.release()
         if agent.json_output and report.startswith("{") and '"status": "draft"' in report:
             header = (
                 f"DRAFT FROM YOUR {agent.title.upper()} (JSON). It is a draft, not saved anywhere: nothing "
@@ -3633,7 +3974,6 @@ class LLMBrain:
             )
         else:
             header = f"REPORT FROM YOUR {agent.title.upper()} (for you, not the user - answer the user yourself):"
-        done = agent.actions_note()
         footer = f"\nWHAT ITS TOOLS DID (from the tools themselves, not the agent's words):\n{done}" if done else ""
         return f"{header}\n{report}{footer}"
 
@@ -3708,12 +4048,13 @@ class LLMBrain:
 
         from agents.creative_agent import markdown_image  # the agents package imports this module
 
+        made = _current_run().artifacts
         lines = []
         for line in result.splitlines():
             if line.startswith("Path: "):
                 image = markdown_image(line[len("Path: "):].strip())
-                if image not in self._artifacts_this_turn:
-                    self._artifacts_this_turn.append(image)
+                if image not in made:
+                    made.append(image)
                 line = f"Image: {image}"
             lines.append(line)
         return "\n".join(lines)
@@ -3726,7 +4067,7 @@ class LLMBrain:
         was made and paid for, or a deck that was built, is never lost to a reply that only
         talked about it.
         """
-        for line in self._artifacts_this_turn:
+        for line in _current_run().artifacts:
             address = line[line.index("](") :]  # "](/artifacts/image_....png)"
             if address not in reply:
                 reply = f"{reply.rstrip()}\n\n{line}"
@@ -3810,7 +4151,7 @@ class LLMBrain:
         web = caller is not None and caller.is_web
         time_left = None
         if web:
-            time_left = WEB_CHAT_SECONDS - (time.monotonic() - self._turn_started) - PUBLISHING_REPLY_SECONDS
+            time_left = WEB_CHAT_SECONDS - (time.monotonic() - _current_run().started) - PUBLISHING_REPLY_SECONDS
         later = f", {time_left:.0f} s left for it" if time_left is not None else ""
         print(f"[Brain] Delegating to the Head of Publishing: {size:,} characters of slides{later}.")
         result = self._publishing.build_presentation(presentation_data, time_left=time_left)
@@ -3829,14 +4170,15 @@ class LLMBrain:
         """
         if not result.startswith("SUCCESS"):
             return result
+        made = _current_run().artifacts
         lines = []
         for line in result.splitlines():
             if line.startswith("URL: "):
                 continue
             if line.startswith("Path: ") and web:
                 link = link_for(line[len("Path: "):].strip())
-                if link not in self._artifacts_this_turn:
-                    self._artifacts_this_turn.append(link)
+                if link not in made:
+                    made.append(link)
                 line = f"Download: {link}"
             lines.append(line)
         return "\n".join(lines)
@@ -4096,7 +4438,12 @@ class LLMBrain:
         there and nowhere else, so an agent can never reach the manager's tools
         (LINE, webhooks, delegation). The confirmation gate and the logging are the
         same for both.
+
+        The one thing it does raise: request_context.Cancelled, before anything runs,
+        when the run this call belongs to was stopped - a stopped run starts no tool
+        (and sends nothing to the background) after the person pressed Stop.
         """
+        request_context.check_cancelled()
         if tools is not None:
             tool = next((t for t in tools if t.name == call.name), None)
         else:
@@ -4164,7 +4511,7 @@ class LLMBrain:
             task_dispatcher.dispatcher().submit(
                 tool.handler, name=tool.name, label=label, **call.args
             )
-            self._dispatched_this_turn.append(label)
+            _current_run().dispatched.append(label)
             return ToolResult(
                 call=call,
                 content=(
@@ -4331,7 +4678,7 @@ class LLMBrain:
             return "answer to Jarvis's own question"
         return ""
 
-    def _front_door(self, user_text: str, intent: str) -> Optional[str]:
+    async def _front_door(self, run: "TurnRun", intent: str) -> Optional[str]:
         """
         Lets the cheap tier answer greetings and general conversation.
 
@@ -4345,6 +4692,7 @@ class LLMBrain:
         if not self._front_door_enabled:
             return None
 
+        user_text = run.user_text
         skip = self._front_door_skip_reason(user_text, intent)
         if skip:
             print(f"[Brain] Front door skipped ({skip}).")
@@ -4358,8 +4706,8 @@ class LLMBrain:
         model, effort = self._route(INTENT_SIMPLE)
 
         try:
-            turn = self._call_provider(
-                working, tools=[], model=model, effort=effort, system=self._front_door_prompt()
+            turn = await self._call_model(
+                run, working, tools=[], model=model, effort=effort, system=self._front_door_prompt()
             )
         except ProviderError as exc:
             # No speaking the error here: the supervisor is about to make
@@ -4397,170 +4745,373 @@ class LLMBrain:
         print(f"[Brain] Front door: answered directly ({model or self._provider.model}).")
         return reply
 
+    # -- the state machine (one question's run) ---------------------------
+
     def ask(self, user_text: str) -> str:
         """
         Answers `user_text`, calling tools as needed, and returns one
         plain-text reply ready for the voice engine.
 
-        Never raises: every error becomes a short spoken sentence.
+        The same state machine as run(), driven on this thread with no event
+        loop (events()): every model call and tool runs here, one after the
+        other, exactly as this method always ran them. Never raises: every
+        error becomes a short spoken sentence.
         """
+        reply = ""
+        for event in self.events(user_text):
+            if event["type"] == "final":
+                reply = event["message"]
+        return reply
+
+    def events(self, user_text: str) -> Iterator[dict[str, Any]]:
+        """
+        The run's events (see run()) as a plain iterator, for a caller without an
+        event loop - the voice assistant, through ask(). Blocking: each node's model
+        call and tools run on this thread as the iterator is advanced. Cannot be
+        cancelled; nothing waits on an event loop (_drive_inline checks that).
+        """
+        run = TurnRun(user_text=user_text, inline=True)
+        yield from _drive_inline(self._machine(run))
+
+    async def run(
+        self,
+        user_text: str,
+        cancel: Optional[threading.Event] = None,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """
+        Answers `user_text` on the running event loop (api_server.py), yielding
+        the state machine's events as they happen:
+
+            {"type": "progress", "node": "Delegate_to_Agent",
+             "status": "Delegating to Head of Analytics..."}     as each step starts
+            {"type": "final", "node": "Final_Response", "status": "Done",
+             "message": "<the reply>"}                           once, last
+
+        Model calls are awaited on the providers' async clients, and tools run on
+        worker threads (asyncio.to_thread), so the loop stays free and the run can
+        be stopped at any point: cancel the task that iterates this generator (a
+        web request that went away), or set `cancel`. Either way the node that is
+        running is abandoned at once - a model request in flight is closed - the
+        work on worker threads sees the cancel event at its next step
+        (request_context.check_cancelled) and stops, and the run ends without
+        adding anything to the history. A run stopped through `cancel` alone ends
+        with {"type": "cancelled"}.
+
+        `progress` hears the finer steps worker threads report while a node runs
+        ("Head of Research: Searching the web..."): thread-safe, and called from
+        any thread. Never raises for a provider or tool failure: like ask(), those
+        become the final message.
+        """
+        state = TurnRun(user_text=user_text, inline=False, cancel=cancel or threading.Event(), progress=progress)
+        async for event in self._machine(state):
+            yield event
+
+    async def _machine(self, run: "TurnRun") -> AsyncIterator[dict[str, Any]]:
+        """
+        Walks one question through the nodes (see THE STATE MACHINE at the top):
+
+            Analyze_Intent -> Plan -> Delegate_to_Agent | Use_Tools -> Plan -> ...
+                           -> Review_Artifact -> Final_Response
+
+        Each node is an async generator that yields its events and names the next
+        node in run.next; the cancel event is checked between nodes. Whatever ends
+        the walk early - a stop, or the task being cancelled - leaves the history as
+        it was: only Final_Response writes to it.
+        """
+        nodes: dict[str, Callable[[TurnRun], AsyncIterator[dict[str, Any]]]] = {
+            Node.ANALYZE_INTENT: self._analyze_intent,
+            Node.PLAN: self._plan,
+            Node.DELEGATE_TO_AGENT: self._act,
+            Node.USE_TOOLS: self._act,
+            Node.REVIEW_ARTIFACT: self._review_artifact,
+            Node.FINAL_RESPONSE: self._final_response,
+        }
+        token = _CURRENT_RUN.set(run)
+        node = Node.ANALYZE_INTENT
+        try:
+            with request_context.run_scope(run.cancel, run.progress):
+                while node != Node.DONE:
+                    if run.cancel.is_set():
+                        raise request_context.Cancelled()
+                    run.node = node
+                    run.trail.append(node)
+                    async for event in nodes[node](run):
+                        yield event
+                    node = run.next
+        except request_context.Cancelled:
+            self._stopped(run)
+            yield {"type": "cancelled", "node": run.node, "status": "Stopped"}
+        except (asyncio.CancelledError, GeneratorExit):
+            # The task was cancelled (api_server: the person went away) or the caller stopped
+            # iterating. Tell the worker threads before the cancellation goes on up.
+            self._stopped(run)
+            raise
+        finally:
+            try:
+                _CURRENT_RUN.reset(token)
+            except ValueError:  # closed from another context (a generator finalised late): nothing to restore there
+                pass
+
+    def _stopped(self, run: "TurnRun") -> None:
+        """A run that will not finish: its worker threads stop at their next step."""
+        if run.finished:  # the reply is out; the caller just did not read on to the end
+            return
+        run.cancel.set()
+        print(f"[Brain] Run stopped at {run.node} after {time.monotonic() - run.started:.1f} s; nothing is kept.")
+
+    @staticmethod
+    def _progress(run: "TurnRun", status: str) -> dict[str, Any]:
+        return {"type": "progress", "node": run.node, "status": status}
+
+    @staticmethod
+    def _answer(run: "TurnRun", text: str, remember: bool = False, remembered: str = "") -> None:
+        """Ends the walk with `text` as the reply (Final_Response next); `remember` keeps the exchange in the history."""
+        run.reply = text
+        run.remember = remember
+        run.remembered = remembered or text
+        run.next = Node.FINAL_RESPONSE
+
+    async def _blocking(self, run: "TurnRun", fn: Callable[..., Any], *args: Any) -> Any:
+        """
+        Runs plain blocking code from a node: on this thread for an inline run (the
+        voice assistant, where tools always ran on the caller's thread), on a worker
+        thread for an async one. The worker gets a copy of the run's context (who is
+        asking, the run, its cancel event), and cancelling the awaiting task stops the
+        waiting at once; the thread itself stops at its next cancellation check.
+        """
+        if run.inline:
+            return fn(*args)
+        return await asyncio.to_thread(fn, *args)
+
+    async def _analyze_intent(self, run: "TurnRun") -> AsyncIterator[dict[str, Any]]:
+        """
+        Analyze_Intent: is there a question, may a model be asked, which tools are
+        there, which tier answers (Feature 3) - and can the cheap front door answer it
+        on its own (Feature 6)? Next: Final_Response for anything settled here, else Plan.
+        """
+        user_text = run.user_text
         if not user_text or not user_text.strip():
-            return "I didn't catch a question."
-        self._turn_started = time.monotonic()
+            self._answer(run, "I didn't catch a question.")
+            return
+        yield self._progress(run, "Analyzing your request...")
 
         # Checked before any routing or provider work happens at all -
         # see llm_budget's module docstring: a no-op unless
         # JARVIS_DAILY_TOKEN_BUDGET is explicitly configured.
         if llm_budget.is_budget_exceeded():
             print("[Brain] Daily LLM token budget reached - not calling a provider.")
-            return (
+            self._answer(
+                run,
                 "I've hit today's language-model budget, so I can't answer that "
                 "right now. It resets tomorrow, or raise JARVIS_DAILY_TOKEN_BUDGET "
-                "in the .env file."
+                "in the .env file.",
             )
+            return
 
         if not self.available:
-            return (
+            self._answer(
+                run,
                 "My language model isn't configured. Add an Anthropic or Gemini "
-                "API key to the .env file and restart me. The console has the steps."
+                "API key to the .env file and restart me. The console has the steps.",
             )
+            return
 
         # A temporary failover (no credit, rate limited) that has run its time:
         # this question goes to Anthropic again.
         self._maybe_fail_back()
 
         # Feature 5: pick up any tool written during the previous turn.
-        self._refresh_plugins()
-        self._refresh_mcp()
-        tools = self._active_tools()
+        await self._blocking(run, self._refresh_tools)
+        run.tools = self._active_tools()
 
         # Feature 3: route this question by intent, BEFORE the turn is
         # sent. Decided once per question and held for all of its tool
         # round trips, so a heavy request does not silently drop back to
         # a cheaper model halfway through answering itself.
-        self._dispatched_this_turn = []
-        self._artifacts_this_turn = []
-
-        intent, why = _classify_intent(_routing_text(user_text))
-        model, effort = self._route(intent)
+        routed = _routing_text(user_text)
+        intent, why = _classify_intent(routed)
+        run.model, run.effort = self._route(intent)
         print(
             f"[Brain] Routing: {intent.upper()} ({why}) "
-            f"-> {model or self._provider.model}, effort {effort}."
+            f"-> {run.model or self._provider.model}, effort {run.effort}."
         )
         # A deck's slides, or a spreadsheet's rows, are written into one tool call: room for
         # all of them (LONG_OUTPUT_MAX_TOKENS). Every other question keeps the spoken-answer limit.
-        max_tokens: Optional[int] = None
-        routed = _routing_text(user_text)
-        if (any(tool.name == DELEGATE_PUBLISHING for tool in tools) and _asks_for_presentation(routed)) or (
-            any(tool.name == DELEGATE_ANALYTICS for tool in tools) and _asks_for_spreadsheet(routed)
+        if (any(tool.name == DELEGATE_PUBLISHING for tool in run.tools) and _asks_for_presentation(routed)) or (
+            any(tool.name == DELEGATE_ANALYTICS for tool in run.tools) and _asks_for_spreadsheet(routed)
         ):
-            max_tokens = LONG_OUTPUT_MAX_TOKENS
+            run.max_tokens = LONG_OUTPUT_MAX_TOKENS
 
         # Feature 6: greetings and general conversation stop here, answered
-        # by the cheap tier without the tool list. Anything else falls
-        # through to the loop below on the model chosen above.
-        spoken = self._front_door(user_text, intent)
+        # by the cheap tier without the tool list. Anything else goes on to
+        # Plan on the model chosen above.
+        spoken = await self._front_door(run, intent)
         if spoken is not None:
-            self._history.append(Turn(kind="user", text=user_text.strip()))
-            self._history.append(Turn(kind="assistant", text=spoken))
-            self._trim_history()
-            return spoken
+            self._answer(run, spoken, remember=True)
+            return
 
         # A working copy: only the question and the final answer are kept
         # in history. The tool round trips are scaffolding for this one
         # answer and would otherwise dominate the context window.
-        working: list[Turn] = list(self._history)
-        working.append(Turn(kind="user", text=user_text.strip()))
-
+        run.working = list(self._history) + [Turn(kind="user", text=user_text.strip())]
         # What this reply may quote a trip link or id from: what the user just
         # typed, plus whatever the tools return below. Never the earlier
         # conversation - that is where a stale link comes from (link_guard.py).
-        evidence: list[str] = [user_text]
-        corrected = False
+        run.evidence = [user_text]
+        run.next = Node.PLAN
 
-        for step in range(1, self._max_steps + 1):
-            try:
-                turn = self._call_provider(working, tools, model, effort, max_tokens=max_tokens)
-            except ProviderError as exc:
-                return exc.spoken
+    def _refresh_tools(self) -> None:
+        """This turn's plugins and MCP tools (Feature 5; mcp_client's snapshot)."""
+        self._refresh_plugins()
+        self._refresh_mcp()
 
-            if turn.kind == "assistant":
-                reply = turn.text.strip()
-                if not reply:
-                    return "I didn't get an answer back. Try asking again."
-
-                # A trip link or id that no tool returned during this request
-                # is a guess, however sure of itself. The model gets one
-                # chance to fix it (usually by calling the tool it skipped);
-                # after that the user gets the honest sentence, never the
-                # link. The bad reply is not kept in the transcript either way.
-                unverified = link_guard.unverified_trip_references(reply, "\n".join(evidence))
-                if unverified:
-                    print(
-                        f"[Brain] Reply held {len(unverified)} trip link/id no tool returned "
-                        f"this request: {ascii(', '.join(unverified[:3]))}"
-                    )
-                    if not corrected and step < self._max_steps:
-                        corrected = True
-                        working.append(turn)
-                        working.append(
-                            Turn(
-                                kind="user",
-                                text=LINK_CORRECTION.format(references=", ".join(unverified[:3])),
-                            )
-                        )
-                        continue
-                    reply = LINK_FALLBACK
-
-                # Web chat: what was made for this request is in the reply, as the Markdown
-                # lines the page draws - a picture, a download link (_create_image, _publish).
-                reply = self._with_artifacts(reply)
-
-                # The transcript keeps the question and the answer, not
-                # the tool scaffolding - so a backgrounded action would
-                # be invisible next turn, and "on it" reads like nothing
-                # happened. Record it for the model only; the user hears
-                # `reply` unchanged.
-                remembered = reply
-                if self._dispatched_this_turn:
-                    remembered += (
-                        " [Already dispatched in the background: "
-                        + ", ".join(self._dispatched_this_turn)
-                        + ". Do not trigger these again.]"
-                    )
-
-                # Widgets a tool asked for during THIS request travel with the reply as one
-                # JSON string (rich_reply.py) - after the link guard above, so it only ever
-                # checks the sentence. The model remembers the sentence and a note, not the JSON.
-                widgets = request_context.take_widgets()
-                if widgets:
-                    names = ", ".join(w["tool"].replace("_", " ") for w in widgets)
-                    remembered += f" [A {names} widget was shown to the user.]"
-                    reply = rich_reply.wrap_reply(reply, widgets)
-
-                self._history.append(Turn(kind="user", text=user_text.strip()))
-                self._history.append(Turn(kind="assistant", text=remembered))
-                self._trim_history()
-                return reply
-
-            # turn.kind == "tool_calls"
-            print(
-                f"[Brain] Step {step}/{self._max_steps}: "
-                f"{len(turn.calls)} tool call(s) requested."
+    async def _plan(self, run: "TurnRun") -> AsyncIterator[dict[str, Any]]:
+        """
+        Plan: the manager's model reads the conversation and the results so far and
+        either answers (Review_Artifact next) or asks for tools (Delegate_to_Agent when
+        any call hands work to a specialist, else Use_Tools). At most max_steps calls.
+        """
+        if run.step >= self._max_steps:
+            print(f"[Brain] Supervisor hit the {self._max_steps}-step ceiling.")
+            self._answer(
+                run,
+                "I went back and forth on that too many times without landing on an "
+                "answer. Try asking it a different way.",
             )
-            working.append(turn)
-            results = [self._execute(c) for c in turn.calls]
-            evidence.extend(result.content for result in results)
-            working.append(Turn(kind="tool_results", results=results))
+            return
+        run.step += 1
+        if run.step == 1:
+            status = "Thinking..."
+        elif run.working and run.working[-1].kind == "user":  # the link guard's correction (Review_Artifact)
+            status = "Double-checking the answer..."
+        else:
+            status = "Reviewing the results..."
+        yield self._progress(run, status)
 
-        print(f"[Brain] Supervisor hit the {self._max_steps}-step ceiling.")
-        return (
-            "I went back and forth on that too many times without landing on an "
-            "answer. Try asking it a different way."
-        )
+        try:
+            turn = await self._call_model(run, run.working, run.tools, run.model, run.effort, max_tokens=run.max_tokens)
+        except ProviderError as exc:
+            self._answer(run, exc.spoken)
+            return
 
-    def _call_provider(
+        run.turn = turn
+        if turn.kind == "assistant":
+            run.next = Node.REVIEW_ARTIFACT
+            return
+        print(f"[Brain] Step {run.step}/{self._max_steps}: {len(turn.calls)} tool call(s) requested.")
+        delegated = any(_is_delegation(self._tool_for(call, run.tools), call) for call in turn.calls)
+        run.next = Node.DELEGATE_TO_AGENT if delegated else Node.USE_TOOLS
+
+    def _tool_for(self, call: ToolCall, tools: list[ToolSpec]) -> Optional[ToolSpec]:
+        return next((tool for tool in tools if tool.name == call.name), None) or TOOLS_BY_NAME.get(call.name)
+
+    async def _act(self, run: "TurnRun") -> AsyncIterator[dict[str, Any]]:
+        """
+        Delegate_to_Agent / Use_Tools: runs the calls the model asked for, one after
+        the other, each announced first ("Delegating to Head of Analytics...",
+        "Searching the web..."). The specialist agents (Research, Data, Productivity),
+        the Heads of Creative, Publishing and Analytics and every other tool are all
+        reached the same way, through _execute. Next: Plan, with the results.
+        """
+        turn = run.turn
+        assert turn is not None
+        run.working.append(turn)
+        results: list[ToolResult] = []
+        for call in turn.calls:
+            request_context.check_cancelled()
+            yield self._progress(run, tool_activity(self._tool_for(call, run.tools), call) + "...")
+            results.append(await self._blocking(run, self._execute, call))
+        run.evidence.extend(result.content for result in results)
+        run.working.append(Turn(kind="tool_results", results=results))
+        run.next = Node.PLAN
+
+    async def _review_artifact(self, run: "TurnRun") -> AsyncIterator[dict[str, Any]]:
+        """
+        Review_Artifact: checks the model's answer before anyone sees it - a trip link
+        no tool returned (link guard: one correction through Plan, then the honest
+        sentence), what was made during this run (a picture, a deck, a spreadsheet: its
+        Markdown line is sure to be in the reply), what went to the background, and the
+        widgets a tool asked for. Next: Final_Response.
+        """
+        turn = run.turn
+        assert turn is not None
+        yield self._progress(run, "Reviewing the answer...")
+        reply = turn.text.strip()
+        if not reply:
+            self._answer(run, "I didn't get an answer back. Try asking again.")
+            return
+
+        # A trip link or id that no tool returned during this request
+        # is a guess, however sure of itself. The model gets one
+        # chance to fix it (usually by calling the tool it skipped);
+        # after that the user gets the honest sentence, never the
+        # link. The bad reply is not kept in the transcript either way.
+        unverified = link_guard.unverified_trip_references(reply, "\n".join(run.evidence))
+        if unverified:
+            print(
+                f"[Brain] Reply held {len(unverified)} trip link/id no tool returned "
+                f"this request: {ascii(', '.join(unverified[:3]))}"
+            )
+            if not run.corrected and run.step < self._max_steps:
+                run.corrected = True
+                run.working.append(turn)
+                run.working.append(
+                    Turn(kind="user", text=LINK_CORRECTION.format(references=", ".join(unverified[:3])))
+                )
+                run.next = Node.PLAN
+                return
+            reply = LINK_FALLBACK
+
+        # Web chat: what was made for this request is in the reply, as the Markdown
+        # lines the page draws - a picture, a download link (_create_image, _publish).
+        reply = self._with_artifacts(reply)
+
+        # The transcript keeps the question and the answer, not
+        # the tool scaffolding - so a backgrounded action would
+        # be invisible next turn, and "on it" reads like nothing
+        # happened. Record it for the model only; the user hears
+        # `reply` unchanged.
+        remembered = reply
+        if run.dispatched:
+            remembered += (
+                " [Already dispatched in the background: "
+                + ", ".join(run.dispatched)
+                + ". Do not trigger these again.]"
+            )
+
+        # Widgets a tool asked for during THIS request travel with the reply as one
+        # JSON string (rich_reply.py) - after the link guard above, so it only ever
+        # checks the sentence. The model remembers the sentence and a note, not the JSON.
+        widgets = request_context.take_widgets()
+        if widgets:
+            names = ", ".join(w["tool"].replace("_", " ") for w in widgets)
+            remembered += f" [A {names} widget was shown to the user.]"
+            reply = rich_reply.wrap_reply(reply, widgets)
+
+        self._answer(run, reply, remember=True, remembered=remembered)
+
+    async def _final_response(self, run: "TurnRun") -> AsyncIterator[dict[str, Any]]:
+        """Final_Response: the exchange goes into the history (when it should) and the reply out."""
+        if run.remember:
+            self._history.append(Turn(kind="user", text=run.user_text.strip()))
+            self._history.append(Turn(kind="assistant", text=run.remembered or run.reply))
+            self._trim_history()
+        run.next = Node.DONE
+        run.finished = True
+        print(f"[Brain] Done in {time.monotonic() - run.started:.1f} s ({' -> '.join(run.trail)}).")
+        yield {"type": "final", "node": Node.FINAL_RESPONSE, "status": "Done", "message": run.reply}
+
+    async def _send(self, run: "TurnRun", *args: Any, **extra: Any) -> Turn:
+        """One request to the active provider: complete() inline, acomplete() on the event loop."""
+        assert self._provider is not None
+        if run.inline:
+            return self._provider.complete(*args, **extra)
+        return await self._provider.acomplete(*args, **extra)
+
+    async def _call_model(
         self,
+        run: "TurnRun",
         working: list[Turn],
         tools: Optional[list[ToolSpec]] = None,
         model: Optional[str] = None,
@@ -4611,7 +5162,7 @@ class LLMBrain:
         else:
             prompt = system
 
-        def once(limit: Optional[int]) -> Turn:
+        async def once(limit: Optional[int]) -> Turn:
             assert self._provider is not None
             # The model was chosen when the question was routed (_route), maybe on the
             # other provider - a failover earlier in this same question. A name meant
@@ -4623,18 +5174,19 @@ class LLMBrain:
             # Only a raised limit is passed: every other call is made exactly as before.
             extra: dict[str, Any] = {"max_tokens": limit} if limit else {}
             try:
-                return self._provider.complete(prompt, working, tools, chosen, effort, context, **extra)
+                return await self._send(run, prompt, working, tools, chosen, effort, context, **extra)
             except ProviderError as exc:
                 if not exc.standby_can_help:
                     raise
                 print(f"[Brain] {self._provider.name} cannot answer ({exc.kind}): {exc.spoken}")
                 if not self._failover(exc.kind):
                     raise
+                request_context.report_progress("Switching to my standby model...")
                 # The standby provider names its models differently, so the
                 # override is dropped rather than sent somewhere it means nothing.
-                return self._provider.complete(prompt, working, tools, None, effort, context, **extra)
+                return await self._send(run, prompt, working, tools, None, effort, context, **extra)
 
-        turn = once(max_tokens)
+        turn = await once(max_tokens)
         # A tool call the output limit cut off - a deck's slides written past MAX_TOKENS -
         # is half a call (Gemini sends nothing at all then). It is never run: the same call
         # is made once more with room for all of it, and if even that is cut off, the
@@ -4645,7 +5197,7 @@ class LLMBrain:
                     f"[Brain] The answer was cut off at the output limit mid tool call; asking again "
                     f"with room for {LONG_OUTPUT_MAX_TOKENS} tokens."
                 )
-                turn = once(LONG_OUTPUT_MAX_TOKENS)
+                turn = await once(LONG_OUTPUT_MAX_TOKENS)
             if turn.cut_off and (turn.kind == "tool_calls" or not turn.text):
                 print("[Brain] Still cut off at the output limit; the half-written tool call is not run.")
                 return Turn(kind="assistant", text=CUT_OFF_REPLY)
