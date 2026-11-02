@@ -53,9 +53,11 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
     GET  /artifacts/<file> -> the file itself: what Jarvis made and saved in artifacts/ - the
                  images from agents/creative_agent.py (image_YYYYMMDD_HHMMSS.png) and the
                  presentations from agents/publishing_agent.py (presentation_YYYYMMDD_HHMMSS.pptx,
-                 or .pdf when Canva sends PDFs).
+                 or .pdf when Canva sends PDFs) and the spreadsheets from agents/analytics_agent.py
+                 (spreadsheet_YYYYMMDD_HHMMSS.xlsx).
                  A web chat reply shows a picture as ![Generated Image](/artifacts/<file>) and
-                 offers a presentation as [Download Presentation](/artifacts/<file>); the web app
+                 offers a presentation as [Download Presentation](/artifacts/<file>) (a spreadsheet
+                 as [Download Spreadsheet](/artifacts/<file>)); the web app
                  answers that address for the browser by fetching it from here
                  (TripPlanner_Web/app/artifacts/[name]/route.ts), for the signed-in person
                  whose chat it is in. 404 for a file that is not there.
@@ -116,6 +118,7 @@ import reply_audio
 import request_context
 import rich_reply
 import stt
+from agents.analytics_agent import XLSX_MIME
 from agents.creative_agent import ARTIFACTS_DIR, ARTIFACTS_URL_PATH
 from agents.publishing_agent import PPTX_MIME
 from llm_brain import LLMBrain
@@ -219,7 +222,7 @@ app.add_middleware(
 )
 
 # GET /artifacts/<file>: the folder Jarvis saves what it makes in (agents/creative_agent.py,
-# agents/publishing_agent.py). StaticFiles keeps requests inside it (no ../), and answers 404
+# agents/publishing_agent.py, agents/analytics_agent.py). StaticFiles keeps requests inside it (no ../), and answers 404
 # for anything missing. The folder is made here when it is not there yet - a fresh clone has
 # it, a Docker volume may not - and a folder that cannot be made only costs the files, never
 # the server's start.
@@ -227,10 +230,12 @@ try:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 except OSError as exc:
     print(f"[API] The artifacts folder {ARTIFACTS_DIR} could not be made ({exc}); its files will not be served.")
-# StaticFiles names a file's type from Python's mimetypes table, which knows .pptx only where
-# the system does (Windows' registry): the Linux image would send presentations as
-# application/octet-stream, and the web app refuses a file whose type is not the one its name says.
+# StaticFiles names a file's type from Python's mimetypes table, which knows .pptx and .xlsx
+# only where the system does (Windows' registry): the Linux image would send presentations and
+# spreadsheets as application/octet-stream, and the web app refuses a file whose type is not the
+# one its name says. With the right type the browser saves the file instead of failing on it.
 mimetypes.add_type(PPTX_MIME, ".pptx")
+mimetypes.add_type(XLSX_MIME, ".xlsx")
 app.mount(ARTIFACTS_URL_PATH, StaticFiles(directory=ARTIFACTS_DIR, check_dir=False), name="artifacts")
 
 _brain: LLMBrain | None = None

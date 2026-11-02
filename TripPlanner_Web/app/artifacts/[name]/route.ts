@@ -24,8 +24,9 @@ function notFound() {
 /**
  * GET /artifacts/<name> - a file Jarvis made, for the chat reply that shows it
  * (lib/jarvis/artifacts.ts): a picture for its <img>
- * (`![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)`), or a presentation for its
- * download link (`[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)`, or .pdf).
+ * (`![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)`), or a presentation or a
+ * spreadsheet for its download link (`[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)`,
+ * or .pdf; `[Download Spreadsheet](/artifacts/spreadsheet_YYYYMMDD_HHMMSS.xlsx)`).
  *
  * The file lives in the Jarvis project's artifacts/ folder, next to the brain, and the
  * browser never talks to the brain: this route fetches it from the brain's own

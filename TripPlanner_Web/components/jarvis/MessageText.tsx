@@ -14,7 +14,8 @@ import { ArtifactImage } from "./ArtifactImage";
  *   - the two Markdown forms Jarvis writes for what it made (lib/jarvis/artifacts.ts: a
  *     same-origin address and a name Jarvis gives, nothing else):
  *     `![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)` becomes that image, and
- *     `[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)` a download.
+ *     `[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)` (or a
+ *     spreadsheet's `[Download Spreadsheet](/artifacts/spreadsheet_YYYYMMDD_HHMMSS.xlsx)`) a download.
  */
 const LINK_PATTERN = /https?:\/\/[^\s<>"'`]+/g;
 // Sentence punctuation stuck to the end of an address belongs to the sentence.

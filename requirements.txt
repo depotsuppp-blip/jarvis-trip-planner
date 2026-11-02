@@ -286,6 +286,17 @@ beautifulsoup4>=4.12
 # and what checks the files Canva sends back.
 python-pptx>=1.0.0
 
+# --- Spreadsheets (agents/analytics_agent.py) ---------------------------
+# The Head of Analytics turns the table the brain writes (delegate_to_analytics)
+# into an Excel file (.xlsx) in artifacts/: a pandas DataFrame written by the
+# openpyxl engine, which also opens the file again to check it. pandas runs on
+# the numpy declared above (2.2.2 is the first release built for numpy 2);
+# openpyxl 3.1 is the version pandas asks for. No key, no service, nothing
+# billed. Without them the brain simply offers no spreadsheet tool and
+# everything else runs.
+pandas>=2.2.2
+openpyxl>=3.1.0
+
 # --- Canva in a browser (agents/canva_browser.py, utils/canva_auth.py) ---
 # Playwright drives canva.com for the Head of Publishing in Jarvis's own Chrome
 # profile (.data/canva_profile), signed in by hand once: python -m utils.canva_auth.

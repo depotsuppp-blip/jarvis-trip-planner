@@ -8,6 +8,8 @@
  *   - presentations (agents/publishing_agent.py): presentation_YYYYMMDD_HHMMSS.pptx (.pdf when
  *     the brain downloads them from Canva as PDFs), offered as one Markdown link:
  *       [Download Presentation](/artifacts/presentation_20261101_103000.pptx)
+ *   - spreadsheets (agents/analytics_agent.py): spreadsheet_YYYYMMDD_HHMMSS.xlsx, offered the same way:
+ *       [Download Spreadsheet](/artifacts/spreadsheet_20261102_093000.xlsx)
  *
  * Those exact forms - a same-origin /artifacts/ address and one of those names - are the only
  * Markdown a reply can hold (MessageText): an image line draws the picture, any other link to
@@ -22,7 +24,8 @@ export const ARTIFACTS_PATH = "/artifacts";
 
 const STAMP = String.raw`\d{8}_\d{6}(?:_\d{1,2})?`;
 const IMAGE_NAME = String.raw`image_${STAMP}\.(?:png|jpe?g|webp)`;
-const FILE_NAME = String.raw`presentation_${STAMP}\.(?:pptx|pdf)`;
+const FILE_NAME = String.raw`(?:presentation_${STAMP}\.(?:pptx|pdf)|spreadsheet_${STAMP}\.xlsx)`;
+const SPREADSHEET_NAME_RE = new RegExp(String.raw`^spreadsheet_${STAMP}\.xlsx$`);
 
 /** A file name Jarvis gives what it makes - nothing else is ever asked of the brain. */
 export const ARTIFACT_NAME_RE = new RegExp(`^(?:${IMAGE_NAME}|${FILE_NAME})$`);
@@ -45,6 +48,7 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   jpeg: "image/jpeg",
   webp: "image/webp",
   pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   pdf: "application/pdf",
 };
 
@@ -57,6 +61,11 @@ export function artifactMime(name: string): string | null {
 /** True for a picture, which the page can show; anything else Jarvis made is a download. */
 export function isArtifactImage(name: string): boolean {
   return IMAGE_NAME_RE.test(name);
+}
+
+/** True for an Excel spreadsheet (the download card's icon). */
+export function isArtifactSpreadsheet(name: string): boolean {
+  return SPREADSHEET_NAME_RE.test(name);
 }
 
 export type ReplyPart =

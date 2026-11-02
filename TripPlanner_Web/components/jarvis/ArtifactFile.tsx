@@ -1,10 +1,10 @@
-import { Download, ImageIcon, Presentation } from "lucide-react";
-import { artifactPath, isArtifactImage } from "@/lib/jarvis/artifacts";
+import { Download, FileSpreadsheet, ImageIcon, Presentation } from "lucide-react";
+import { artifactPath, isArtifactImage, isArtifactSpreadsheet } from "@/lib/jarvis/artifacts";
 import { focusRing } from "./styles";
 
 /**
- * A file Jarvis made, offered for download inside a reply: a PowerPoint presentation (or a
- * picture, when a reply links one instead of showing it). One ruled chip in the family of
+ * A file Jarvis made, offered for download inside a reply: a PowerPoint presentation, an Excel
+ * spreadsheet (or a picture, when a reply links one instead of showing it). One ruled chip in the family of
  * the person's own attachments (AttachmentChip): what it is, the file's name, a download mark.
  *
  * A plain link with `download`: this app's GET /artifacts/<name> hands the file only to the
@@ -15,7 +15,7 @@ import { focusRing } from "./styles";
  * Rendered inside the reply's <p>, so everything here is phrasing content (a, span, svg).
  */
 export function ArtifactFile({ name, label }: { name: string; label: string }) {
-  const Icon = isArtifactImage(name) ? ImageIcon : Presentation;
+  const Icon = isArtifactImage(name) ? ImageIcon : isArtifactSpreadsheet(name) ? FileSpreadsheet : Presentation;
   return (
     <a
       href={artifactPath(name)}

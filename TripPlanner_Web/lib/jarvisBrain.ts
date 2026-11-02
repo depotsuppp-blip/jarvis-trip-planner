@@ -76,12 +76,13 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *
  * The artifacts door (fetchArtifact) is where a file Jarvis made comes from. A reply
  * shows a picture as `![Generated Image](/artifacts/image_YYYYMMDD_HHMMSS.png)` and offers
- * a presentation as `[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)`;
+ * a presentation as `[Download Presentation](/artifacts/presentation_YYYYMMDD_HHMMSS.pptx)`,
+ * a spreadsheet as `[Download Spreadsheet](/artifacts/spreadsheet_YYYYMMDD_HHMMSS.xlsx)`;
  * the browser asks THIS app for that address (app/artifacts/[name]/route.ts), which
  * fetches it from:
  *
  *   GET {JARVIS_ARTIFACTS_URL}/<name>   default: JARVIS_BRAIN_URL with its /chat swapped for /artifacts
- *   reply the file (image/png, image/jpeg, image/webp, the .pptx type or application/pdf); 404 when there is none
+ *   reply the file (image/png, image/jpeg, image/webp, the .pptx or .xlsx type, or application/pdf); 404 when there is none
  */
 
 export type ChatTurn = { role: "user" | "jarvis"; content: string; attachments?: Attachment[] };

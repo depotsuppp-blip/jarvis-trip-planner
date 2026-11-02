@@ -145,6 +145,20 @@ Several things were added to this module beyond plain tool calling:
       with that room (_call_provider). No key and no cost: there whenever
       python-pptx is installed, JARVIS_PUBLISHING=0 turns it off.
 
+  SPREADSHEETS  delegate_to_analytics(tabular_data) hands a table - JSON the
+      manager writes after working out the data (rows as objects, or lists
+      per column, optionally with a sheet name) - to the Head of Analytics
+      (agents/analytics_agent.py), which builds it with pandas and the
+      openpyxl engine, checks it and keeps it as
+      artifacts/spreadsheet_YYYYMMDD_HHMMSS.xlsx. Cells are values: text
+      that starts with "=" is saved as text, never as a formula. By voice the
+      reply names the folder and the file; in the web chat it carries a
+      download link, [Download Spreadsheet](/artifacts/<file>)
+      (ANALYTICS_RULE, _analyze, _with_artifacts). Like a deck, the table
+      travels inside the tool call, so a spreadsheet question may write up to
+      LONG_OUTPUT_MAX_TOKENS. No key and no cost: there whenever pandas and
+      openpyxl are installed, JARVIS_ANALYTICS=0 turns it off.
+
 -------------------------------------------------------------------
 PROVIDERS
 -------------------------------------------------------------------
@@ -388,8 +402,9 @@ When you answer, the response is converted to speech and played through a speake
 # and avoids the assistant monologuing at the user through the speakers.
 MAX_TOKENS = 1024
 
-# ...except where the answer is a document. A presentation's slides are written as
-# the JSON argument of one tool call (delegate_to_publishing), and MAX_TOKENS cuts a
+# ...except where the answer is a document. A presentation's slides (or a spreadsheet's
+# rows) are written as the JSON argument of one tool call (delegate_to_publishing,
+# delegate_to_analytics), and MAX_TOKENS cuts a
 # deck of any size off in the middle: Claude then hands back half a tool call, Gemini
 # an empty answer. A presentation question may write this much instead (LLMBrain.ask),
 # and a tool call that still comes back cut off is asked for once more with it
@@ -407,7 +422,8 @@ PUBLISHING_REPLY_SECONDS = 15.0
 # The answer when a tool call is cut off even with that much room: never half of it run.
 CUT_OFF_REPLY = (
     "That came out too long for me to write in one go, so nothing was made. Ask for a shorter "
-    "version - for a presentation, fewer slides or shorter points - and I'll do it."
+    "version - for a presentation, fewer slides or shorter points; for a spreadsheet, fewer rows "
+    "or columns - and I'll do it."
 )
 
 # Extended thinking costs seconds of latency, which is very noticeable
@@ -857,6 +873,49 @@ def publishing_rule(tools: list[ToolSpec], web: bool) -> str:
     )
 
 
+# Excel spreadsheets (agents/analytics_agent.py): a tool of the manager's own, like decks.
+DELEGATE_ANALYTICS = "delegate_to_analytics"
+
+# Added to the per-turn context while the manager has that tool (analytics_rule), in the
+# uncached block like PUBLISHING_RULE: it is there only with pandas and openpyxl. How the
+# file reaches the user is said in the same words as a deck's (PUBLISHING_SHARE_*), which
+# fit any file.
+ANALYTICS_RULE = (
+    "Spreadsheets: you can build real Excel files (.xlsx). When the user asks for a spreadsheet, an Excel file "
+    "or a table to download - or wants structured data such as a list, a financial table, a budget, a schedule "
+    "or a project plan as a file - build the file instead of writing the table into your reply. First work out "
+    "the data{research}. Then write it as JSON, one object per row: "
+    '[{{"Task": "...", "Owner": "...", "Due": "2026-11-30", "Cost (THB)": 1200}}, ...] - or one list per '
+    'column: {{"Task": ["...", "..."], "Cost (THB)": [1200, 800]}}. To name the sheet, wrap it: '
+    '{{"sheet_name": "Budget", "data": [...]}}. Every cell is plain text, a number, true/false or null: numbers '
+    "as numbers, with no currency signs or thousands separators (put the unit in the column name), and dates as "
+    "YYYY-MM-DD text. Cells hold values, not formulas: work out totals and other figures yourself and add them "
+    "as a row. Write the column names and text in the language the user wants - the one they wrote in, unless "
+    "they say otherwise; speaking English is a rule for your own reply, not for the file. Call {tool} once with "
+    "that JSON as tabular_data. {share} Say a spreadsheet was made only when the result starts with SUCCESS. "
+    "When it starts with ERROR and says what to change in the data, change exactly that and call again once; "
+    "otherwise tell the user in one sentence what went wrong."
+)
+ANALYTICS_RESEARCH = (
+    " - when it needs facts or figures you are not sure of, or anything recent, get them with {tool} first; "
+    "never make numbers up"
+)
+
+
+def analytics_rule(tools: list[ToolSpec], web: bool) -> str:
+    """ANALYTICS_RULE when this call can build spreadsheets, for a chat (download link) or a voice call (file name); else ""."""
+    if not any(tool.name == DELEGATE_ANALYTICS for tool in tools):
+        return ""
+    research = next((tool.name for tool in tools if tool.name == DELEGATE_RESEARCH), None) or next(
+        (tool.name for tool in tools if tool.name == "web_search" or tool.name.endswith("__web_search")), None
+    )
+    return ANALYTICS_RULE.format(
+        research=ANALYTICS_RESEARCH.format(tool=research) if research else "",
+        tool=DELEGATE_ANALYTICS,
+        share=PUBLISHING_SHARE_WEB if web else PUBLISHING_SHARE_VOICE,
+    )
+
+
 # What the brain does when a reply holds a trip link or id that no tool returned
 # during this request (link_guard.py says which): it is not sent. The model gets
 # one chance to fix it - the likeliest cause is a plain request to plan a trip
@@ -1160,6 +1219,22 @@ def _asks_for_presentation(text: str) -> bool:
     return any(fragment in raw for fragment in _PRESENTATION_SUBSTRINGS)
 
 
+# A spreadsheet is a tool call too (delegate_to_analytics), after the data is worked out:
+# "a budget spreadsheet for our project plan" would otherwise go to the reasoning tier on
+# "plan", and the tool-less front door would type the table into the chat. The English
+# words are matched as words even inside Thai ("ทำไฟล์excel" has no space before them) but
+# never inside longer words ("excellent"); the Thai ones are spreadsheet (two spellings)
+# and Excel (four). Not "worksheet" or "workbook": far more often a school exercise sheet.
+_SPREADSHEET_WORD = re.compile(r"(?<![a-z])(?:spreadsheets?|excel|xlsx?)(?![a-z])")
+_SPREADSHEET_SUBSTRINGS: tuple[str, ...] = ("สเปรดชีต", "สเปรดชีท", "เอ็กเซล", "เอ็กเซล์", "เอกเซล", "เอ๊กเซล")
+
+
+def _asks_for_spreadsheet(text: str) -> bool:
+    """True when the utterance asks for a spreadsheet or an Excel file, or is about one."""
+    raw = text.lower()
+    return bool(_SPREADSHEET_WORD.search(raw)) or any(fragment in raw for fragment in _SPREADSHEET_SUBSTRINGS)
+
+
 # "How is the system doing?" is a tool call (get_system_status), not conversation: the front
 # door has no tools and would answer it from nothing. Whole words, like the lists above.
 _STATUS_WORDS: tuple[str, ...] = ("cpu", "ram", "memory", "uptime", "telemetry")
@@ -1219,6 +1294,10 @@ def _classify_intent(text: str) -> tuple[str, str]:
     # And for "a deck on our strategy": planned on the standard tier, built by one tool call.
     if _asks_for_presentation(text):
         return INTENT_STANDARD, "a presentation request"
+
+    # The same for "a budget spreadsheet for the project plan".
+    if _asks_for_spreadsheet(text):
+        return INTENT_STANDARD, "a spreadsheet request"
 
     for marker in _DEEP_MARKERS:
         if f" {marker} " in lowered:
@@ -1283,6 +1362,15 @@ _FRONT_DOOR_PUBLISHING = (
     "request for a presentation, slides, a slide deck or a PowerPoint, or to change one, is route_to "
     "\"ORCHESTRATOR\" with response null. Never write the slides yourself, and never say that you "
     "cannot make a presentation."
+)
+
+# The same while it can build spreadsheets (delegate_to_analytics): the cheap model would
+# otherwise type the table into the chat.
+_FRONT_DOOR_ANALYTICS = (
+    "\n- The assistant behind you can also build Excel spreadsheets and save them as files: a request "
+    "for a spreadsheet, an Excel file or a table to download, or to change one, is route_to "
+    "\"ORCHESTRATOR\" with response null. Never write the table yourself, and never say that you "
+    "cannot make a spreadsheet."
 )
 
 # A web address in the utterance: "what does https://... say", "summarise www.example.com".
@@ -1369,7 +1457,13 @@ def _looks_like_tool_command(text: str) -> bool:
     if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS + _AGENDA_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
-    return _mentions_trip(text) or _asks_system_status(text) or _asks_for_image(text) or _asks_for_presentation(text)
+    return (
+        _mentions_trip(text)
+        or _asks_system_status(text)
+        or _asks_for_image(text)
+        or _asks_for_presentation(text)
+        or _asks_for_spreadsheet(text)
+    )
 
 
 # -- tool implementations ---------------------------------------------
@@ -3180,8 +3274,11 @@ class LLMBrain:
         # PowerPoint files (agents/publishing_agent.py): delegate_to_publishing while python-pptx is there.
         self._publishing: Any = self._start_publishing()
         self._publishing_spec: Optional[ToolSpec] = None
+        # Excel files (agents/analytics_agent.py): delegate_to_analytics while pandas and openpyxl are there.
+        self._analytics: Any = self._start_analytics()
+        self._analytics_spec: Optional[ToolSpec] = None
         # The Markdown lines for what was made during the current web request - a picture,
-        # a presentation's download link (see _with_artifacts).
+        # a presentation's or a spreadsheet's download link (see _with_artifacts).
         self._artifacts_this_turn: list[str] = []
         # When the question being answered arrived (time.monotonic()): a deck made in Canva
         # gets what is left of the web chat's wait (_publish).
@@ -3261,6 +3358,8 @@ class LLMBrain:
             print(f"[Brain] Images: {DELEGATE_CREATIVE} -> {self._creative.describe()}.")
         if self._publishing is not None:
             print(f"[Brain] Presentations: {DELEGATE_PUBLISHING} -> {self._publishing.describe()}.")
+        if self._analytics is not None:
+            print(f"[Brain] Spreadsheets: {DELEGATE_ANALYTICS} -> {self._analytics.describe()}.")
 
     # -- capabilities --------------------------------------------------
 
@@ -3342,8 +3441,9 @@ class LLMBrain:
         tool per working agent. An agent that cannot work (no model, or its tool servers
         are down) is left out and its server tools stay here, so a missing key never takes
         a capability away. An agent's own tools (the calendar, LINE) are never here.
-        Last, delegate_to_creative while image generation is set up, and
-        delegate_to_publishing while presentations are.
+        Last, delegate_to_creative while image generation is set up,
+        delegate_to_publishing while presentations are, and delegate_to_analytics while
+        spreadsheets are.
         """
         working = self._working_agents()
         replaced = self._replaced_tool_names(working)
@@ -3351,8 +3451,15 @@ class LLMBrain:
         mcp = [tool for tool in self._mcp_tools if not any(agent.owns(tool) for agent in working)]
         creative = [self._creative_tool()] if self._creative is not None and self._creative.available else []
         publishing = [self._publishing_tool()] if self._publishing is not None and self._publishing.available else []
+        analytics = [self._analytics_tool()] if self._analytics is not None and self._analytics.available else []
         return (
-            builtins + list(self._plugin_tools) + mcp + [self._delegation_tool(a) for a in working] + creative + publishing
+            builtins
+            + list(self._plugin_tools)
+            + mcp
+            + [self._delegation_tool(a) for a in working]
+            + creative
+            + publishing
+            + analytics
         )
 
     def _replaced_tool_names(self, working: Optional[list[Any]] = None) -> set[str]:
@@ -3616,22 +3723,106 @@ class LLMBrain:
         later = f", {time_left:.0f} s left for it" if time_left is not None else ""
         print(f"[Brain] Delegating to the Head of Publishing: {size:,} characters of slides{later}.")
         result = self._publishing.build_presentation(presentation_data, time_left=time_left)
-        if not result.startswith("SUCCESS"):
-            return result
 
         from agents.publishing_agent import markdown_link  # the agents package imports this module
 
+        return self._shared_file(result, markdown_link, web)
+
+    def _shared_file(self, result: str, link_for: Callable[[str], str], web: bool) -> str:
+        """
+        A file agent's SUCCESS as the model should pass it on. In the web chat the Path and URL
+        lines become one "Download: [Download ...](/artifacts/<file>)" line - `link_for` makes
+        it from the path - remembered so the reply is sure to carry it (_with_artifacts). By
+        voice the path stays and the URL goes: a web address means nothing through a speaker.
+        An ERROR is passed on as it is.
+        """
+        if not result.startswith("SUCCESS"):
+            return result
         lines = []
         for line in result.splitlines():
             if line.startswith("URL: "):
                 continue
             if line.startswith("Path: ") and web:
-                link = markdown_link(line[len("Path: "):].strip())
+                link = link_for(line[len("Path: "):].strip())
                 if link not in self._artifacts_this_turn:
                     self._artifacts_this_turn.append(link)
                 line = f"Download: {link}"
             lines.append(line)
         return "\n".join(lines)
+
+    # -- spreadsheets (agents/analytics_agent.py) ---------------------------------
+
+    def _start_analytics(self) -> Any:
+        """The Head of Analytics, or None when JARVIS_ANALYTICS=0 or it cannot be built. Never raises."""
+        if _env("JARVIS_ANALYTICS", "1").lower() in ("0", "false", "no", "off"):
+            print("[Brain] Spreadsheets off (JARVIS_ANALYTICS=0).")
+            return None
+        try:
+            # Imported here, not at the top: the agents package imports this module.
+            from agents import analytics_agent
+
+            return analytics_agent.build()
+        except Exception as exc:  # noqa: BLE001 - spreadsheets are an extra; the manager works without them
+            print(f"[Brain] Spreadsheets could not start ({type(exc).__name__}: {exc}).")
+            return None
+
+    def _analytics_tool(self) -> ToolSpec:
+        """delegate_to_analytics: built once, the same object every turn (the tool list stays cacheable)."""
+        if self._analytics_spec is None:
+            from agents.analytics_agent import MAX_COLUMNS, MAX_ROWS  # the agents package imports this module
+
+            self._analytics_spec = ToolSpec(
+                name=DELEGATE_ANALYTICS,
+                description=(
+                    "Hand finished tabular data to your Head of Analytics, who saves it as a real Excel spreadsheet "
+                    "(.xlsx) on this computer in about a second: one sheet with a bold header row that stays in view, "
+                    "a filter on it and readable column widths. Use it whenever the user asks for a spreadsheet, an "
+                    "Excel file or a table to download - lists, financial tables, budgets, schedules, project plans - "
+                    "after you have worked out the data (research first when it needs facts). It writes nothing "
+                    "itself: it lays out exactly the rows and columns you send, and every cell is a value, never a "
+                    "formula. Returns SUCCESS with where the file is - the saved file's path, or in the web chat a "
+                    "Markdown download link - or ERROR with what to change in the data."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "tabular_data": {
+                            "type": "string",
+                            "description": (
+                                "The table as JSON, written as a string, in one of two shapes. Rows: "
+                                '[{"Task": "Book flights", "Cost (THB)": 12000, "Done": false}, ...] - one object per '
+                                "row with the same column names; a column a row leaves out is empty there. Columns: "
+                                '{"Task": ["Book flights", "..."], "Cost (THB)": [12000, 8000]} - every list the same '
+                                'length. Optionally wrapped to name the sheet: {"sheet_name": "Budget", "data": <rows '
+                                "or columns>}. A cell is text, a number (no currency signs or thousands separators), "
+                                f"true/false or null for empty. Up to {MAX_ROWS:,} rows and {MAX_COLUMNS} columns."
+                            ),
+                        }
+                    },
+                    "required": ["tabular_data"],
+                },
+                handler=lambda tabular_data="": self._analyze(tabular_data),
+                requires_confirmation=False,
+                # Foreground: the saved file's path IS the answer.
+                background=False,
+                label="the Head of Analytics",
+                source="agent",
+            )
+        return self._analytics_spec
+
+    def _analyze(self, tabular_data: Any = "") -> str:
+        """
+        Builds one spreadsheet on the Head of Analytics; its SUCCESS/ERROR text goes back to the
+        model, with a web chat's download link in place of the path (_shared_file).
+        """
+        size = len(tabular_data) if isinstance(tabular_data, str) else len(json.dumps(tabular_data, default=str))
+        caller = request_context.current()
+        print(f"[Brain] Delegating to the Head of Analytics: {size:,} characters of table data.")
+        result = self._analytics.build_spreadsheet(tabular_data)
+
+        from agents.analytics_agent import markdown_link  # the agents package imports this module
+
+        return self._shared_file(result, markdown_link, caller is not None and caller.is_web)
 
     def _team_rule(self, tools: list[ToolSpec]) -> str:
         """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
@@ -3692,6 +3883,8 @@ class LLMBrain:
             base += _FRONT_DOOR_CREATIVE
         if self._publishing is not None and self._publishing.available:
             base += _FRONT_DOOR_PUBLISHING
+        if self._analytics is not None and self._analytics.available:
+            base += _FRONT_DOOR_ANALYTICS
         if not self._mcp_tools:
             return base
         notes = self._mcp.server_notes() if self._mcp is not None else []
@@ -4163,10 +4356,13 @@ class LLMBrain:
             f"[Brain] Routing: {intent.upper()} ({why}) "
             f"-> {model or self._provider.model}, effort {effort}."
         )
-        # A deck's slides are written into one tool call: room for all of them
-        # (LONG_OUTPUT_MAX_TOKENS). Every other question keeps the spoken-answer limit.
+        # A deck's slides, or a spreadsheet's rows, are written into one tool call: room for
+        # all of them (LONG_OUTPUT_MAX_TOKENS). Every other question keeps the spoken-answer limit.
         max_tokens: Optional[int] = None
-        if any(tool.name == DELEGATE_PUBLISHING for tool in tools) and _asks_for_presentation(_routing_text(user_text)):
+        routed = _routing_text(user_text)
+        if (any(tool.name == DELEGATE_PUBLISHING for tool in tools) and _asks_for_presentation(routed)) or (
+            any(tool.name == DELEGATE_ANALYTICS for tool in tools) and _asks_for_spreadsheet(routed)
+        ):
             max_tokens = LONG_OUTPUT_MAX_TOKENS
 
         # Feature 6: greetings and general conversation stop here, answered
@@ -4311,6 +4507,9 @@ class LLMBrain:
             decks = publishing_rule(tools, web=caller is not None and caller.is_web)
             if decks:
                 context += "\n\n" + decks
+            sheets = analytics_rule(tools, web=caller is not None and caller.is_web)
+            if sheets:
+                context += "\n\n" + sheets
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
