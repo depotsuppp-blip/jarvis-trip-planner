@@ -537,6 +537,13 @@ that reach outside this process: one triggers an n8n automation \
 workflow with a payload you build, one reads from the Subtrack \
 database.
 
+You can also read the user's Google Classroom, read-only: \
+delegate_to_classroom_courses lists their active courses, and \
+delegate_to_classroom_assignments lists one course's assignments with \
+their due dates. Use them for questions about classes, homework, \
+assignments and deadlines. You cannot submit, post or grade anything \
+there.
+
 Your primary automation job is data capture for Subtrack. When the \
 user says they spent something, subscribed to something, cancelled \
 something, or otherwise gives you a record to keep, pull the \
@@ -1130,7 +1137,13 @@ _TOOL_WORDS: tuple[str, ...] = (
     # Today's agenda: the productivity agent reads the calendar; the front door would
     # answer "I can't see your calendar".
     "calendar", "agenda", "schedule", "briefing",
+    # Google Classroom: the front door would answer "I can't see your classes".
+    # ("course" is not here: "of course" would lose the cheap path.)
+    "classroom", "homework", "assignment", "assignments", "coursework",
 )
+
+# The same for Thai, as substrings: homework / classroom / work to hand in.
+_CLASSROOM_SUBSTRINGS: tuple[str, ...] = ("การบ้าน", "ห้องเรียน", "งานที่ต้องส่ง")
 
 # The same for Thai, as substrings: calendar / work schedule / appointment schedule /
 # appointment / LINE (the app).
@@ -1455,6 +1468,8 @@ def _looks_like_tool_command(text: str) -> bool:
     if any(word in _TOOL_WORDS for word in lowered.split()):
         return True
     if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS + _AGENDA_SUBSTRINGS):
+        return True
+    if any(fragment in text for fragment in _CLASSROOM_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
     return (
@@ -1936,6 +1951,40 @@ def _tool_list_capabilities(include_tasks: bool = True) -> str:
     return " ".join(parts)
 
 
+# -- Google Classroom (agents/classroom_agent.py) ------------------------------
+#
+# Read-only, through the official API, signed in as the OWNER (token.json from
+# utils/classroom_auth.py). The web chat serves everyone who signs in to the web
+# app, and the owner's classes are not theirs to read: only the voice assistant
+# and the owner's own web account (JARVIS_OWNER_USER_ID, as for memory - see
+# mcp_client.caller_scope) get answers.
+
+CLASSROOM_OWNER_ONLY = json.dumps({
+    "error": "Google Classroom is connected to the owner's Google account, so only the owner can read "
+             "it here. Tell the user it is not available to them."
+})
+
+
+def _classroom_allowed() -> bool:
+    return mcp_client.caller_scope() == "owner"
+
+
+def _tool_classroom_courses() -> str:
+    if not _classroom_allowed():
+        return CLASSROOM_OWNER_ONLY
+    from agents.classroom_agent import get_courses  # lazy: agents imports this module
+
+    return get_courses()
+
+
+def _tool_classroom_assignments(course_id: str = "") -> str:
+    if not _classroom_allowed():
+        return CLASSROOM_OWNER_ONLY
+    from agents.classroom_agent import get_coursework
+
+    return get_coursework(course_id)
+
+
 TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="trigger_n8n_webhook",
@@ -2411,6 +2460,48 @@ TOOLS: list[ToolSpec] = [
         },
         handler=_tool_list_capabilities,
         requires_confirmation=False,
+    ),
+    ToolSpec(
+        name="delegate_to_classroom_courses",
+        description=(
+            "Lists the user's active Google Classroom courses (read-only): each course's id, name, "
+            "section, room, and whether the user teaches it or is enrolled. Use it when they ask about "
+            "their classes or courses, and FIRST whenever they ask about assignments, homework or "
+            "deadlines and you do not already have the course id from this conversation: pick the "
+            "course by its name from this list, never guess an id. If it returns an error (not signed "
+            "in yet, the API not enabled), tell the user exactly that."
+        ),
+        input_schema={"type": "object", "properties": {}},
+        handler=_tool_classroom_courses,
+        requires_confirmation=False,
+        # Foreground: the owner check reads the request context, which a background thread would not have.
+        background=False,
+        label="Google Classroom courses",
+    ),
+    ToolSpec(
+        name="delegate_to_classroom_assignments",
+        description=(
+            "Lists the published assignments of ONE Google Classroom course (read-only): title, due date "
+            "and time in the user's local time, how far off it is (due today, due in 3 days, overdue), "
+            "type, points and a link, upcoming work first. Use it for homework, assignments, coursework "
+            "and deadlines. course_id must come from delegate_to_classroom_courses. For a question across "
+            "all classes (\"what is due this week?\"), call it for each course in the same step. It "
+            "cannot submit, post or grade anything."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "course_id": {
+                    "type": "string",
+                    "description": "The course's id, as delegate_to_classroom_courses returned it.",
+                },
+            },
+            "required": ["course_id"],
+        },
+        handler=_tool_classroom_assignments,
+        requires_confirmation=False,
+        background=False,
+        label="Google Classroom assignments",
     ),
 ]
 

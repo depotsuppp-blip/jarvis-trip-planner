@@ -10,6 +10,10 @@
 # it in to the Canva account. Any folder, any copy.
 canva_profile/
 canva_state.json
+# Google Classroom sign-in (utils/classroom_auth.py): the OAuth client and the saved user token.
+# token.json reads the owner's classes for whoever has it. Matched in any folder.
+credentials.json
+token.json
 
 # --- Python -------------------------------------------------------------
 __pycache__/
