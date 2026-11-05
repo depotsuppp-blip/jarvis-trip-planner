@@ -205,6 +205,14 @@ requests>=2.31.0
 # registered in SAFE_QUERIES; point it at a SELECT-only role anyway.
 psycopg2-binary>=2.9.9
 
+# --- Head of Database (agents/database_agent.py) ------------------------
+# Async PostgreSQL driver for delegate_to_database: the SELECT statements
+# the brain writes run on DATABASE_URL (or JARVIS_DATABASE_URL) inside a
+# read-only transaction. Prebuilt wheels for Windows, macOS and Linux - no
+# libpq or compiler needed. Without it Jarvis still starts; the tool is
+# simply not offered.
+asyncpg>=0.30.0
+
 # --- Configuration ------------------------------------------------------
 # Loads credentials (API keys, n8n webhook URLs, database password) from
 # a local .env file so none of them are hardcoded into a source file.

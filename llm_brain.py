@@ -159,6 +159,21 @@ Several things were added to this module beyond plain tool calling:
       LONG_OUTPUT_MAX_TOKENS. No key and no cost: there whenever pandas and
       openpyxl are installed, JARVIS_ANALYTICS=0 turns it off.
 
+  DATABASE  delegate_to_database(sql_query) hands one SELECT statement the
+      manager wrote to the Head of Database (agents/database_agent.py), which
+      runs it on the live PostgreSQL database in JARVIS_DATABASE_URL or
+      DATABASE_URL - in this project the Trip Planner web app's own - inside a
+      read-only transaction, after refusing anything that is not one SELECT,
+      and answers with the rows as a JSON array of records, or PostgreSQL's own
+      error (with the tables there are, for an unknown table or column) so the
+      manager can fix the SQL and call again. Rows the user wants as a file go
+      straight to the Head of Analytics (the tool's `spreadsheet` argument),
+      never re-typed by the model (DATABASE_RULE, _query_database). The database
+      holds every web user's data, so only the owner gets the tool - the voice
+      assistant and JARVIS_OWNER_USER_ID in the web chat (_database_allowed).
+      There whenever asyncpg is installed and a URL is set, JARVIS_DATABASE=0
+      turns it off.
+
 -------------------------------------------------------------------
 THE STATE MACHINE
 -------------------------------------------------------------------
@@ -171,7 +186,7 @@ Every question is one run through these nodes (LLMBrain._machine):
                        (-> Review_Artifact) or tool calls
     Delegate_to_Agent  the calls, when any hands work to a specialist
                        (Research, Data, Productivity, Creative, Publishing,
-                       Analytics, Classroom)                     (-> Plan)
+                       Analytics, Database, Classroom)           (-> Plan)
     Use_Tools          the calls, when none does: MCP tools, built-ins (-> Plan)
     Review_Artifact    the link guard (one correction back through Plan),
                        the Markdown line of every file made during the run,
@@ -968,6 +983,57 @@ def analytics_rule(tools: list[ToolSpec], web: bool) -> str:
     )
 
 
+# Read-only SQL on the live PostgreSQL database (agents/database_agent.py): a tool of the
+# manager's own, like spreadsheets, and only ever offered to the owner (_database_allowed).
+DELEGATE_DATABASE = "delegate_to_database"
+
+# Added to the per-turn context while the manager has that tool (database_rule), in the
+# uncached block like ANALYTICS_RULE: the tool is there only with a database URL and asyncpg,
+# and only for the owner - a persona that always promised a database would promise it to
+# everyone. This is "the system prompt" that says Jarvis is connected to a database.
+DATABASE_RULE = (
+    "Database: you are connected to a live PostgreSQL database through your Head of Database ({tool}) - in this "
+    "setup normally the Trip Planner web app's own database, with its users, trips, polls, votes and chats. When "
+    "the user asks about data that lives there - how many, which, who, when, totals, the latest ones - write ONE "
+    "read-only SELECT statement and call {tool} with it as sql_query, instead of guessing or saying you cannot see "
+    "the data. Names with capital letters go in double quotes exactly as the database spells them (\"User\", "
+    "\"createdAt\"). If you do not know the tables, write your best query anyway: an unknown table or column comes "
+    "back as an ERROR that lists every table and its columns. Let the database do the work - count, sum, average "
+    "and GROUP BY in SQL, and a LIMIT when listing rows - rather than fetching everything. The result is a JSON "
+    "array of records, sometimes after a NOTE line (more rows than were sent, secret columns shown as [hidden], "
+    "text cut short). Answer only from those rows and never invent a number or a name; do not read raw JSON out "
+    "to the user. A time with an offset (+07:00) is already in the user's time zone; a time without one is "
+    "exactly as stored - a Prisma app like the Trip Planner stores those in UTC - so convert it before you say "
+    "it. When the result starts with ERROR about the SQL, fix the SQL from the message and call again, at most "
+    "twice; when it says it could not connect or is not set up, tell the user in one sentence. Only SELECT runs: "
+    "you cannot add, change or delete anything in the database, so say so if asked and do not try.{files}{sheet}"
+)
+DATABASE_FILES = (
+    " It is not where the files the user attached are: questions about those go to {tool}."
+)
+DATABASE_SPREADSHEET = (
+    " When the user wants the data as a spreadsheet or an Excel file, call {database} with spreadsheet set to a "
+    "short sheet name: the rows go straight from the database into the file, exactly as stored, and the result "
+    "carries the file's line - work totals and other figures out in the SQL too. Never copy rows into {tool} "
+    "yourself: a copied name or number can come out changed."
+)
+
+
+def database_rule(tools: list[ToolSpec]) -> str:
+    """DATABASE_RULE when this call can query the database (naming the files and spreadsheet tools there are); else ""."""
+    if not any(tool.name == DELEGATE_DATABASE for tool in tools):
+        return ""
+    names = {tool.name for tool in tools}
+    files = next((name for name in ("delegate_to_data", "mcp__data__load_file") if name in names), None)
+    return DATABASE_RULE.format(
+        tool=DELEGATE_DATABASE,
+        files=DATABASE_FILES.format(tool=files) if files else "",
+        sheet=DATABASE_SPREADSHEET.format(database=DELEGATE_DATABASE, tool=DELEGATE_ANALYTICS)
+        if DELEGATE_ANALYTICS in names
+        else "",
+    )
+
+
 # What the brain does when a reply holds a trip link or id that no tool returned
 # during this request (link_guard.py says which): it is not sent. The model gets
 # one chance to fix it - the likeliest cause is a plain request to plan a trip
@@ -1185,7 +1251,12 @@ _TOOL_WORDS: tuple[str, ...] = (
     # Google Classroom: the front door would answer "I can't see your classes".
     # ("course" is not here: "of course" would lose the cheap path.)
     "classroom", "homework", "assignment", "assignments", "coursework",
+    # The live database (delegate_to_database): "how many rows are in the polls table?"
+    "postgres", "postgresql", "query", "queries", "table", "tables", "rows", "records",
 )
+
+# The same for Thai, as substrings: database (two spellings).
+_DATABASE_SUBSTRINGS: tuple[str, ...] = ("ฐานข้อมูล", "ดาต้าเบส")
 
 # The same for Thai, as substrings: homework / classroom / work to hand in.
 _CLASSROOM_SUBSTRINGS: tuple[str, ...] = ("การบ้าน", "ห้องเรียน", "งานที่ต้องส่ง")
@@ -1431,6 +1502,15 @@ _FRONT_DOOR_ANALYTICS = (
     "cannot make a spreadsheet."
 )
 
+# The same while it can query the live database (delegate_to_database, the owner only): the
+# cheap model would otherwise answer "how many people signed up this week?" with "I can't see that".
+_FRONT_DOOR_DATABASE = (
+    "\n- The assistant behind you is also connected to a live PostgreSQL database (the Trip Planner app's "
+    "users, trips, polls, votes and chats): a question about data that lives there - how many, which, who, "
+    "when, totals, the latest ones - or a request for SQL to be run, is route_to \"ORCHESTRATOR\" with "
+    "response null. Never guess the numbers, and never say that you cannot see the data."
+)
+
 # A web address in the utterance: "what does https://... say", "summarise www.example.com".
 _HAS_LINK = re.compile(r"\bhttps?://|\bwww\.[a-z0-9-]", re.IGNORECASE)
 _FRONT_DOOR_ROUTES = ("SELF", "ORCHESTRATOR")
@@ -1514,7 +1594,7 @@ def _looks_like_tool_command(text: str) -> bool:
         return True
     if any(fragment in text for fragment in _MEMORY_SUBSTRINGS + _REALTIME_SUBSTRINGS + _AGENDA_SUBSTRINGS):
         return True
-    if any(fragment in text for fragment in _CLASSROOM_SUBSTRINGS):
+    if any(fragment in text for fragment in _CLASSROOM_SUBSTRINGS + _DATABASE_SUBSTRINGS):
         return True
     # The Thai trip words are not separate words, so _TOOL_WORDS cannot hold them.
     return (
@@ -2025,6 +2105,23 @@ CLASSROOM_OWNER_ONLY = json.dumps({
 
 
 def _classroom_allowed() -> bool:
+    return mcp_client.caller_scope() == "owner"
+
+
+# -- the live PostgreSQL database (agents/database_agent.py) -------------------
+#
+# Read-only, but it holds every web user's data (accounts, chats, votes): like
+# Classroom, only the voice assistant and the owner's own web account
+# (JARVIS_OWNER_USER_ID) may query it. Anyone else is not even offered the tool
+# (LLMBrain._active_tools), and the handler checks again (_query_database).
+
+DATABASE_OWNER_ONLY = (
+    "ERROR: the database holds every user's data, so only the owner can query it here. Tell the user it is "
+    "not available to them, and do not try again."
+)
+
+
+def _database_allowed() -> bool:
     return mcp_client.caller_scope() == "owner"
 
 
@@ -3598,7 +3695,7 @@ def _drive_inline(machine: AsyncIterator[dict[str, Any]]) -> Iterator[dict[str, 
 
 
 def _is_delegation(tool: Optional[ToolSpec], call: ToolCall) -> bool:
-    """A call that hands work to a specialist (agents/, the Heads of Creative, Publishing, Analytics, Classroom)."""
+    """A call that hands work to a specialist (agents/, the Heads of Creative, Publishing, Analytics, Database, Classroom)."""
     return (tool is not None and tool.source == "agent") or call.name.startswith("delegate_to_")
 
 
@@ -3723,6 +3820,9 @@ class LLMBrain:
         # Excel files (agents/analytics_agent.py): delegate_to_analytics while pandas and openpyxl are there.
         self._analytics: Any = self._start_analytics()
         self._analytics_spec: Optional[ToolSpec] = None
+        # Read-only SQL (agents/database_agent.py): delegate_to_database, for the owner, while a URL and asyncpg are there.
+        self._database: Any = self._start_database()
+        self._database_spec: Optional[ToolSpec] = None
         # What was made during a question, what went to the background and when it arrived
         # live on its run (TurnRun), not here: a stopped run's worker thread can still be
         # finishing while the next question is answered.
@@ -3806,6 +3906,8 @@ class LLMBrain:
             print(f"[Brain] Presentations: {DELEGATE_PUBLISHING} -> {self._publishing.describe()}.")
         if self._analytics is not None:
             print(f"[Brain] Spreadsheets: {DELEGATE_ANALYTICS} -> {self._analytics.describe()}.")
+        if self._database is not None:
+            print(f"[Brain] Database: {DELEGATE_DATABASE} (owner only) -> {self._database.describe()}.")
 
     # -- capabilities --------------------------------------------------
 
@@ -3883,9 +3985,10 @@ class LLMBrain:
     def heads_status(self) -> list[dict[str, Any]]:
         """
         The capabilities that are not LLM agents, for /health and the web hub's sidebar: the
-        Head of Creative (images), of Publishing (PowerPoint) and of Analytics (Excel) - plain
-        Python behind a delegate_to_* tool, so they have no model routes and are not in
-        team_status() - and Google Classroom (delegate_to_classroom_*, read-only, owner only).
+        Head of Creative (images), of Publishing (PowerPoint), of Analytics (Excel) and of
+        Database (read-only SQL, owner only) - plain Python behind a delegate_to_* tool, so they
+        have no model routes and are not in team_status() - and Google Classroom
+        (delegate_to_classroom_*, read-only, owner only).
 
             {"name": "creative", "title": "Head of Creative", "tools": ["delegate_to_creative"],
              "state": "ready" | "not configured" | "off", "why": "needs OPENAI_API_KEY",
@@ -3919,6 +4022,10 @@ class LLMBrain:
                  {"python-pptx": "needs python-pptx", "Canva": "Canva is not ready"}),
             head("analytics", "Head of Analytics", DELEGATE_ANALYTICS, self._analytics, "JARVIS_ANALYTICS",
                  {"pandas": "needs pandas and openpyxl"}),
+            # Read-only SQL on the live database; offered to the owner only (_database_allowed).
+            {**head("database", "Head of Database", DELEGATE_DATABASE, self._database, "JARVIS_DATABASE",
+                    {"asyncpg": "needs asyncpg", "is not set": "needs DATABASE_URL", "not usable": "DATABASE_URL is not usable"}),
+             "owner_only": True},
         ]
 
         classroom_tools = [t.name for t in TOOLS if t.name.startswith("delegate_to_classroom_")]
@@ -3947,8 +4054,8 @@ class LLMBrain:
         are down) is left out and its server tools stay here, so a missing key never takes
         a capability away. An agent's own tools (the calendar, LINE) are never here.
         Last, delegate_to_creative while image generation is set up,
-        delegate_to_publishing while presentations are, and delegate_to_analytics while
-        spreadsheets are.
+        delegate_to_publishing while presentations are, delegate_to_analytics while
+        spreadsheets are, and delegate_to_database while a database is - for the owner only.
         """
         working = self._working_agents()
         replaced = self._replaced_tool_names(working)
@@ -3957,6 +4064,7 @@ class LLMBrain:
         creative = [self._creative_tool()] if self._creative is not None and self._creative.available else []
         publishing = [self._publishing_tool()] if self._publishing is not None and self._publishing.available else []
         analytics = [self._analytics_tool()] if self._analytics is not None and self._analytics.available else []
+        database = [self._database_tool()] if self._database_ready() and _database_allowed() else []
         return (
             builtins
             + list(self._plugin_tools)
@@ -3965,6 +4073,7 @@ class LLMBrain:
             + creative
             + publishing
             + analytics
+            + database
         )
 
     def _replaced_tool_names(self, working: Optional[list[Any]] = None) -> set[str]:
@@ -4339,6 +4448,113 @@ class LLMBrain:
 
         return self._shared_file(result, markdown_link, caller is not None and caller.is_web)
 
+    # -- read-only SQL (agents/database_agent.py) ---------------------------------
+
+    def _start_database(self) -> Any:
+        """The Head of Database, or None when JARVIS_DATABASE=0 or it cannot be built. Never raises."""
+        if _env("JARVIS_DATABASE", "1").lower() in ("0", "false", "no", "off"):
+            print("[Brain] Database off (JARVIS_DATABASE=0).")
+            return None
+        try:
+            # Imported here, not at the top: the agents package imports this module.
+            from agents import database_agent
+
+            return database_agent.build()
+        except Exception as exc:  # noqa: BLE001 - the database is an extra; the manager works without it
+            print(f"[Brain] Database could not start ({type(exc).__name__}: {exc}).")
+            return None
+
+    def _database_ready(self) -> bool:
+        """True while the Head of Database can run a query (a URL is set and asyncpg is installed)."""
+        return self._database is not None and self._database.available
+
+    def _database_tool(self) -> ToolSpec:
+        """delegate_to_database: built once, the same object every turn (the tool list stays cacheable)."""
+        if self._database_spec is None:
+            from agents.database_agent import EXPORT_MAX_ROWS, MAX_ROWS  # the agents package imports this module
+
+            properties: dict[str, Any] = {
+                "sql_query": {
+                    "type": "string",
+                    "description": (
+                        "One PostgreSQL SELECT statement, without a semicolon in the middle. Names with "
+                        'capital letters in double quotes: SELECT count(*) FROM "User" WHERE "createdAt" >= '
+                        "now() - interval '7 days'. Aggregate in SQL and add a LIMIT when listing rows."
+                    ),
+                }
+            }
+            if self._analytics is not None and self._analytics.available:
+                properties["spreadsheet"] = {
+                    "type": "string",
+                    "description": (
+                        "Only when the user wants these rows as an Excel file: a short sheet name, such as "
+                        f'"Users". The rows - up to {EXPORT_MAX_ROWS:,} - then go straight from the database to your '
+                        "Head of Analytics, exactly as stored, and the result carries the file's line. Leave it out "
+                        "for a question you answer yourself."
+                    ),
+                }
+            self._database_spec = ToolSpec(
+                name=DELEGATE_DATABASE,
+                description=(
+                    "Run ONE read-only SQL SELECT statement on the live PostgreSQL database through your Head of "
+                    "Database and get the rows back as a JSON array of records. Use it for questions about the data "
+                    "in it - counts, lists, totals, the latest rows, who did what and when. Only SELECT (or WITH ... "
+                    "SELECT) runs, inside a read-only transaction: INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, "
+                    "GRANT and every other command that writes are refused, so it can never change data. At most "
+                    f"{MAX_ROWS} rows come back, after a NOTE line when there is more or a column holding a secret was "
+                    "hidden. On a mistake it returns ERROR with PostgreSQL's exact message - and, for an unknown table "
+                    "or column, the tables and columns there are - so you can fix the SQL and call again."
+                ),
+                input_schema={"type": "object", "properties": properties, "required": ["sql_query"]},
+                handler=lambda sql_query="", spreadsheet=None: self._query_database(sql_query, spreadsheet),
+                requires_confirmation=False,
+                # Foreground: the rows ARE the answer, and the owner check reads the request context.
+                background=False,
+                label="the Head of Database",
+                source="agent",
+            )
+        return self._database_spec
+
+    def _query_database(self, sql_query: Any = "", spreadsheet: Any = None) -> str:
+        """
+        Runs one SELECT on the Head of Database for the owner; its JSON records or ERROR text go
+        back to the model. With `spreadsheet` (a sheet name) the rows go straight on to the Head
+        of Analytics - never re-typed by the model - and the answer is the file's SUCCESS (with
+        the web chat's download line) plus a preview of the rows.
+        """
+        if not _database_allowed():
+            print("[Brain] Database query refused: the caller is not the owner.")
+            return DATABASE_OWNER_ONLY
+        if not self._database_ready():
+            why = self._database.unavailable_reason if self._database is not None else "it is switched off"
+            return f"ERROR: the database is not set up ({why}). Tell the user; do not try again."
+        size = len(sql_query) if isinstance(sql_query, str) else 0
+        sheet = "" if spreadsheet in (None, False) else ("Query" if spreadsheet is True else str(spreadsheet))
+        sheet = re.sub(r"[\[\]:*?/\\]", " ", sheet).strip()[:31]
+        if not sheet or self._analytics is None or not self._analytics.available:
+            print(f"[Brain] Delegating to the Head of Database: {size:,} characters of SQL.")
+            return self._database.run_query(sql_query)
+
+        print(f"[Brain] Delegating to the Head of Database for a spreadsheet ({sheet!r}): {size:,} characters of SQL.")
+        result = self._database.export(sql_query)
+        if not result.ok:
+            return result.to_text()
+        if not result.records:
+            return "NOTE: the query returned no rows, so no spreadsheet was made.\n" + result.to_text()
+        request_context.check_cancelled()
+        made = self._analyze(json.dumps(result.table(sheet), ensure_ascii=False, default=str))
+        if not made.startswith("SUCCESS"):
+            return made
+        from agents.database_agent import EXPORT_MAX_ROWS  # the agents package imports this module
+
+        held = f"{len(result.records):,} row{'s' if len(result.records) != 1 else ''}"
+        if result.more:
+            held += f" - the first {EXPORT_MAX_ROWS:,}; the query returned more, which were left out"
+        return (
+            f"{made}\nThe spreadsheet holds {held}, exactly as the database returned them. The first of them, "
+            "for your answer (do not copy them anywhere):\n" + result.to_text(limit=4_000)
+        )
+
     def _team_rule(self, tools: list[ToolSpec]) -> str:
         """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
         members = [
@@ -4400,6 +4616,8 @@ class LLMBrain:
             base += _FRONT_DOOR_PUBLISHING
         if self._analytics is not None and self._analytics.available:
             base += _FRONT_DOOR_ANALYTICS
+        if self._database_ready() and _database_allowed():
+            base += _FRONT_DOOR_DATABASE
         if not self._mcp_tools:
             return base
         notes = self._mcp.server_notes() if self._mcp is not None else []
@@ -5262,6 +5480,9 @@ class LLMBrain:
             sheets = analytics_rule(tools, web=caller is not None and caller.is_web)
             if sheets:
                 context += "\n\n" + sheets
+            database = database_rule(tools)
+            if database:
+                context += "\n\n" + database
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).

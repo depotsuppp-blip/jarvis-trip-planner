@@ -27,7 +27,9 @@ what they make in artifacts/, so the manager holds delegate_to_creative,
 delegate_to_publishing and delegate_to_analytics itself (LLMBrain._creative_tool,
 _publishing_tool, _analytics_tool), with or without the team: images whenever
 OPENAI_API_KEY is set, presentations whenever python-pptx is installed, spreadsheets
-whenever pandas and openpyxl are.
+whenever pandas and openpyxl are. The Head of Database (database_agent.py) is plain
+Python too - one read-only SELECT per call on DATABASE_URL through asyncpg - and the
+manager holds delegate_to_database itself, for the owner only (LLMBrain._database_tool).
 
 Keys (.env): GEMINI_API_KEY (data, research, productivity fallback, last resort),
 GROQ_API_KEY (data fallback), OPENAI_API_KEY (productivity primary, images);
