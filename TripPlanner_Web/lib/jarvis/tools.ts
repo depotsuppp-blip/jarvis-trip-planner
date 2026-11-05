@@ -11,6 +11,11 @@ import type { AgentStatus } from "./types";
  *                       "Ready" on their primary model, "On fallback" while a
  *                       fallback answers (and why the primary is not),
  *                       "Not connected" when the manager does their work itself.
+ *                       Then the Heads that are not LLM agents - Creative (images),
+ *                       Publishing (PowerPoint), Analytics (Excel) - and Google
+ *                       Classroom: plain Python behind a delegate_to_* tool, so no
+ *                       model to name; "Ready" when Jarvis can use them, "Not
+ *                       connected" with what is missing ("needs OPENAI_API_KEY").
  *   Tools               Trip Planner, Voice and the MCP tool servers, each saying
  *                       which agent uses it.
  *
@@ -31,11 +36,19 @@ const KNOWN_SERVERS: { name: string; label: string; detail: string }[] = [
   { name: "local_fs", label: "Local Files", detail: "Reads project files and attachments" },
 ];
 
-/** The specialist agents (Python agents/), in the order the sidebar lists them. */
+/**
+ * The specialist agents (Python agents/) and the capabilities beside them that are not LLM agents
+ * (Creative, Publishing, Analytics, Classroom - reported under `heads`), in the order the sidebar
+ * lists them.
+ */
 const KNOWN_AGENTS: { name: string; label: string; detail: string }[] = [
   { name: "data", label: "Data & Documents", detail: "Reads files and crunches data" },
   { name: "research", label: "Research", detail: "Searches and reads the web" },
   { name: "productivity", label: "Productivity", detail: "Calendar, schedules and LINE alerts" },
+  { name: "creative", label: "Creative", detail: "Makes images" },
+  { name: "publishing", label: "Publishing", detail: "Builds PowerPoint presentations" },
+  { name: "analytics", label: "Analytics", detail: "Builds Excel spreadsheets" },
+  { name: "classroom", label: "Google Classroom", detail: "Reads your courses and assignments" },
 ];
 
 export const TOOL_OFFLINE_DETAIL = "Not running right now";
@@ -168,6 +181,28 @@ export function agentRows(agents: NonNullable<ToolsData["agents"]>): AgentStatus
     });
 }
 
+/**
+ * One row per capability that is not an LLM agent: "Ready" when Jarvis can use it, otherwise
+ * "Not connected" with what is missing. No model is named - there is none. Classroom says it is
+ * the owner's alone, because the web hub serves everyone who signs in.
+ */
+export function headRows(heads: NonNullable<ToolsData["heads"]>): AgentStatus[] {
+  return [...heads]
+    .sort((a, b) => rank(KNOWN_AGENTS, a.name) - rank(KNOWN_AGENTS, b.name) || a.name.localeCompare(b.name))
+    .map((head): AgentStatus => {
+      const known = KNOWN_AGENTS.find((candidate) => candidate.name === head.name);
+      const detail = `${known?.detail ?? head.title}${head.ownerOnly ? " · owner only" : ""}`;
+      const base = {
+        id: `${AGENT_ROW_PREFIX}${head.name}`,
+        name: known?.label ?? head.title.replace(/^Head of /, ""),
+        kind: "agent" as const,
+        detail,
+      };
+      if (head.state === "ready") return { ...base, state: "ready" };
+      return { ...base, state: "unavailable", model: head.state === "off" ? head.why || "Switched off" : head.why || "Not set up" };
+    });
+}
+
 /** One row per tool server, saying which agent uses it. */
 export function toolRows(servers: ToolsData["servers"], agents: ToolsData["agents"] = []): AgentStatus[] {
   return [...servers]
@@ -194,5 +229,5 @@ export function withStatus(agents: AgentStatus[], status: ToolsData): AgentStatu
   const own = agents
     .filter((agent) => !agent.id.startsWith(TOOL_ROW_PREFIX) && !agent.id.startsWith(AGENT_ROW_PREFIX))
     .map((agent) => (agent.id === "brain" ? brainFromStatus(agent, status) : agent));
-  return [...own, ...agentRows(status.agents ?? []), ...toolRows(status.servers, status.agents ?? [])];
+  return [...own, ...agentRows(status.agents ?? []), ...headRows(status.heads ?? []), ...toolRows(status.servers, status.agents ?? [])];
 }

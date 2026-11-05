@@ -8,10 +8,13 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *   POST {JARVIS_BRAIN_URL}   default http://127.0.0.1:8000/chat
  *   body  { prompt: string,
  *           history: [{ role: "user" | "jarvis", content, attachments? }],
- *           user_id?: string, app_url?: string, speak?: true,
+ *           user_id?: string, app_url?: string, speak?: true, interactive?: false,
  *           attachments?: [{ path, name, mime, size }] }
  *   reply text/event-stream - the brain's state machine as it works, one JSON per `data:`:
  *           { type: "progress", node?, status: "Delegating to Head of Analytics..." }   any number
+ *           { type: "action_required", approval_id, tool, prompt, details: [{ name, value }], expires_in }
+ *                                     a confirmation-gated tool is WAITING for the person's Allow or Deny
+ *           { type: "action_resolved", approval_id, decision: "allow" | "deny" | "timeout" }   it was answered
  *           { type: "final", status: "Done", message: string | object, audio?: { mime, base64 } | null }
  *           { type: "error", status: "Failed", message, code }                            instead of final
  *         (a brain from before the stream answers { reply, audio } as JSON, and that is read too)
@@ -20,9 +23,20 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *           (askJarvis hands it to `onProgress`). Free text from the brain: it is trimmed and
  *           capped here, and never stored.
  *
+ *   action_required = a tool that changes something outside Jarvis (sends a LINE message, starts a
+ *           server, writes a new tool) is paused until the person says yes. It reaches the page as an
+ *           Approval Card (`onApproval`); the answer goes back through decideApproval (below), and
+ *           the brain carries on - or reports the action as declined. The brain only asks the owner
+ *           (JARVIS_OWNER_USER_ID) and gives up after JARVIS_APPROVAL_TIMEOUT (60 s), well inside
+ *           BRAIN_TIMEOUT_MS. Every field is checked here (readApproval): the page shows what the
+ *           brain says the action is, so it is trimmed, capped and never trusted as markup.
+ *
  *   Stopping: when the person stops the turn (`signal`), the connection to the brain closes and
  *           the brain stops the turn itself - the model request in flight is closed, no further
  *           tool starts, nothing is kept - and is free for the next message at once.
+ *
+ *   interactive = false when the caller has no way to show an Approval Card (no `onApproval`): the
+ *           brain then declines gated tools straight away instead of waiting for an answer.
  *
  *   attachments = files the person attached to this message, already saved under
  *           the Jarvis project's uploads/ folder (lib/uploads.ts); `path` is
@@ -70,20 +84,30 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  * an OPENAI_API_KEY and the recording left the machine); "local" is faster-whisper
  * on the brain's own machine.
  *
+ * The approvals door (decideApproval) carries the person's answer to an Approval Card back:
+ *
+ *   POST {JARVIS_APPROVALS_URL}/<approval_id>   default: JARVIS_BRAIN_URL with its /chat swapped for /approvals
+ *   body  { user_id, decision: "allow" | "deny" }
+ *   reply 200 { ok: true } | 404 the card is gone (answered, timed out, the turn stopped) | 403 not that user's
+ *
  * The status door (getJarvisStatus) is what the hub's sidebar shows as "Agents & tools":
  *
  *   GET {JARVIS_HEALTH_URL}   default: JARVIS_BRAIN_URL with its /chat swapped for /health
  *   reply { ok: boolean, mcp_servers: [{ name, connected, tools: string[], error }],
  *           manager: { provider, model, on_standby, primary: { provider, model, state, last_error?, back_in? } },
  *           agents: [{ name, title, tool, active, routes: [{ role, provider, model, state, why?, last_error? }],
- *                      tools: string[] }], ... }
+ *                      tools: string[] }],
+ *           heads: [{ name, title, tools: string[], state: "ready" | "not configured" | "off", why?, owner_only }], ... }
  *
  *   ok = the brain has a language model to answer with. mcp_servers = its tool
  *   servers (web search, memory, ...) as they are right now; `error` is for the
  *   logs, never the page. manager = the brain's own model (Claude, or the Gemini
  *   standby and why); agents = the specialist agents it delegates to (Python
  *   agents/), each with its routes in order and the MCP tools it holds. A brain
- *   from before the agents sends neither, and the sidebar then shows none.
+ *   from before the agents sends neither, and the sidebar then shows none. heads = what Jarvis
+ *   can do that is not an LLM agent: the Heads of Creative (images), Publishing (PowerPoint)
+ *   and Analytics (Excel), and Google Classroom; `why` is a short fixed phrase from the brain
+ *   ("needs OPENAI_API_KEY") and is checked against a pattern here before it is shown.
  *   Free text (`why`, `error`) never leaves this file: it can hold local paths.
  *
  * The artifacts door (fetchArtifact) is where a file Jarvis made comes from. A reply
@@ -111,7 +135,14 @@ export type ChatContext = { userId?: string; appUrl?: string; speak?: boolean; s
  * A typed turn's extras: the files attached to it (see `attachments` in the contract above), and
  * `onProgress`, told each step the brain reports while it works ("Searching the web...").
  */
-export type AskContext = ChatContext & { attachments?: Attachment[]; onProgress?: (status: string) => void };
+export type AskContext = ChatContext & {
+  attachments?: Attachment[];
+  onProgress?: (status: string) => void;
+  /** A confirmation-gated tool is waiting for the person (see action_required above). */
+  onApproval?: (approval: BrainApproval) => void;
+  /** That card was answered, timed out or was given up on: the page can close it. */
+  onApprovalResolved?: (resolved: BrainApprovalResolved) => void;
+};
 
 /** What the brain said, and its voice if it was asked for one and could give it. */
 export interface BrainAnswer {
@@ -119,10 +150,32 @@ export interface BrainAnswer {
   audio: ReplyAudio | null;
 }
 
+/** What a paused action is, as the Approval Card shows it. Nothing here is trusted as markup. */
+export interface BrainApproval {
+  /** Hands the answer back to the right waiting action (decideApproval). */
+  id: string;
+  /** The tool's name: "send_line_notification", "start_subtrack_env", ... */
+  tool: string;
+  /** The question, in a sentence: "Do you authorize sending this LINE message?" */
+  prompt: string;
+  /** The tool's arguments, as name and value (a credential's value arrives as "(hidden)"). */
+  details: { name: string; value: string }[];
+  /** Seconds the brain waits before it counts the silence as a "no". */
+  expiresInSeconds: number;
+}
+
+export interface BrainApprovalResolved {
+  id: string;
+  decision: "allow" | "deny" | "timeout";
+}
+
 const BRAIN_URL = process.env.JARVIS_BRAIN_URL ?? "http://127.0.0.1:8000/chat";
 const VOICE_URL = process.env.JARVIS_VOICE_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/voice");
 const HEALTH_URL = process.env.JARVIS_HEALTH_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/health");
 const ARTIFACTS_URL = process.env.JARVIS_ARTIFACTS_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/artifacts");
+const APPROVALS_URL = process.env.JARVIS_APPROVALS_URL ?? BRAIN_URL.replace(/\/chat\/?$/, "/approvals");
+// Answering a card only wakes a waiting thread: it comes back at once.
+const APPROVAL_TIMEOUT_MS = 8_000;
 // A file on the brain's own disk: a picture of a few MB, or a deck, arrives in well under a second.
 const ARTIFACT_TIMEOUT_MS = 15_000;
 // The brain answers /health at once, except while it is still starting (it connects its
@@ -165,6 +218,8 @@ export async function askJarvis(
         ...(context.userId ? { user_id: context.userId } : {}),
         ...(context.appUrl ? { app_url: context.appUrl } : {}),
         ...(context.speak ? { speak: true } : {}),
+        // A caller that cannot show an Approval Card says so, and gated tools are declined at once.
+        ...(context.onApproval ? {} : { interactive: false }),
         ...(context.attachments?.length ? { attachments: context.attachments } : {}),
       }),
       cache: "no-store",
@@ -203,6 +258,77 @@ function progressText(value: unknown): string | null {
   const text = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   if (!text) return null;
   return text.length > MAX_PROGRESS_CHARS ? `${text.slice(0, MAX_PROGRESS_CHARS - 1).trimEnd()}…` : text;
+}
+
+const APPROVAL_ID = /^[A-Za-z0-9_-]{8,64}$/;
+const APPROVAL_TOOL = /^[A-Za-z0-9_.:-]{1,80}$/;
+const MAX_APPROVAL_DETAILS = 12;
+const MAX_APPROVAL_VALUE_CHARS = 6000;
+
+function cleanText(value: unknown, max: number, keepLines = false): string {
+  if (typeof value !== "string") return "";
+  // Control characters out (a newline and tab stay for code and multi-line messages when asked).
+  const controls = keepLines ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+/g : /[\u0000-\u001f\u007f]+/g;
+  const text = value.replace(controls, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text;
+}
+
+/** An action_required event as the page may show it, or null when it is not a well-formed request. */
+export function readApproval(event: Record<string, unknown>): BrainApproval | null {
+  const id = typeof event.approval_id === "string" ? event.approval_id : "";
+  const tool = typeof event.tool === "string" ? event.tool : "";
+  if (!APPROVAL_ID.test(id) || !APPROVAL_TOOL.test(tool)) return null;
+  const details: BrainApproval["details"] = [];
+  for (const item of Array.isArray(event.details) ? event.details : []) {
+    const row = record(item);
+    const name = cleanText(row?.name, 64);
+    if (!row || !name || details.length >= MAX_APPROVAL_DETAILS) continue;
+    details.push({ name, value: cleanText(row.value, MAX_APPROVAL_VALUE_CHARS, true) });
+  }
+  const expires = typeof event.expires_in === "number" && Number.isFinite(event.expires_in) ? event.expires_in : 60;
+  return {
+    id,
+    tool,
+    prompt: cleanText(event.prompt, 600) || `Do you authorize running ${tool}?`,
+    details,
+    expiresInSeconds: Math.max(5, Math.min(Math.round(expires), 100)),
+  };
+}
+
+export function readApprovalResolved(event: Record<string, unknown>): BrainApprovalResolved | null {
+  const id = typeof event.approval_id === "string" ? event.approval_id : "";
+  const decision = event.decision === "allow" || event.decision === "deny" || event.decision === "timeout" ? event.decision : null;
+  return APPROVAL_ID.test(id) && decision ? { id, decision } : null;
+}
+
+/** What came of an answer to a card. */
+export type ApprovalOutcome = "recorded" | "gone" | "forbidden";
+
+/**
+ * Carries the person's Allow or Deny to the brain (POST /approvals/<id>). "gone": the card is no longer
+ * waiting - it timed out, was answered, or its turn was stopped. "forbidden": it was not this user's.
+ * Throws JarvisBrainError (safe to show) when the brain cannot be reached or fails.
+ */
+export async function decideApproval(id: string, userId: string, decision: "allow" | "deny"): Promise<ApprovalOutcome> {
+  if (!APPROVAL_ID.test(id)) return "gone";
+  let response: Response;
+  try {
+    response = await fetch(`${APPROVALS_URL}/${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, decision }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
+    });
+  } catch (error) {
+    console.error(`Jarvis approvals endpoint unreachable at ${APPROVALS_URL}:`, error);
+    throw new JarvisBrainError("Jarvis brain is offline.");
+  }
+  if (response.ok) return "recorded";
+  if (response.status === 404) return "gone";
+  if (response.status === 403) return "forbidden";
+  console.error(`Jarvis approvals endpoint answered ${response.status} ${response.statusText}`);
+  throw new JarvisBrainError(`Jarvis brain returned an error (${response.status}).`);
 }
 
 /** One server-sent event's JSON (its `data:` lines joined), or null for a comment or anything unreadable. */
@@ -254,6 +380,13 @@ async function readBrainStream(
         if (event.type === "progress") {
           const status = progressText(event.status);
           if (status) context.onProgress?.(status);
+        } else if (event.type === "action_required") {
+          const approval = readApproval(event);
+          if (approval) context.onApproval?.(approval);
+          else console.error("Jarvis brain sent an approval request that could not be read; it will time out as a no.");
+        } else if (event.type === "action_resolved") {
+          const resolved = readApprovalResolved(event);
+          if (resolved) context.onApprovalResolved?.(resolved);
         } else if (event.type === "final") {
           return { reply: event.message, audio: event.audio };
         } else if (event.type === "error") {
@@ -392,6 +525,19 @@ export interface BrainManager {
   primary: { provider: string; model: string; state: BrainRouteState; lastError?: string; backInSeconds?: number };
 }
 
+/** One capability that is not an LLM agent: the Heads of Creative, Publishing and Analytics, or Google Classroom. */
+export interface BrainHead {
+  /** "creative", "publishing", "analytics", "classroom". */
+  name: string;
+  title: string;
+  /** "ready": Jarvis can use it now. "not configured": on, but something is not set up. "off": switched off. */
+  state: "ready" | "not configured" | "off";
+  /** What is missing, in a few words ("needs OPENAI_API_KEY"); empty when ready. */
+  why: string;
+  /** Only the owner's own account can use it (Google Classroom). */
+  ownerOnly: boolean;
+}
+
 export interface BrainStatus {
   /** The brain has a language model to answer with. */
   ready: boolean;
@@ -400,6 +546,8 @@ export interface BrainStatus {
   manager: BrainManager | null;
   /** Empty with the team off, or from a brain without one. */
   agents: BrainAgent[];
+  /** Creative, Publishing, Analytics and Classroom. Empty from a brain from before they were reported. */
+  heads: BrainHead[];
 }
 
 const SERVER_NAME = /^[a-z0-9_]{1,64}$/;
@@ -445,6 +593,20 @@ function readAgent(value: unknown): BrainAgent | null {
   }
   const title = typeof agent.title === "string" ? agent.title.trim().slice(0, 80) : "";
   return { name: agent.name, title: title || agent.name, active: agent.active === true, routes: routes as BrainRoute[], servers: [...servers] };
+}
+
+const HEAD_STATES: readonly BrainHead["state"][] = ["ready", "not configured", "off"];
+// `why` is a short phrase the brain wrote for the sidebar; anything longer or odder is dropped, not shown.
+const HEAD_WHY = /^[A-Za-z0-9 ()_./,=-]{0,80}$/;
+
+function readHead(value: unknown): BrainHead | null {
+  const head = record(value);
+  if (!head || typeof head.name !== "string" || !SERVER_NAME.test(head.name)) return null;
+  const state = HEAD_STATES.find((candidate) => candidate === head.state);
+  if (!state) return null;
+  const title = typeof head.title === "string" ? head.title.trim().slice(0, 80) : "";
+  const why = typeof head.why === "string" && HEAD_WHY.test(head.why) ? head.why.trim() : "";
+  return { name: head.name, title: title || head.name, state, why, ownerOnly: head.owner_only === true };
 }
 
 function readManager(value: unknown): BrainManager | null {
@@ -498,7 +660,11 @@ export async function getJarvisStatus(): Promise<BrainStatus> {
     .map(readAgent)
     .filter((agent): agent is BrainAgent => agent !== null)
     .slice(0, 12);
-  return { ready: body.ok === true, servers, manager: readManager(body.manager), agents };
+  const heads = (Array.isArray(body.heads) ? body.heads : [])
+    .map(readHead)
+    .filter((head): head is BrainHead => head !== null)
+    .slice(0, 12);
+  return { ready: body.ok === true, servers, manager: readManager(body.manager), agents, heads };
 }
 
 /**

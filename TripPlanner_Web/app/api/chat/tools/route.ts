@@ -4,6 +4,7 @@ import {
   getJarvisStatus,
   JarvisBrainError,
   type BrainAgent,
+  type BrainHead,
   type BrainManager,
   type BrainToolServer,
 } from "@/lib/jarvisBrain";
@@ -18,6 +19,8 @@ interface ToolsResponse {
   manager: BrainManager | null;
   /** The specialist agents it delegates to, each with its model routes in order. */
   agents: BrainAgent[];
+  /** What it can do that is not an LLM agent: Creative, Publishing, Analytics, Classroom - ready or what is missing. */
+  heads: BrainHead[];
   /**
    * Its tool servers (web search, memory, ...), connected or not, and - when the brain
    * has a team - which working agent holds each one's tools (null: the manager holds
@@ -30,14 +33,15 @@ interface ToolsResponse {
  * GET /api/chat/tools - who Jarvis is made of right now, for the hub's sidebar
  * ("Agents & tools"): the executive manager and the model it is on, the
  * specialist agents (Data & Documents, Research, Productivity) and how each is
- * running, and the tool servers with the agent that uses each. All from the
+ * running, the Heads that are not LLM agents (Creative, Publishing, Analytics,
+ * Google Classroom) and whether each is set up, and the tool servers with the agent that uses each. All from the
  * brain's GET /health (lib/jarvisBrain.ts), narrowed and checked there - the
  * brain's own error text stays in its logs.
  *
  * A brain that is offline or still starting is not an error here - it is the
  * status to show - so it answers 200 with `reachable: false`.
  *
- * Responses: 200 { reachable, ready, manager, agents, servers }, 401 signed out.
+ * Responses: 200 { reachable, ready, manager, agents, heads, servers }, 401 signed out.
  */
 export async function GET() {
   const userId = await getSessionUserId();
@@ -59,6 +63,7 @@ export async function GET() {
       ready: status.ready,
       manager: status.manager,
       agents: status.agents,
+      heads: status.heads,
       // Without a team (switched off, or an older brain) there is no one else to name: no owner at all.
       servers: status.agents.length
         ? status.servers.map((server) => ({ ...server, agent: owner.get(server.name) ?? null }))
@@ -66,7 +71,7 @@ export async function GET() {
     };
   } catch (error) {
     if (!(error instanceof JarvisBrainError)) console.error("GET /api/chat/tools failed:", error);
-    body = { reachable: false, ready: false, manager: null, agents: [], servers: [] };
+    body = { reachable: false, ready: false, manager: null, agents: [], heads: [], servers: [] };
   }
   return NextResponse.json(body, { headers: { "Cache-Control": "private, no-store" } });
 }

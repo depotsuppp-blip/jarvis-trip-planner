@@ -12,7 +12,9 @@ import type { ReplyAudio } from "./replyAudio";
  *   POST /api/chat { message, conversationId?, newConversation?, speak? }   one typed turn
  *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?)   one typed turn with a file
  *        - asked for as lines of JSON (Accept: application/x-ndjson) when the caller wants Jarvis's
- *          steps on the way ("Searching the web..."): `send` with `onProgress`
+ *          steps on the way ("Searching the web..."): `send` with `onProgress`; the same lines carry
+ *          an action waiting for the person's yes or no (`approval`) and its closing (`approval_resolved`)
+ *   POST /api/chat/approvals/<id> { decision: "allow" | "deny" }   the answer to that: `decideApproval`
  *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
  *   GET  /api/chat/tools                    the manager's model, the specialist agents and the tool servers
  *   DELETE /api/chat/messages/<id>          deletes one saved message (the person's own)
@@ -80,6 +82,35 @@ export interface ModelRoute {
   lastError?: string;
 }
 
+/** An action the brain paused for the person's Allow or Deny (an `approval` line of the stream; see lib/jarvisBrain.ts). */
+export interface ApprovalRequest {
+  id: string;
+  tool: string;
+  prompt: string;
+  details: { name: string; value: string }[];
+  expiresInSeconds: number;
+}
+
+/** What happens on the way of a streamed turn besides its steps. */
+export interface TurnEvents {
+  onProgress: (status: string) => void;
+  onApproval?: (approval: ApprovalRequest) => void;
+  /** The card was answered, timed out, or was given up on. */
+  onApprovalResolved?: (resolved: { id: string; decision: "allow" | "deny" | "timeout" }) => void;
+}
+
+/** One capability that is not an LLM agent (see BrainHead in lib/jarvisBrain.ts). */
+export interface HeadData {
+  /** "creative", "publishing", "analytics", "classroom". */
+  name: string;
+  title: string;
+  state: "ready" | "not configured" | "off";
+  /** What is missing, in a few words; empty when ready. */
+  why: string;
+  /** Only the owner's own account can use it. */
+  ownerOnly: boolean;
+}
+
 /** What the sidebar's "Agents & tools" is built from (app/api/chat/tools/route.ts). */
 export interface ToolsData {
   /** The brain answered at all. */
@@ -95,6 +126,8 @@ export interface ToolsData {
   } | null;
   /** The specialist agents: name, title, whether taking tasks, model routes in order, servers held. */
   agents?: { name: string; title: string; active: boolean; routes: ModelRoute[]; servers: string[] }[];
+  /** Creative, Publishing, Analytics and Classroom: the capabilities that are plain Python, not LLM agents. */
+  heads?: HeadData[];
   /** Its tool servers: config name, connected or not, how many tools, and the agent that uses it (null = the manager). */
   servers: { name: string; connected: boolean; tools: number; agent?: string | null }[];
 }
@@ -170,7 +203,8 @@ function failure(status: number, data: unknown): ApiFailure {
  * plain JSON response and is read like any other request; so is the answer of a server that does
  * not stream. Never throws: a stream that breaks off is a network failure, a stopped one "cancelled".
  */
-async function streamedTurn(url: string, init: RequestInit, onProgress: (status: string) => void): Promise<ApiResult<TurnData>> {
+async function streamedTurn(url: string, init: RequestInit, events: TurnEvents): Promise<ApiResult<TurnData>> {
+  const { onProgress, onApproval, onApprovalResolved } = events;
   const signal = init.signal ?? undefined;
   const cancelled = (): ApiFailure | null =>
     signal?.aborted && !isTimeout(signal) ? { ok: false, kind: "cancelled", status: 0, message: "" } : null;
@@ -210,6 +244,12 @@ async function streamedTurn(url: string, init: RequestInit, onProgress: (status:
         }
         if (event.type === "progress" && typeof event.status === "string") {
           onProgress(event.status);
+        } else if (event.type === "approval" && event.approval && typeof event.approval === "object") {
+          // Already checked by the server (readApproval in lib/jarvisBrain.ts).
+          onApproval?.(event.approval as ApprovalRequest);
+        } else if (event.type === "approval_resolved" && typeof event.id === "string") {
+          const decision = event.decision === "allow" || event.decision === "deny" ? event.decision : "timeout";
+          onApprovalResolved?.({ id: event.id, decision });
         } else if (event.type === "final") {
           return cancelled() ?? { ok: true, data: event as unknown as TurnData };
         } else if (event.type === "error") {
@@ -250,8 +290,9 @@ export const chatApi = {
   // No client timeout: the brain may run a whole trip plan (tens of seconds) and the server enforces its own limit.
   // With a file the turn goes as multipart (no Content-Type set, so the browser adds the boundary); without, as JSON.
   // `signal` is "Stop generating": aborting it answers { ok: false, kind: "cancelled" }, and the server saves no reply
-  // (and the brain stops working on it). `onProgress` hears each step Jarvis reports on the way (streamedTurn).
-  send: ({ file, ...turn }: TurnRequest, signal?: AbortSignal, onProgress?: (status: string) => void) => {
+  // (and the brain stops working on it). `events.onProgress` hears each step Jarvis reports on the way (streamedTurn),
+  // `events.onApproval` an action waiting for the person's yes or no.
+  send: ({ file, ...turn }: TurnRequest, signal?: AbortSignal, events?: TurnEvents) => {
     let init: RequestInit;
     if (!file) {
       init = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(turn), signal };
@@ -264,8 +305,18 @@ export const chatApi = {
       if (turn.speak) form.append("speak", "true");
       init = { method: "POST", body: form, signal };
     }
-    return onProgress ? streamedTurn("/api/chat", init, onProgress) : request<TurnData>("/api/chat", init);
+    return events ? streamedTurn("/api/chat", init, events) : request<TurnData>("/api/chat", init);
   },
+
+  // The person's Allow or Deny for an Approval Card. 404 ("not-found") means it is no longer waiting;
+  // 403 comes back as a server failure with the server's own sentence.
+  decideApproval: (id: string, decision: "allow" | "deny") =>
+    request<{ ok: true }>(`/api/chat/approvals/${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+    }),
 
   // The recording goes as multipart, and no Content-Type is set so the browser adds the boundary.
   // No client timeout, for the same reason as `send`: transcription and then the brain's whole turn.

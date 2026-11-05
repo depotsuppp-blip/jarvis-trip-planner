@@ -24,6 +24,12 @@ whose person pressed Stop sets the run's cancel event; code that can stop betwee
 steps (a specialist agent's loop, the Canva browser, a tool call that has not started)
 calls check_cancelled() and gets Cancelled. The voice assistant's runs are never
 cancelled and report progress nowhere, so for it both are no-ops.
+
+EVENTS AND APPROVALS. A run can also push a structured event to whoever follows it
+(emit_event): the web hub uses it to ask the person to approve a confirmation-gated
+tool (approvals.py). confirming() names the tool being confirmed for the length of
+the question, so the approval can say WHAT it is asking about without the confirm
+callback (which only ever receives a sentence) having to be told.
 """
 
 from __future__ import annotations
@@ -126,15 +132,22 @@ class RunScope:
     # Called with a short sentence ("Head of Research: searching the web..."); thread-safe,
     # never raises. None when nobody is listening (the voice assistant).
     progress: Optional[Callable[[str], None]] = None
+    # Called with one structured event (a dict, e.g. an approval request); thread-safe.
+    # None when the caller cannot answer one (the voice assistant, the web /voice door).
+    emit: Optional[Callable[[dict[str, Any]], None]] = None
 
 
 _RUN: contextvars.ContextVar[Optional[RunScope]] = contextvars.ContextVar("jarvis_run_scope", default=None)
 
 
 @contextmanager
-def run_scope(cancel: threading.Event, progress: Optional[Callable[[str], None]] = None) -> Iterator[RunScope]:
-    """Makes a run's cancel event and progress reporter current for the with-block."""
-    scope = RunScope(cancel=cancel, progress=progress)
+def run_scope(
+    cancel: threading.Event,
+    progress: Optional[Callable[[str], None]] = None,
+    emit: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> Iterator[RunScope]:
+    """Makes a run's cancel event, progress reporter and event channel current for the with-block."""
+    scope = RunScope(cancel=cancel, progress=progress, emit=emit)
     token = _RUN.set(scope)
     try:
         yield scope
@@ -169,3 +182,48 @@ def report_progress(text: str) -> None:
         scope.progress(text)
     except Exception:  # noqa: BLE001 - a status line must never cost the work its result
         pass
+
+
+def can_emit() -> bool:
+    """True when the current run has someone who can be sent a structured event (and answer it)."""
+    scope = _RUN.get()
+    return scope is not None and scope.emit is not None
+
+
+def emit_event(event: dict[str, Any]) -> bool:
+    """
+    Sends one structured event to whoever follows the current run. True when it was handed
+    over; False when nobody follows the run in a way that can take it, or the hand-over failed.
+    """
+    scope = _RUN.get()
+    if scope is None or scope.emit is None:
+        return False
+    try:
+        scope.emit(event)
+    except Exception:  # noqa: BLE001 - a status event must never cost the work its result
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# What a confirmation is about
+# ---------------------------------------------------------------------------
+
+_SUBJECT: contextvars.ContextVar[Optional[tuple[str, dict[str, Any]]]] = contextvars.ContextVar(
+    "jarvis_confirmation_subject", default=None
+)
+
+
+@contextmanager
+def confirming(tool: str, args: Optional[dict[str, Any]]) -> Iterator[None]:
+    """For the with-block, the confirmation being asked is about `tool` called with `args`."""
+    token = _SUBJECT.set((tool, dict(args or {})))
+    try:
+        yield
+    finally:
+        _SUBJECT.reset(token)
+
+
+def confirmation_subject() -> Optional[tuple[str, dict[str, Any]]]:
+    """(tool name, arguments) the current confirmation question is about, or None outside one."""
+    return _SUBJECT.get()

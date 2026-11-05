@@ -123,6 +123,32 @@ export interface ChatState {
  */
 export interface PendingReply {
   status: string | null;
+  /**
+   * An action Jarvis has paused until the person says yes or no (a LINE message, starting a server,
+   * writing a new tool): the Approval Card the bubble shows. Null when nothing is waiting.
+   */
+  approval?: PendingApproval | null;
+}
+
+/**
+ * One action waiting for the person's Allow or Deny. Everything but `state` comes from the brain
+ * (checked in lib/jarvisBrain.ts) and is shown as plain text, never as markup.
+ */
+export interface PendingApproval {
+  /** Hands the answer to the right waiting action. */
+  id: string;
+  /** The tool's name ("send_line_notification"). */
+  tool: string;
+  /** The question: "Do you authorize ...?" */
+  prompt: string;
+  /** The tool's arguments, name and value. */
+  details: { name: string; value: string }[];
+  /** When the brain stops waiting and counts the silence as a no (milliseconds since the epoch, this page's clock). */
+  expiresAt: number;
+  /** "waiting": the buttons are live. "sending": an answer is on its way. */
+  state: "waiting" | "sending";
+  /** Set when the last answer could not be delivered - the buttons are live again. */
+  error?: string;
 }
 
 export interface OrbState {

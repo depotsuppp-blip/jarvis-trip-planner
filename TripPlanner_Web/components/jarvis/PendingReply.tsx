@@ -3,6 +3,7 @@
 import { memo } from "react";
 import { Square } from "lucide-react";
 import { useChat, useChatActions } from "@/lib/jarvis/JarvisProvider";
+import { ApprovalCard } from "./ApprovalCard";
 import { focusRing } from "./styles";
 
 /** What the bubble says when nothing has said what Jarvis is doing (see PendingReply in lib/jarvis/types.ts). */
@@ -18,6 +19,9 @@ const THINKING = "Jarvis is thinking";
  * "Delegating to Head of Analytics") - each step the brain streams for a typed turn
  * (ChatController.reportStatus); until the first one, "Jarvis is thinking". Only the words are a live region, so a change of
  * status is announced once and the dots never are. Under reduced motion the dots hold still.
+ *
+ * When an action is paused for the person's yes or no (a LINE message, starting a server, a new
+ * tool), its Approval Card stands between the bubble and "Stop generating" (pending.approval).
  *
  * Stop generating aborts the turn's request (ChatController: endVoice): the reply is
  * neither shown nor saved, and the person's message stays.
@@ -44,6 +48,7 @@ export const PendingReply = memo(function PendingReply() {
           {pending.status ?? THINKING}
         </span>
       </div>
+      {pending.approval && <ApprovalCard approval={pending.approval} />}
       <div className="mt-1.5">
         <button
           type="button"

@@ -1,4 +1,4 @@
-import { chatApi, type ApiFailure } from "./chatApi";
+import { chatApi, type ApiFailure, type ApprovalRequest } from "./chatApi";
 import { demoReply, initialAgents, parseDemoCommand, type DemoTool } from "./demo";
 import { toChatMessage } from "./messageContent";
 import { canSpeak, type ReplyAudio } from "./replyAudio";
@@ -130,6 +130,11 @@ export interface ChatActions {
    * no longer sees it either. Not the message whose answer is still on its way (`sendingId`).
    */
   deleteMessage(id: string): Promise<void>;
+  /**
+   * The person's answer to an Approval Card: Allow runs the action Jarvis paused, Deny reports it
+   * as declined. The turn carries on either way; a card that is no longer waiting just closes.
+   */
+  decideApproval(id: string, decision: "allow" | "deny"): Promise<void>;
 }
 
 /** Where to find the saved copy of a typed message whose turn never came back with it. */
@@ -226,6 +231,7 @@ export class ChatController {
     previewWidget: (tool) => this.previewWidget(tool),
     editMessage: (id) => this.editMessage(id),
     deleteMessage: (id) => this.deleteMessage(id),
+    decideApproval: (id, decision) => this.decideApproval(id, decision),
   };
 
   /**
@@ -426,9 +432,18 @@ export class ChatController {
         ...(this.speech.getState().enabled ? { speak: true } : {}),
       },
       request.signal,
-      // Jarvis's steps on the way, into the thinking bubble - only while this turn is the one waiting.
-      (status) => {
-        if (this.turn === mine && this.request === request) this.reportStatus(status);
+      // Jarvis's steps on the way, into the thinking bubble - and an action waiting for a yes or no,
+      // as the Approval Card under it - only while this turn is the one waiting.
+      {
+        onProgress: (status) => {
+          if (this.turn === mine && this.request === request) this.reportStatus(status);
+        },
+        onApproval: (approval) => {
+          if (this.turn === mine && this.request === request) this.showApproval(approval);
+        },
+        onApprovalResolved: ({ id }) => {
+          if (this.turn === mine && this.request === request) this.closeApproval(id);
+        },
       }
     );
     if (this.request === request) this.request = null;
@@ -827,9 +842,67 @@ export class ChatController {
    * own dots say "working", so a trailing "..." is dropped.
    */
   reportStatus(status: string | null): void {
-    if (!this.chat.getState().pending) return;
+    const pending = this.chat.getState().pending;
+    if (!pending) return;
     const words = status?.replace(/\s*(?:\.{3}|…)\s*$/, "").trim() || null;
-    this.chat.setState({ pending: { status: words } });
+    // An Approval Card that is waiting stays: a new step is not an answer to it.
+    this.chat.setState({ pending: { ...pending, status: words } });
+  }
+
+  /** An action is paused for the person's yes or no: the card goes under the bubble. */
+  private showApproval(request: ApprovalRequest): void {
+    const pending = this.chat.getState().pending;
+    if (!pending) return;
+    this.chat.setState({
+      pending: {
+        ...pending,
+        status: "Waiting for your approval",
+        approval: {
+          id: request.id,
+          tool: request.tool,
+          prompt: request.prompt,
+          details: request.details,
+          expiresAt: Date.now() + request.expiresInSeconds * 1000,
+          state: "waiting",
+        },
+      },
+    });
+  }
+
+  /** The card `id` was answered, timed out, or was given up on: take it away (a different card stays). */
+  private closeApproval(id: string): void {
+    const pending = this.chat.getState().pending;
+    if (!pending?.approval || pending.approval.id !== id) return;
+    this.chat.setState({ pending: { ...pending, status: null, approval: null } });
+  }
+
+  async decideApproval(id: string, decision: "allow" | "deny"): Promise<void> {
+    const approval = this.chat.getState().pending?.approval;
+    if (!approval || approval.id !== id || approval.state !== "waiting") return;
+    const update = (change: Partial<NonNullable<typeof approval>> | null, status?: string | null) =>
+      this.chat.setState((state) => {
+        if (!state.pending?.approval || state.pending.approval.id !== id) return {};
+        return {
+          pending: {
+            ...state.pending,
+            ...(status !== undefined ? { status } : {}),
+            approval: change ? { ...state.pending.approval, ...change } : null,
+          },
+        };
+      });
+
+    update({ state: "sending", error: undefined });
+    const result = await chatApi.decideApproval(id, decision);
+    if (this.disposed) return;
+    if (result.ok) {
+      // The brain has it and carries on; its closing line would take the card away a moment later anyway.
+      update(null, decision === "allow" ? "Approved - carrying on" : "Declined - carrying on");
+    } else if (result.kind === "not-found") {
+      // Timed out, or the turn was stopped: nothing is waiting any more.
+      update(null, null);
+    } else {
+      update({ state: "waiting", error: result.message });
+    }
   }
 
   /** A cancelled recording or upload must not leave the sidebar saying Voice is working. */

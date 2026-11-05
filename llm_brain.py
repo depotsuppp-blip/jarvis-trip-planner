@@ -1726,14 +1726,28 @@ def _tool_get_system_status() -> str:
     screen, it returns the numbers as a sentence to speak.
     """
     snapshot = system_status.collect()
+    # The capabilities that are not LLM agents (Creative, Publishing, Analytics, Classroom) are
+    # real, not sample: they come from the brain itself. Without one (a test) the card is as before.
+    brain = _CURRENT_BRAIN.get()
+    try:
+        capabilities = brain.heads_status() if brain is not None else []
+    except Exception as exc:  # noqa: BLE001 - the card is still worth showing without them
+        print(f"[Brain] get_system_status could not read the capabilities: {type(exc).__name__}: {exc}")
+        capabilities = []
     try:
         shown = request_context.add_widget(
-            rich_reply.widget("system_status", system_status.widget_data(snapshot), sample=True)
+            rich_reply.widget(
+                "system_status",
+                system_status.widget_data(snapshot, capabilities),
+                # Only the CPU / memory / uptime rows are made up: with capability rows on the card each
+                # row says so itself (data.services[].sample), and the card as a whole is not a sample.
+                sample=not capabilities,
+            )
         )
     except (TypeError, ValueError) as exc:  # a bug in widget_data, not the user's problem
         print(f"[Brain] get_system_status could not build its widget: {exc}")
         shown = False
-    return system_status.web_result(snapshot) if shown else system_status.spoken_summary(snapshot)
+    return system_status.web_result(snapshot, capabilities) if shown else system_status.spoken_summary(snapshot, capabilities)
 
 
 def _tool_check_poll_status_async(trip_id: str = "") -> str:
@@ -3501,6 +3515,10 @@ class TurnRun:
     inline: bool
     cancel: threading.Event = field(default_factory=threading.Event)
     progress: Optional[Callable[[str], None]] = None
+    # The web run's channel for events that are not progress text - an approval card for a
+    # confirmation-gated tool (approvals.py). Thread-safe; None for voice and for callers that
+    # do not take events.
+    emit: Optional[Callable[[dict[str, Any]], None]] = None
     started: float = field(default_factory=time.monotonic)
     node: str = Node.ANALYZE_INTENT
     next: str = Node.DONE
@@ -3532,6 +3550,11 @@ class TurnRun:
 # The run being answered, for code a node calls (a tool on a worker thread gets a copy of the
 # context, so it sees the same run). None outside a run.
 _CURRENT_RUN: contextvars.ContextVar[Optional[TurnRun]] = contextvars.ContextVar("jarvis_turn_run", default=None)
+
+
+# The brain answering, for tools that report on the brain itself (get_system_status lists its
+# capabilities). Set with the run, and seen by the run's worker threads the same way.
+_CURRENT_BRAIN: contextvars.ContextVar[Optional["LLMBrain"]] = contextvars.ContextVar("jarvis_brain", default=None)
 
 
 def _current_run() -> TurnRun:
@@ -3856,6 +3879,65 @@ class LLMBrain:
     def team_status(self) -> list[dict[str, Any]]:
         """Each specialist agent: whether it is working, its routes (provider, model, state) and its tools."""
         return [agent.status(self._mcp_tools) for agent in self._team.values()]
+
+    def heads_status(self) -> list[dict[str, Any]]:
+        """
+        The capabilities that are not LLM agents, for /health and the web hub's sidebar: the
+        Head of Creative (images), of Publishing (PowerPoint) and of Analytics (Excel) - plain
+        Python behind a delegate_to_* tool, so they have no model routes and are not in
+        team_status() - and Google Classroom (delegate_to_classroom_*, read-only, owner only).
+
+            {"name": "creative", "title": "Head of Creative", "tools": ["delegate_to_creative"],
+             "state": "ready" | "not configured" | "off", "why": "needs OPENAI_API_KEY",
+             "owner_only": false}
+
+        "ready": the manager has the tool this turn. "not configured": it is on but cannot work
+        until something is set up (`why` says what, in a few words of this method's own - never the
+        failure's text, which can name paths). "off": switched off by its JARVIS_* setting.
+        Checks only what is already known - no network call, no image, no sign-in.
+        """
+
+        def head(name: str, title: str, tool: str, agent: Any, switch: str, needs: dict[str, str]) -> dict[str, Any]:
+            row: dict[str, Any] = {"name": name, "title": title, "tools": [tool], "owner_only": False}
+            if agent is None:
+                row["state"] = "off"
+                row["why"] = f"switched off ({switch}=0)" if _env(switch, "1").lower() in ("0", "false", "no", "off") else "could not start"
+            elif agent.available:
+                row["state"] = "ready"
+                row["why"] = ""
+            else:
+                reason = str(getattr(agent, "unavailable_reason", "") or "")
+                row["state"] = "not configured"
+                row["why"] = next((hint for marker, hint in needs.items() if marker in reason), "not set up")
+            return row
+
+        rows = [
+            head("creative", "Head of Creative", DELEGATE_CREATIVE, self._creative, "JARVIS_CREATIVE",
+                 {"OPENAI_API_KEY": "needs OPENAI_API_KEY", "openai package": "needs the openai package",
+                  "JARVIS_IMAGE_MODEL": "needs JARVIS_IMAGE_MODEL"}),
+            head("publishing", "Head of Publishing", DELEGATE_PUBLISHING, self._publishing, "JARVIS_PUBLISHING",
+                 {"python-pptx": "needs python-pptx", "Canva": "Canva is not ready"}),
+            head("analytics", "Head of Analytics", DELEGATE_ANALYTICS, self._analytics, "JARVIS_ANALYTICS",
+                 {"pandas": "needs pandas and openpyxl"}),
+        ]
+
+        classroom_tools = [t.name for t in TOOLS if t.name.startswith("delegate_to_classroom_")]
+        classroom: dict[str, Any] = {
+            "name": "classroom",
+            "title": "Google Classroom",
+            "tools": classroom_tools,
+            "owner_only": True,
+        }
+        try:
+            from utils import classroom_auth  # lazy: not needed unless asked
+
+            signed_in = classroom_auth.token_file().is_file()
+        except Exception:  # noqa: BLE001 - a status row must never fail /health
+            signed_in = False
+        classroom["state"] = "ready" if signed_in else "not configured"
+        classroom["why"] = "" if signed_in else "not signed in (run utils/classroom_auth.py)"
+        rows.append(classroom)
+        return rows
 
     def _active_tools(self) -> list[ToolSpec]:
         """
@@ -4470,7 +4552,11 @@ class LLMBrain:
             question = tool.confirmation_question(call.args)
             question = self._augment_confirmation(tool, call, question)
             print(f"[Brain] Confirmation required for {call.name}.")
-            if not self._ask_confirmation(question):
+            # The gate is told which tool and arguments it is asking about: the web's Approval Card
+            # shows them (approvals.py); the voice gate only speaks `question`.
+            with request_context.confirming(call.name, call.args):
+                approved = self._ask_confirmation(question)
+            if not approved:
                 print(f"[Brain] Tool call denied by the user: {call.name}.")
                 return ToolResult(
                     call=call,
@@ -4564,6 +4650,15 @@ class LLMBrain:
             return question
 
         code = str(call.args.get("python_code", ""))
+        if request_context.can_emit():
+            # On the web the person reads the code on the Approval Card itself (its details
+            # carry python_code in full), so the console is not where they look.
+            risky = plugin_loader.risky_behaviours(code)
+            if risky:
+                print(f"[Plugins] Flagged behaviour: {', '.join(risky)}.")
+                return f"{question} Be aware, the code {' and '.join(risky)}. The full code is shown below."
+            return f"{question} The full code is shown below."
+
         print("-" * 68)
         print(f"  PROPOSED NEW TOOL: {call.args.get('name', '?')}")
         print("-" * 68)
@@ -4778,6 +4873,7 @@ class LLMBrain:
         user_text: str,
         cancel: Optional[threading.Event] = None,
         progress: Optional[Callable[[str], None]] = None,
+        emit: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """
         Answers `user_text` on the running event loop (api_server.py), yielding
@@ -4802,8 +4898,20 @@ class LLMBrain:
         ("Head of Research: Searching the web..."): thread-safe, and called from
         any thread. Never raises for a provider or tool failure: like ask(), those
         become the final message.
+
+        `emit` hears the events a tool needs the page to act on, not just read -
+        {"type": "action_required", ...} when a confirmation-gated tool is waiting for the
+        person's Allow or Deny (approvals.py), and {"type": "action_resolved", ...} once it
+        has been answered. Same threading rules as `progress`. Without it (or on the voice
+        path) the gate is whatever `confirm` the brain was built with.
         """
-        state = TurnRun(user_text=user_text, inline=False, cancel=cancel or threading.Event(), progress=progress)
+        state = TurnRun(
+            user_text=user_text,
+            inline=False,
+            cancel=cancel or threading.Event(),
+            progress=progress,
+            emit=emit,
+        )
         async for event in self._machine(state):
             yield event
 
@@ -4828,9 +4936,10 @@ class LLMBrain:
             Node.FINAL_RESPONSE: self._final_response,
         }
         token = _CURRENT_RUN.set(run)
+        brain_token = _CURRENT_BRAIN.set(self)
         node = Node.ANALYZE_INTENT
         try:
-            with request_context.run_scope(run.cancel, run.progress):
+            with request_context.run_scope(run.cancel, run.progress, run.emit):
                 while node != Node.DONE:
                     if run.cancel.is_set():
                         raise request_context.Cancelled()
@@ -4848,10 +4957,11 @@ class LLMBrain:
             self._stopped(run)
             raise
         finally:
-            try:
-                _CURRENT_RUN.reset(token)
-            except ValueError:  # closed from another context (a generator finalised late): nothing to restore there
-                pass
+            for variable, value in ((_CURRENT_RUN, token), (_CURRENT_BRAIN, brain_token)):
+                try:
+                    variable.reset(value)
+                except ValueError:  # closed from another context (a generator finalised late): nothing to restore there
+                    pass
 
     def _stopped(self, run: "TurnRun") -> None:
         """A run that will not finish: its worker threads stop at their next step."""

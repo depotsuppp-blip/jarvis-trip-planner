@@ -11,7 +11,14 @@ import {
   saveReply,
   saveUserMessage,
 } from "@/lib/chatTurns";
-import { askJarvis, JarvisBrainCancelled, JarvisBrainError, type ChatTurn } from "@/lib/jarvisBrain";
+import {
+  askJarvis,
+  JarvisBrainCancelled,
+  JarvisBrainError,
+  type BrainApproval,
+  type BrainApprovalResolved,
+  type ChatTurn,
+} from "@/lib/jarvisBrain";
 import { MAX_DOCUMENT_BYTES, storedUserMessage, type Attachment } from "@/lib/jarvis/attachments";
 import { speakableAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 import { prisma } from "@/lib/prisma";
@@ -112,6 +119,9 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  * lines of JSON instead, one per step, while the brain works on it:
  *
  *   { "type": "progress", "status": "Delegating to Head of Analytics..." }   any number
+ *   { "type": "approval", approval: { id, tool, prompt, details, expiresInSeconds } }   an action is
+ *                                   waiting for the person's Allow or Deny (POST /api/chat/approvals/<id>)
+ *   { "type": "approval_resolved", id, decision: "allow" | "deny" | "timeout" }   that card is closed
  *   { "type": "final", conversationId, userMessage, reply, audio? }         the JSON answer's body
  *   { "type": "error", "status": 502 | 500, error, conversationId?, userMessage? }
  *
@@ -239,7 +249,11 @@ export async function POST(request: NextRequest) {
           // The page is gone; the outcome below is saved (or not) all the same.
         }
       };
-      const outcome = await answerTurn(turn, signal, (status) => send({ type: "progress", status }));
+      const outcome = await answerTurn(turn, signal, {
+        onProgress: (status) => send({ type: "progress", status }),
+        onApproval: (approval) => send({ type: "approval", approval }),
+        onApprovalResolved: (resolved) => send({ type: "approval_resolved", ...resolved }),
+      });
       if (outcome.kind === "stopped") logStopped(conversation.id);
       else if (outcome.kind === "answered") send({ type: "final", ...outcome.body });
       else send({ type: "error", status: outcome.status, ...outcome.body });
@@ -284,12 +298,20 @@ type TurnOutcome =
   | { kind: "failed"; status: number; body: Record<string, unknown> }
   | { kind: "stopped" };
 
+/** What a turn tells the page on the way: its steps, and an action waiting for the person's yes or no. */
+interface TurnHooks {
+  onProgress?: (status: string) => void;
+  onApproval?: (approval: BrainApproval) => void;
+  onApprovalResolved?: (resolved: BrainApprovalResolved) => void;
+}
+
 /**
  * Asks the brain for the reply to a saved message and saves it: the answer's body, a failure's
  * status and body (502 the brain, 500 saving), or "stopped" - the person stopped the turn
- * (`signal`), and nothing is saved. `onProgress` hears the brain's steps on the way.
+ * (`signal`), and nothing is saved. `hooks` hear the brain's steps on the way; without
+ * `onApproval` (a plain JSON request cannot show a card) the brain declines gated actions at once.
  */
-async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, onProgress?: (status: string) => void): Promise<TurnOutcome> {
+async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHooks = {}): Promise<TurnOutcome> {
   const { conversationId, userMessage } = turn;
   let replyText: string;
   let audio: ReplyAudio | null = null;
@@ -300,7 +322,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, onProgress?: 
       speak: turn.speak,
       attachments: turn.attachments,
       signal,
-      onProgress,
+      ...hooks,
     });
     replyText = answer.reply.trim();
     if (!replyText) throw new Error("The brain returned an empty reply.");

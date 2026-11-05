@@ -84,45 +84,94 @@ def format_uptime(seconds: int) -> str:
     return f"{secs} s"
 
 
-def widget_data(snapshot: Snapshot) -> dict[str, Any]:
-    """The `data` of a system_status widget: one row each for CPU, memory and uptime."""
+def widget_data(snapshot: Snapshot, capabilities: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    """
+    The `data` of a system_status widget: one row each for CPU, memory and uptime and, when
+    `capabilities` is given (LLMBrain.heads_status), one row for each capability after them.
+    The machine rows are mock numbers and say so ("sample": true) on the row, so the card can
+    mix them with the capability rows, which are real.
+    """
+    machine = [
+        {
+            "name": "CPU",
+            "status": _level(snapshot.cpu_pct),
+            "note": f"{snapshot.cpu_pct:g}% load across {snapshot.cpu_cores} cores",
+        },
+        {
+            "name": "Memory",
+            "status": _level(snapshot.memory_pct),
+            "note": f"{snapshot.memory_used_gb:g} of {snapshot.memory_total_gb:g} GB in use ({snapshot.memory_pct:.0f}%)",
+        },
+        {
+            "name": "Uptime",
+            "status": "operational",
+            "note": f"Up {format_uptime(snapshot.uptime_seconds)} since the brain started",
+        },
+    ]
+    rows = capability_rows(capabilities or [])
+    if rows:
+        for row in machine:
+            row["sample"] = True
     return {
         "updatedAt": snapshot.taken_at.isoformat().replace("+00:00", "Z"),
-        "services": [
-            {
-                "name": "CPU",
-                "status": _level(snapshot.cpu_pct),
-                "note": f"{snapshot.cpu_pct:g}% load across {snapshot.cpu_cores} cores",
-            },
-            {
-                "name": "Memory",
-                "status": _level(snapshot.memory_pct),
-                "note": f"{snapshot.memory_used_gb:g} of {snapshot.memory_total_gb:g} GB in use ({snapshot.memory_pct:.0f}%)",
-            },
-            {
-                "name": "Uptime",
-                "status": "operational",
-                "note": f"Up {format_uptime(snapshot.uptime_seconds)} since the brain started",
-            },
-        ],
+        "services": machine + rows,
     }
 
 
-def spoken_summary(snapshot: Snapshot) -> str:
+def capability_rows(capabilities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    One widget row for each capability LLMBrain.heads_status reports: "operational" when the
+    manager has its tool, "unavailable" (not set up, or switched off - optional, so not a
+    fault) otherwise, with what to do about it in the note. Real, not sample.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in capabilities:
+        ready = item.get("state") == "ready"
+        why = str(item.get("why") or "").strip()
+        note = "Ready" if ready else (why[:1].upper() + why[1:] if why else "Not set up")
+        if item.get("owner_only"):
+            note += " · owner only"
+        rows.append(
+            {
+                "name": str(item.get("title") or item.get("name") or "Capability")[:80],
+                "status": "operational" if ready else "unavailable",
+                "note": note[:160],
+                "sample": False,
+            }
+        )
+    return rows
+
+
+def _capability_sentence(capabilities: list[dict[str, Any]]) -> str:
+    if not capabilities:
+        return ""
+    parts = []
+    for item in capabilities:
+        title = item.get("title") or item.get("name")
+        if item.get("state") == "ready":
+            parts.append(f"{title} is ready")
+        else:
+            parts.append(f"{title} is not available ({item.get('why') or 'not set up'})")
+    return " Capabilities: " + "; ".join(parts) + "."
+
+
+def spoken_summary(snapshot: Snapshot, capabilities: Optional[list[dict[str, Any]]] = None) -> str:
     """The readout as a tool result for the voice assistant, which has no screen to show it on."""
     return (
         f"System status (sample numbers, not live readings): CPU at {snapshot.cpu_pct:g} percent "
         f"of {snapshot.cpu_cores} cores, memory {snapshot.memory_used_gb:g} of "
-        f"{snapshot.memory_total_gb:g} gigabytes in use, up for {format_uptime(snapshot.uptime_seconds)}. "
+        f"{snapshot.memory_total_gb:g} gigabytes in use, up for {format_uptime(snapshot.uptime_seconds)}."
+        f"{_capability_sentence(capabilities or [])} "
         "Tell the user in one or two short sentences, and say these are sample numbers."
     )
 
 
-def web_result(snapshot: Snapshot) -> str:
+def web_result(snapshot: Snapshot, capabilities: Optional[list[dict[str, Any]]] = None) -> str:
     """The tool result when the web chat is showing the widget: the model should not repeat what is on screen."""
     return (
-        "DONE: a System status card (CPU, memory, uptime - SAMPLE numbers, not live readings) is "
+        "DONE: a System status card (CPU, memory, uptime - SAMPLE numbers, not live readings"
+        f"{' - and, live, which capabilities are ready' if capabilities else ''}) is "
         "now shown to the user in the chat. Do not list the numbers; answer in ONE short sentence "
         f"on the overall picture ({'everything looks normal' if _level(max(snapshot.cpu_pct, snapshot.memory_pct)) == 'operational' else 'something is running hot'}) "
-        "and say they are sample numbers."
+        "and say the CPU, memory and uptime are sample numbers."
     )

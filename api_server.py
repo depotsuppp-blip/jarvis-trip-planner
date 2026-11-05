@@ -3,7 +3,7 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
 
     POST /chat   { "prompt": "...", "history": [{ "role": "user"|"jarvis", "content": "...",
                                                   "attachments": [...] }],
-                   "user_id": "...", "app_url": "...", "speak": false,
+                   "user_id": "...", "app_url": "...", "speak": false, "interactive": true,
                    "attachments": [{ "path": "uploads/...", "name": "report.pdf",
                                      "mime": "application/pdf", "size": 48213 }] }
               -> text/event-stream: server-sent events as the brain's state machine works
@@ -17,6 +17,13 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                               "message": "...", "audio": null}           once, last
                    error     {"type": "error", "status": "Failed", "message": "...",
                               "code": 502}                    instead of final, last
+                   action_required  {"type": "action_required", "approval_id": "...",
+                              "tool": "send_line_notification", "prompt": "Do you authorize ...?",
+                              "details": [{"name": "message", "value": "..."}], "expires_in": 60}
+                             a confirmation-gated tool is WAITING for the person's Allow or Deny
+                             (approvals.py); answer with POST /approvals/{approval_id}
+                   action_resolved  {"type": "action_resolved", "approval_id": "...",
+                              "decision": "allow"|"deny"|"timeout"}   the card is closed
                  plus a ": keep-alive" comment line after 10 s without an event.
 
                  message is a plain sentence, or - when a tool showed the person a widget -
@@ -46,6 +53,10 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  exactly as a typed /chat prompt would be - the same state machine,
                  collected into this one JSON answer, and stopped the same way when the
                  connection closes. 422 when nothing was heard.
+    POST /approvals/{approval_id}  { "user_id": "...", "decision": "allow"|"deny" }
+              -> { "ok": true, "decision": "allow" }   the person's answer to an action_required
+                 card; the waiting run resumes at once. 404 when the card is gone (answered, timed
+                 out, the turn stopped), 403 when it was sent to a different user_id.
     GET  /health -> { "ok": true, "provider": "...", "model": "...",
                       "stt": "openai"|"local", "stt_ready": true|false,
                       "tts": true|false, "mcp_tools": ["mcp__web_search__web_search", ...],
@@ -67,7 +78,11 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  (agents/); manager is the brain's own route (LLMBrain.manager_status: on the
                  Gemini standby or not, and why); agents is the team - a route's state is ready, resting (failed lately:
                  out of credit or quota, rate limited), failed (until restart) or not configured
-                 (no key: "why" says which). mcp_servers is each tool
+                 (no key: "why" says which). heads is the rest of what Jarvis can do, none of it an LLM
+                 agent: [{ "name": "creative"|"publishing"|"analytics"|"classroom", "title": "Head of
+                 Creative", "tools": ["delegate_to_creative"], "state": "ready"|"not configured"|"off",
+                 "why": "needs OPENAI_API_KEY", "owner_only": false }, ...] (LLMBrain.heads_status; Google
+                 Classroom is owner_only). mcp_servers is each tool
                  server as it is right now (error says why one is not connected). The bundled
                  servers - local_fs, web_search, fetch, memory, data - start with the brain, with
                  nothing to configure (mcp_client.py). The web hub's sidebar lists them from here
@@ -112,11 +127,21 @@ Things that differ from the voice assistant, deliberately:
   are awaited on the providers' async clients and tools run on worker
   threads (LLMBrain.run), so a stopped turn lets go of the lock at once.
 * Tools that ask for spoken confirmation (n8n webhooks, the manager's own
-  send_line_notification, starting/stopping servers, creating tools) are
-  DECLINED. There is no human at a microphone here, and a web request must
-  never be able to trigger an outward side effect or run new code on this
-  machine by itself. The model is told they were declined and says so.
-  Wiring a real confirm step through the web UI is a separate piece of work.
+  send_line_notification, starting/stopping servers, creating tools) are put
+  to the person on the page. There is no microphone here, so /chat streams
+  {"type": "action_required", "approval_id", "tool", "prompt", "details",
+  "expires_in"} and the run WAITS inside that tool call (approvals.py) while the
+  web app shows an Approval Card; the person's Allow or Deny comes back through
+  POST /approvals/{approval_id} and the run resumes - the tool runs, or the model
+  is told it was declined and says so. An {"type": "action_resolved", ...} event
+  closes the card. A card nobody answers (JARVIS_APPROVAL_TIMEOUT, 60 s), Stop, or a
+  closed page is a denial.
+  A web request must still never be able to trigger an outward side effect or run
+  new code on this machine by itself, and the web app serves everyone who signs in:
+  so only the OWNER (the user named in JARVIS_OWNER_USER_ID) is ever asked, and only
+  the same user can answer the card. For anyone else - and for /voice, which has no
+  page to show a card on - these tools are DECLINED, as before. Without
+  JARVIS_OWNER_USER_ID set, nobody is the owner and every one is declined.
   The one exception is the Head of Productivity's push_line_notification
   (agents/productivity_agent.py): it asks no one, because it can only
   message the owner's own LINE (LINE_TARGET_USER_ID) and sending the daily
@@ -140,6 +165,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
+import approvals
 import attachments
 import reply_audio
 import request_context
@@ -191,6 +217,9 @@ class ChatRequest(BaseModel):
     app_url: str = Field(default="", max_length=300)
     # The person has voice replies on: also answer with audio when the reply is short enough.
     speak: bool = False
+    # The caller can show an Approval Card and send the answer back (POST /approvals/{id}). False for
+    # a caller that cannot: confirmation-gated tools are then declined at once instead of after the wait.
+    interactive: bool = True
     attachments: list[Attachment] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
 
     @model_validator(mode="after")
@@ -216,9 +245,12 @@ class VoiceResponse(BaseModel):
 _history_turns = TypeAdapter(Annotated[list[HistoryTurn], Field(max_length=MAX_HISTORY_TURNS)])
 
 
-def _decline(question: str) -> bool:
-    print(f"[API] Declined a confirmation-gated action: {question}")
-    return False
+class ApprovalDecision(BaseModel):
+    """The person's answer to an Approval Card (POST /approvals/{approval_id})."""
+
+    # TripPlanner_Web's User.id of the signed-in person answering: the card is only theirs.
+    user_id: str = Field(min_length=1, max_length=128)
+    decision: Literal["allow", "deny"]
 
 
 def _warm_brain() -> None:
@@ -280,7 +312,7 @@ def _get_brain() -> LLMBrain:
     global _brain
     with _build_lock:
         if _brain is None:
-            _brain = LLMBrain(confirm=_decline)
+            _brain = LLMBrain(confirm=approvals.confirm)
         return _brain
 
 
@@ -299,6 +331,8 @@ def health() -> dict:
         "mcp_servers": brain.mcp_servers(),
         "manager": brain.manager_status(),
         "agents": brain.team_status(),
+        # The capabilities that are plain Python behind a delegate_to_* tool, not LLM agents.
+        "heads": brain.heads_status(),
     }
 
 
@@ -343,6 +377,7 @@ async def _turn(
     app_url: str,
     speak: bool = False,
     files: list[Attachment] | None = None,
+    interactive: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     One turn through the brain's state machine (LLMBrain.run), as /chat and /voice both
@@ -356,6 +391,10 @@ async def _turn(
     model request in flight is closed, the run's worker threads stop at their next step,
     nothing is added to the history, and the brain is free for the next message at once.
     Closing this generator early (a streamed response the server cancelled) does the same.
+
+    `interactive`: the client is a page that can answer the run (/chat). Its tools may then
+    stream an {"type": "action_required"} event and wait for the person's Allow or Deny
+    (approvals.py); /voice, which collects one JSON answer, is not, and those tools are declined.
     """
     caller = request_context.RequestContext(
         channel=request_context.CHANNEL_WEB,
@@ -390,7 +429,7 @@ async def _turn(
                     # The context is current only while this request is being answered, on
                     # this task and the worker threads it starts - see request_context.py.
                     with request_context.use(caller):
-                        async for event in brain.run(question, cancel=cancel, progress=progress):
+                        async for event in brain.run(question, cancel=cancel, progress=progress, emit=push if interactive else None):
                             push(event)
                 finally:
                     # Nothing is carried to the next request; the caller owns the transcript.
@@ -481,7 +520,10 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
 
     async def stream() -> AsyncIterator[str]:
         async with aclosing(
-            _turn(request, brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments)
+            _turn(
+                request, brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments,
+                interactive=body.interactive,
+            )
         ) as events:
             async for event in events:
                 kind = event.get("type")
@@ -514,6 +556,22 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
         # No caching, and no buffering by a proxy in between: each event is meant to arrive as it happens.
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/approvals/{approval_id}")
+def decide_approval(approval_id: str, body: ApprovalDecision) -> dict:
+    """
+    The person's Allow or Deny for an Approval Card (an `action_required` event of /chat).
+    The run that is waiting on it resumes at once: Allow runs the tool, Deny reports it as
+    declined. 404 when the card is gone (answered, timed out, the turn stopped), 403 when
+    it was sent to someone else. A plain (sync) endpoint: it only wakes a waiting thread.
+    """
+    outcome = approvals.resolve(approval_id, body.user_id, body.decision == "allow")
+    if outcome == approvals.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="That request is no longer waiting for an answer.")
+    if outcome == approvals.FORBIDDEN:
+        raise HTTPException(status_code=403, detail="That request was not sent to you.")
+    return {"ok": True, "decision": body.decision}
 
 
 # Speech-to-text runs OUTSIDE the brain's turn (on a worker thread), so a slow upload to the STT
