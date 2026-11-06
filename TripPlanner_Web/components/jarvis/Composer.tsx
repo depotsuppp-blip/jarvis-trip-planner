@@ -1,17 +1,35 @@
 "use client";
 
-import { memo, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { ArrowUp, Mic, Paperclip, Square, X } from "lucide-react";
 import { ACCEPTED_FILE_TYPES, attachmentProblem } from "@/lib/jarvis/attachments";
 import { useChatActions, useDraftRequests, useOrb } from "@/lib/jarvis/JarvisProvider";
 import { isFocalMode } from "@/lib/jarvis/types";
 import { AttachmentChip } from "./AttachmentChip";
-import { focusRing } from "./styles";
+import { focusRing, thinScroll } from "./styles";
 
 /**
  * The dock at the bottom centre: the message field, Send, Attach and Talk in ONE
  * ruled control - and every control of a turn in progress. Jarvis's face is the
  * Signal Orb in the sidebar (JarvisOrb.tsx); nothing is drawn over the conversation.
+ *
+ * The field is a textarea that grows with the draft, a line at a time, up to about
+ * seven lines (less on a short screen: 35% of its height); past that it scrolls inside
+ * itself. A long message wraps instead of running off sideways. Enter sends and
+ * Shift+Enter starts a new line - on a touch screen Enter starts a new line and Send
+ * sends, as phones' own keyboards expect. Enter never sends half a word an input
+ * method (Thai, Japanese...) is still composing. The buttons stay at the foot of the
+ * dock as it grows.
  *
  * Talk records for real (lib/jarvis/voiceRecorder.ts) and is a toggle: one press
  * starts, the next sends. While it records, the field gives its place to a
@@ -46,7 +64,7 @@ export const Composer = memo(function Composer() {
   const [draft, setDraft] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [fileProblem, setFileProblem] = useState<string | null>(null);
-  const field = useRef<HTMLInputElement>(null);
+  const field = useRef<HTMLTextAreaElement>(null);
   const talk = useRef<HTMLButtonElement>(null);
   const attach = useRef<HTMLButtonElement>(null);
   const picker = useRef<HTMLInputElement>(null);
@@ -56,6 +74,48 @@ export const Composer = memo(function Composer() {
   const focusFieldWhenFree = useRef(false);
 
   const canSend = (draft.trim().length > 0 || file !== null) && !busy;
+
+  // The field as tall as its words, up to its max-height (the class below); scrolling past that.
+  // "auto" first, so a draft that got shorter (a line deleted, a message sent) lets it shrink.
+  const fitField = useCallback(() => {
+    const element = field.current;
+    if (!element) return;
+    element.style.height = "auto";
+    const limit = Number.parseFloat(window.getComputedStyle(element).maxHeight);
+    const tallest = Number.isFinite(limit) ? limit : Number.POSITIVE_INFINITY;
+    element.style.height = `${Math.min(element.scrollHeight, tallest)}px`;
+    element.style.overflowY = element.scrollHeight > tallest ? "auto" : "hidden";
+  }, []);
+
+  // Before paint, so a new line never shows a frame of scrollbar first. `listening` too: the field
+  // comes back after a recording, as one line again or as tall as the words it kept.
+  useLayoutEffect(fitField, [draft, listening, fitField]);
+
+  // A narrower field wraps the same words onto more lines - the window, or the sidebar opening and
+  // closing. Only a change of WIDTH re-fits: the height is this effect's own doing.
+  useEffect(() => {
+    const element = field.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    let width = element.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (element.clientWidth === width) return;
+      width = element.clientWidth;
+      fitField();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [listening, fitField]);
+
+  // Enter sends, Shift+Enter breaks the line. Not on a touch screen, where Enter is the keyboard's
+  // own new-line key and Send is the button. Never while an input method is still composing a word.
+  function onFieldKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey || event.altKey) return;
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    const touch = window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+    if (touch && !event.ctrlKey && !event.metaKey) return;
+    event.preventDefault(); // no new line, sent or not (an empty draft stays empty)
+    event.currentTarget.form?.requestSubmit();
+  }
 
   function pick(event: ChangeEvent<HTMLInputElement>) {
     const chosen = event.target.files?.[0] ?? null;
@@ -100,6 +160,7 @@ export const Composer = memo(function Composer() {
           }
           input.focus();
           input.setSelectionRange(input.value.length, input.value.length);
+          input.scrollTop = input.scrollHeight; // a long message: the caret's end in view
         });
       }),
     [onDraftRequest]
@@ -156,22 +217,27 @@ export const Composer = memo(function Composer() {
         className="hidden"
       />
 
+      {/* items-end: as the field grows, Send, Attach and Talk stay on its last line. */}
       <form
         onSubmit={submit}
-        className="mx-auto flex max-w-2xl items-center gap-1.5 rounded-md border border-slate-300 bg-white p-1.5 has-[input:focus-visible]:border-slate-900 has-[input:focus-visible]:outline-2 has-[input:focus-visible]:outline-offset-2 has-[input:focus-visible]:outline-rose-600"
+        className="mx-auto flex max-w-2xl items-end gap-1.5 rounded-md border border-slate-300 bg-white p-1.5 has-[textarea:focus-visible]:border-slate-900 has-[textarea:focus-visible]:outline-2 has-[textarea:focus-visible]:outline-offset-2 has-[textarea:focus-visible]:outline-rose-600"
       >
         {listening ? (
           <RecordingClock />
         ) : (
-          <input
+          // One line is 44px (24px line + 10px above and below), the buttons' height. It grows to
+          // 12rem - about seven lines - or 35% of a short screen, then scrolls (fitField).
+          <textarea
             ref={field}
+            rows={1}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={onFieldKeyDown}
             disabled={busy}
             placeholder="Message Jarvis"
             aria-label="Message Jarvis"
             autoComplete="off"
-            className="h-11 min-w-0 flex-1 bg-transparent px-2 text-base text-slate-900 caret-rose-600 outline-none placeholder:text-slate-500 disabled:cursor-not-allowed"
+            className={`block max-h-[min(12rem,35dvh)] min-h-11 min-w-0 flex-1 resize-none overflow-y-hidden bg-transparent px-2 py-2.5 text-base leading-6 text-slate-900 caret-rose-600 outline-none wrap-break-word placeholder:text-slate-500 disabled:cursor-not-allowed ${thinScroll}`}
           />
         )}
 

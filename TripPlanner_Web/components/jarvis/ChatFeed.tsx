@@ -42,6 +42,30 @@ export const ChatFeed = memo(function ChatFeed() {
     element.scrollTo({ top: element.scrollHeight, behavior: jump ? "auto" : "smooth" });
   }, [messages, epoch, waiting]);
 
+  // The dock grows with a long draft (Composer) and the conversation's window gets shorter from the
+  // bottom: someone reading the newest message keeps it in view. Someone scrolled up stays where they are.
+  useEffect(() => {
+    const element = scroller.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const atFoot = () => element.scrollHeight - element.scrollTop - element.clientHeight < 32;
+    let pinned = atFoot();
+    let height = element.clientHeight;
+    const onScroll = () => {
+      pinned = atFoot();
+    };
+    const observer = new ResizeObserver(() => {
+      const shorter = element.clientHeight < height;
+      height = element.clientHeight;
+      if (shorter && pinned) element.scrollTop = element.scrollHeight;
+    });
+    element.addEventListener("scroll", onScroll, { passive: true });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+      element.removeEventListener("scroll", onScroll);
+    };
+  }, []);
+
   return (
     <div ref={scroller} className={`min-h-0 flex-1 overflow-y-auto ${thinScroll}`}>
       <div className="mx-auto w-full max-w-2xl px-4 py-8">
