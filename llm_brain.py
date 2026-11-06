@@ -943,7 +943,8 @@ PUBLISHING_RULE = (
     "PowerPoint (.pptx). You never write the slides yourself, not in your reply and not in the tool call: you "
     "hand over a short brief. When the user asks for a presentation, slides, a slide deck, a PowerPoint or a "
     "Canva presentation, call {tool} once with: topic - what the deck is about, in the user's own words and "
-    "language; num_slides - only when the user gave a number (it counts the opening slide); target_platform - "
+    "language; num_slides - the number of slides the user asked for, counting the opening slide (5 when they "
+    "gave none); target_platform - "
     '"canva" when the user asks for it in Canva, "pptx" when they ask for a PowerPoint or .pptx file, "any" '
     "otherwise; special_instructions - audience, purpose, tone, points that must be covered, and the language "
     "of the slides when it is not the topic's (the user's language: Thai slides for a request in Thai - "
@@ -4646,9 +4647,10 @@ class LLMBrain:
                             "type": "integer",
                             "minimum": 1,
                             "maximum": MAX_ASKED_SLIDES,
+                            "default": 5,
                             "description": (
-                                "How many slides in all, the opening slide included - only when the user gave a "
-                                "number; leave it out and the Head of Publishing picks one (usually 8)."
+                                "How many slides in all, the opening slide included: the number the user asked for, "
+                                "or 5 when they gave none."
                             ),
                         },
                         "target_platform": {
@@ -4671,7 +4673,7 @@ class LLMBrain:
                     },
                     "required": ["topic", "target_platform"],
                 },
-                handler=lambda topic="", num_slides=None, target_platform="any", special_instructions="": self._publish(
+                handler=lambda topic="", num_slides=5, target_platform="any", special_instructions="": self._publish(
                     topic, num_slides, target_platform, special_instructions
                 ),
                 requires_confirmation=False,
@@ -4682,7 +4684,7 @@ class LLMBrain:
             )
         return self._publishing_spec
 
-    def _publish(self, topic: Any = "", num_slides: Any = None, target_platform: Any = "any", special_instructions: Any = "") -> str:
+    def _publish(self, topic: Any = "", num_slides: Any = 5, target_platform: Any = "any", special_instructions: Any = "") -> str:
         """
         Runs one brief on the Head of Publishing, which writes the slides with its own model and
         builds the file (create_presentation); its SUCCESS/ERROR text goes back to the model. In
@@ -4705,7 +4707,7 @@ class LLMBrain:
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
         shown = str(topic or "")[:120].encode(encoding, errors="backslashreplace").decode(encoding)
         print(
-            f"[Brain] Delegating to the Head of Publishing: {shown!r}, {num_slides or 'any number of'} slides, "
+            f"[Brain] Delegating to the Head of Publishing: {shown!r}, {num_slides or 5} slides, "
             f"platform {target_platform or 'any'}{later}."
         )
         result = self._publishing.create_presentation(

@@ -92,7 +92,7 @@ NEVER RAISES. Every failure comes back as one sentence starting "ERROR:" (the on
 is request_context.Cancelled when the request it works for was stopped).
 
     python -m agents.publishing_agent --check            the writer, both engines, a test deck in memory, the folder
-    python -m agents.publishing_agent --topic "..." [--slides N] [--platform canva|pptx|any] [--instructions "..."]
+    python -m agents.publishing_agent --topic "..." [--slides N (5)] [--platform canva|pptx|any] [--instructions "..."]
                                                          writes and builds one deck (calls the writer's model)
     python -m agents.publishing_agent deck.json          builds one deck from a JSON file (no model)
     python -m agents.publishing_agent --canva-test       a two-slide deck in Canva only (add --headed to watch)
@@ -162,9 +162,8 @@ MAX_TOPIC_CHARS = 500
 MAX_INSTRUCTIONS_CHARS = 4000
 # A deck asked for by number has at most this many slides in all (the opening slide included).
 MAX_ASKED_SLIDES = 30
-# Without a number the writer picks one: usually this many, within the range.
-DEFAULT_SLIDES = 8
-AUTO_SLIDES = (6, 12)
+# A brief without a number gets this many slides in all (the opening slide included).
+DEFAULT_SLIDES = 5
 WRITER_MODEL = "gpt-4o"
 WRITER_FALLBACK_MODEL = "gpt-4o-mini"
 # Room for a whole deck as JSON (thirty slides of five bullets is about 4,000 tokens).
@@ -828,7 +827,7 @@ class PublishingAgent:
             result += "\nSlide titles: " + "; ".join(f"{n}. {t}" for n, t in enumerate(titles, start=1))
         return result
 
-    def _write(self, topic: str, wanted: Optional[int], instructions: str) -> str:
+    def _write(self, topic: str, wanted: int, instructions: str) -> str:
         """The deck's JSON for this brief - written now, or the draft kept for the same brief - or an ERROR."""
         key = hashlib.sha256(json.dumps([topic, wanted, instructions], ensure_ascii=False).encode("utf-8")).hexdigest()
         now = time.monotonic()
@@ -848,7 +847,7 @@ class PublishingAgent:
         made: dict[str, Any] = {}
         try:
             self.writer.finish = lambda answer: finish_deck(answer, wanted, made)
-            print(f"[Agent:publishing] Writing {wanted or 'some'} slides: {_shown(topic)}")
+            print(f"[Agent:publishing] Writing {wanted} slides: {_shown(topic)}")
             self.writer.run(_writer_task(topic, wanted, instructions), [], _no_tools)
         except AgentUnavailable as exc:
             return f"ERROR: no model could write the slides ({_shown(str(exc), 300)})"
@@ -1238,8 +1237,8 @@ def _summary(planned: list[PlannedSlide]) -> str:
     return f"{len(planned)} slide{'s' if len(planned) != 1 else ''}: {listed}"
 
 
-def _brief(topic: Any, num_slides: Any, target_platform: Any, special_instructions: Any) -> "tuple[str, Optional[int], str, str] | str":
-    """The brief as (topic, slide count or None, platform, instructions), or an ERROR saying what to change."""
+def _brief(topic: Any, num_slides: Any, target_platform: Any, special_instructions: Any) -> "tuple[str, int, str, str] | str":
+    """The brief as (topic, slide count, platform, instructions), or an ERROR saying what to change."""
     topic = " ".join(str(topic or "").split())
     if not topic:
         return "ERROR: no topic was given. Call again with what the presentation is about in topic."
@@ -1248,7 +1247,7 @@ def _brief(topic: Any, num_slides: Any, target_platform: Any, special_instructio
     platform = str(target_platform or "any").strip().lower()
     if platform not in PLATFORMS:
         return f"ERROR: target_platform must be one of {', '.join(PLATFORMS)}, not {target_platform!r}."
-    wanted: Optional[int] = None
+    wanted = DEFAULT_SLIDES
     if num_slides not in (None, "", 0, "0"):
         try:
             wanted = int(float(str(num_slides).strip()))
@@ -1262,19 +1261,16 @@ def _brief(topic: Any, num_slides: Any, target_platform: Any, special_instructio
     return topic, wanted, platform, instructions
 
 
-def _writer_task(topic: str, wanted: Optional[int], instructions: str) -> str:
+def _writer_task(topic: str, wanted: int, instructions: str) -> str:
     """The writer's one message: the brief, self-contained."""
     if wanted == 1:
         count = "exactly 1 slide: no opening slide (title and subtitle empty), one entry in slides"
-    elif wanted:
+    else:
         # Said as the length of the list: "N slides" alone gets N entries plus the opening slide.
         count = (
             f'{wanted} in all - the opening slide (title and subtitle) plus EXACTLY {wanted - 1} entries '
             f'in "slides", not {wanted}'
         )
-    else:
-        low, high = AUTO_SLIDES
-        count = f"your choice - usually {DEFAULT_SLIDES} in all, between {low} and {high}, the opening slide included"
     return (
         "Write this presentation as JSON.\n"
         f"Topic: {topic}\n"
