@@ -98,6 +98,19 @@ Several things were added to this module beyond plain tool calling:
       must search for anything real-time (weather, news, prices, places)
       instead of saying it has no tool for it (turn_context, REALTIME_RULE).
 
+  PROMPT CACHE  Anthropic calls carry three cache breakpoints: the last
+      tool, the persona, and - on calls with tools - the last block of the
+      conversation (AnthropicProvider._cache_tail). So the second Plan call
+      of a question reads tools, system, history and question from the cache
+      at a tenth of the price and pays only for the tool round it adds; the
+      clock in the per-turn block is read once per question (TurnRun.clock)
+      so the two calls match byte for byte. Every call prints its tokens -
+      input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+      output_tokens - and the daily budget weights them by price
+      (llm_budget: reads 0.1x, writes 1.25x). Measured 2026-11-06 on Sonnet 5
+      with a 13 k-token prompt: the second call read 98% from the cache, and
+      a two-call question cost 25% less than with the first two breakpoints alone.
+
   THE TEAM  specialist agents (agents/) that the brain - the manager -
       delegates to, each on its own models with a fixed fallback order:
       the Head of Data & Documents (Gemini Pro -> Groq; owns the local_fs
@@ -761,6 +774,12 @@ aloud."""
 # That block goes AFTER the persona as a separate system block (see the providers'
 # `context`), never into it: the persona carries the prompt-cache breakpoint, and a
 # clock inside it would make every turn a cache miss.
+#
+# It still comes BEFORE the conversation, so the clock is read once per question
+# (TurnRun.clock), not once per call: the second Plan call of a question must send
+# the same bytes as the first up to the end of the history, or the history it reads
+# from the prompt cache (AnthropicProvider._cache_tail) is a miss whenever the minute
+# changes in between.
 #
 # JARVIS_LOCATION and JARVIS_TIMEZONE (an IANA name) change the defaults.
 DEFAULT_LOCATION = "Bangkok, Thailand"
@@ -2951,6 +2970,64 @@ class _PerLoopClient:
         return self._client
 
 
+def _tokens(usage: Any, name: str) -> int:
+    """One usage field as an int: 0 when the SDK leaves it out or None."""
+    value = getattr(usage, name, 0)
+    return value if isinstance(value, int) else 0
+
+
+def _log_anthropic_usage(response: Any) -> None:
+    """
+    One Messages API call's tokens: printed on every call, so a cache hit (or a miss) shows
+    in the console, and added to the daily budget weighted by price (llm_budget). The prompt
+    is input_tokens (full price) + cache_creation_input_tokens (written to the cache, 1.25x)
+    + cache_read_input_tokens (read from it, 0.1x); a healthy second Plan call reads nearly
+    all of it.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    fresh = _tokens(usage, "input_tokens")
+    output = _tokens(usage, "output_tokens")
+    written = _tokens(usage, "cache_creation_input_tokens")
+    read = _tokens(usage, "cache_read_input_tokens")
+    split = getattr(usage, "cache_creation", None)
+    written_1h = _tokens(split, "ephemeral_1h_input_tokens") if split is not None else 0
+    weighted = llm_budget.record_usage(fresh, output, written, read, written_1h)
+    prompt = fresh + written + read
+    model = getattr(response, "model", None)
+    print(
+        f"[Brain] Tokens {model if isinstance(model, str) and model else 'anthropic'}: "
+        f"input_tokens={fresh} cache_creation_input_tokens={written} cache_read_input_tokens={read} "
+        f"output_tokens={output} | prompt {prompt:,}, {read / prompt if prompt else 0:.0%} read from cache "
+        f"| {weighted:,.0f} toward the daily budget"
+    )
+
+
+def _log_gemini_usage(response: Any) -> None:
+    """
+    One generate_content call's tokens, printed like Anthropic's (_log_anthropic_usage).
+    Gemini caches on its own (implicit caching): cached_content_token_count is the part of
+    prompt_token_count it served from that cache. The budget counts the prompt and the
+    candidates as before.
+    """
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return
+    prompt = _tokens(usage, "prompt_token_count")
+    cached = _tokens(usage, "cached_content_token_count")
+    output = _tokens(usage, "candidates_token_count")
+    thoughts = _tokens(usage, "thoughts_token_count")
+    weighted = llm_budget.record_usage(prompt, output)
+    model = getattr(response, "model_version", None)
+    print(
+        f"[Brain] Tokens {model if isinstance(model, str) and model else 'gemini'}: "
+        f"prompt_token_count={prompt} cached_content_token_count={cached} candidates_token_count={output} "
+        f"thoughts_token_count={thoughts} | {cached / prompt if prompt else 0:.0%} read from cache "
+        f"| {weighted:,.0f} toward the daily budget"
+    )
+
+
 class AnthropicProvider(_Provider):
     """Claude via the Anthropic Messages API."""
 
@@ -3000,12 +3077,20 @@ class AnthropicProvider(_Provider):
         """Neutral transcript -> Anthropic `messages` array."""
         messages: list[dict[str, Any]] = []
 
+        # Text as a list of one block, never the plain-string shorthand: the last message of
+        # a call carries the cache breakpoint (_cache_tail), which only a block can hold, and
+        # the next call sends that same message again without it - in the same form, so the
+        # prefix the cache matches on is the same JSON. (An empty text block is a 400; an
+        # empty string stays a string, as before.)
+        def text(value: str) -> Any:
+            return [{"type": "text", "text": value}] if value else value
+
         for turn in transcript:
             if turn.kind == "user":
-                messages.append({"role": "user", "content": turn.text})
+                messages.append({"role": "user", "content": text(turn.text)})
 
             elif turn.kind == "assistant":
-                messages.append({"role": "assistant", "content": turn.text})
+                messages.append({"role": "assistant", "content": text(turn.text)})
 
             elif turn.kind == "tool_calls":
                 blocks: list[dict[str, Any]] = []
@@ -3121,6 +3206,9 @@ class AnthropicProvider(_Provider):
             "output_config": {"effort": effort or self._effort},
             "messages": self._to_messages(transcript),
         }
+        if tools:
+            # The third breakpoint: the end of the conversation (_cache_tail).
+            self._cache_tail(request["messages"])
 
         if target in MODELS_WITHOUT_EFFORT:
             # The cheap tier is a 4.5-generation model, which knows
@@ -3144,14 +3232,26 @@ class AnthropicProvider(_Provider):
         return request
 
     @staticmethod
+    def _cache_tail(messages: list[dict[str, Any]]) -> None:
+        """
+        Marks the last content block of the last message as a prompt-cache breakpoint - the
+        third of Anthropic's four, after the tools and the persona. Plan's first call of a
+        question writes the prefix up to the question (tools, system, history, question); its
+        second call, which adds only the model's tool calls and their results, reads all of that
+        back at a tenth of the price and marks its own end - the tool results - for a third call.
+        Only for calls with tools: the front door and other one-off calls are never followed
+        by a call that shares their prefix, and a write that is never read only costs 1.25x.
+        """
+        if not messages:
+            return
+        content = messages[-1].get("content")
+        if isinstance(content, list) and content:  # _to_messages writes every non-empty turn as blocks
+            content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+
+    @staticmethod
     def _parse(response: Any) -> Turn:
         """One Messages API response as a neutral Turn (complete, acomplete)."""
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            llm_budget.record_usage(
-                getattr(usage, "input_tokens", 0) or 0,
-                getattr(usage, "output_tokens", 0) or 0,
-            )
+        _log_anthropic_usage(response)
 
         # Safety classifiers can decline a request: HTTP 200, but with
         # stop_reason "refusal" and no usable content. Check before
@@ -3213,6 +3313,7 @@ class AnthropicProvider(_Provider):
         except Exception as exc:  # noqa: BLE001
             raise self._classify(exc) from exc
 
+        _log_anthropic_usage(response)
         return "".join(
             block.text for block in response.content if getattr(block, "type", None) == "text"
         ).strip()
@@ -3481,12 +3582,7 @@ class GeminiProvider(_Provider):
     @staticmethod
     def _parse(response: Any) -> Turn:
         """One generate_content response as a neutral Turn (complete, acomplete)."""
-        usage = getattr(response, "usage_metadata", None)
-        if usage is not None:
-            llm_budget.record_usage(
-                getattr(usage, "prompt_token_count", 0) or 0,
-                getattr(usage, "candidates_token_count", 0) or 0,
-            )
+        _log_gemini_usage(response)
 
         text_parts: list[str] = []
         calls: list[ToolCall] = []
@@ -3617,6 +3713,9 @@ class TurnRun:
     # do not take events.
     emit: Optional[Callable[[dict[str, Any]], None]] = None
     started: float = field(default_factory=time.monotonic)
+    # The time every model call of this question is told (turn_context): read once, so the
+    # calls' prompts match up to the end of the history and the prompt cache can serve it.
+    clock: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     node: str = Node.ANALYZE_INTENT
     next: str = Node.DONE
     trail: list[str] = field(default_factory=list)
@@ -5461,8 +5560,10 @@ class LLMBrain:
         tools = self._active_tools() if tools is None else tools
         # When and where, on every call - the front door's too, which is what answers
         # "what day is it?" - plus, for the persona, the real-time rule when this
-        # call can search the web.
-        context = turn_context()
+        # call can search the web. The question's own clock, not a fresh one per call:
+        # the context sits before the history, and the second Plan call's cache read
+        # needs it byte for byte (TurnRun.clock).
+        context = turn_context(run.clock)
         if system is None:
             caller = request_context.current()
             rule = realtime_rule(tools)
