@@ -65,7 +65,11 @@ Several things were added to this module beyond plain tool calling:
       the question on to the supervisor loop below, which is where the
       orchestration actually lives. Tool commands, reasoning-tier
       questions and answers to something Jarvis just asked never reach
-      it - see LLMBrain._front_door. JARVIS_FRONT_DOOR=0 turns it off.
+      it - see LLMBrain._front_door. The JSON is enforced by the API
+      (structured outputs, FRONT_DOOR_SCHEMA); a reply in plain prose all
+      the same is taken as its answer, not sent on to the supervisor, unless
+      it reads like a hand-off (_front_door_plain_answer).
+      JARVIS_FRONT_DOOR=0 turns it off.
 
   LINK GUARD  a trip link or trip id in a reply must come from a tool that
       ran during the same request (or from the user's own message), never
@@ -93,18 +97,20 @@ Several things were added to this module beyond plain tool calling:
 
   WHEN AND WHERE  every call tells the model the date, the time and the
       user's location (Bangkok, Thailand unless JARVIS_LOCATION and
-      JARVIS_TIMEZONE say otherwise) in a short system block after the
-      cached persona - and, when a web search tool is connected, that it
-      must search for anything real-time (weather, news, prices, places)
-      instead of saying it has no tool for it (turn_context, REALTIME_RULE).
+      JARVIS_TIMEZONE say otherwise) in a note sent with the question, after
+      the conversation (moment_note, Turn.note) - and, when a web search tool
+      is connected, a system rule that it must search for anything real-time
+      (weather, news, prices, places) instead of saying it has no tool for it
+      (turn_context, REALTIME_RULE).
 
   PROMPT CACHE  Anthropic calls carry three cache breakpoints: the last
-      tool, the persona, and - on calls with tools - the last block of the
-      conversation (AnthropicProvider._cache_tail). So the second Plan call
-      of a question reads tools, system, history and question from the cache
-      at a tenth of the price and pays only for the tool round it adds; the
-      clock in the per-turn block is read once per question (TurnRun.clock)
-      so the two calls match byte for byte. Every call prints its tokens -
+      tool, the persona, and - on calls with tools - the end of the
+      conversation (AnthropicProvider._cache_tail): the question's own words,
+      or the tool results on a later call. Nothing that changes from question
+      to question comes before that point - the time and place ride after the
+      question as its note - so the second Plan call of a question reads tools,
+      system, history and question from the cache, and so does the next
+      question within the cache's 5 minutes. Every call prints its tokens -
       input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
       output_tokens - and the daily budget weights them by price
       (llm_budget: reads 0.1x, writes 1.25x). Measured 2026-11-06 on Sonnet 5
@@ -457,7 +463,7 @@ Output JSON format:
 
 How this deployment reads your output:
 
-- Reply with the JSON object and nothing else: no code fence, no commentary before or after it.
+- Reply with the JSON object and nothing else: no code fence, no commentary before or after it. That holds for every input, a thank-you or a one-word greeting included - "thanks" gets {"intent_type": "CHAT", "route_to": "SELF", "response": "You're welcome."}.
 - Use route_to "SELF" only with intent_type "CHAT" and a real answer in response. Every other case is route_to "ORCHESTRATOR" with response null.
 - intent_type says what the input is about and route_to says who answers it, so they are separate decisions. "TRIP_PLANNING" is only for input about a trip: planning one, its group poll, voting, or finalizing the plan. Every other input is "CHAT", including a request that needs a tool, which is "CHAT" with route_to "ORCHESTRATOR".
 - The assistant behind you has tools that you do not. It logs and reads Subtrack expenses and records, runs n8n workflows, looks at the user's screen, reads the user's Google Calendar for today, sends LINE messages, starts and stops apps and servers, plans trips and trip polls, and reports what it can do and what is still running. A request that needs one of those, or live information about the user's own systems, is never yours to answer: route it to "ORCHESTRATOR" with response null. Never say or imply that you have done, started, or checked anything.
@@ -771,15 +777,14 @@ aloud."""
 # now carries one short block that says both (turn_context), and - when a web search
 # tool is connected - the rule to search for anything real-time (REALTIME_RULE).
 #
-# That block goes AFTER the persona as a separate system block (see the providers'
-# `context`), never into it: the persona carries the prompt-cache breakpoint, and a
-# clock inside it would make every turn a cache miss.
-#
-# It still comes BEFORE the conversation, so the clock is read once per question
-# (TurnRun.clock), not once per call: the second Plan call of a question must send
-# the same bytes as the first up to the end of the history, or the history it reads
-# from the prompt cache (AnthropicProvider._cache_tail) is a miss whenever the minute
-# changes in between.
+# That sentence pair goes with the QUESTION, after the whole conversation (Turn.note,
+# moment_note) - not in the system block, which comes before the history: a clock there
+# changed the bytes ahead of the history every minute, so a follow-up a minute later
+# read none of the history from the prompt cache. Tools, system and history now stay
+# byte-identical from one question to the next. The clock is still read once per
+# question (TurnRun.clock), so the calls of one question send the same note. The rules
+# that depend on this turn's tools (REALTIME_RULE, TEAM_RULE, ...) stay in the system
+# block: they change only when the tool set does.
 #
 # JARVIS_LOCATION and JARVIS_TIMEZONE (an IANA name) change the defaults.
 DEFAULT_LOCATION = "Bangkok, Thailand"
@@ -793,7 +798,7 @@ REALTIME_RULE = (
     "Real-time information: when the user asks about anything that changes or that you "
     "cannot know from training - the weather or a forecast, news and current events, prices "
     "and exchange rates, opening hours, places nearby, sports results, traffic - you MUST "
-    "call {search} straight away, adding the location above to the query whenever the "
+    "call {search} straight away, adding the user's location (the note with their message gives it) to the query whenever the "
     "answer depends on place. Never say you lack a weather, news or maps tool, and never "
     "tell the user to check for themselves: search, then answer from what you found.{read} "
     "Answer from the first useful results - two searches at most - instead of searching again "
@@ -831,6 +836,16 @@ def turn_context(now: Optional[datetime] = None) -> str:
         "use that for anything that depends on place - the weather, local news, opening "
         "hours, places nearby, travel times - and do not ask where they are."
     )
+
+
+# How turn_context travels: a block after the question (Turn.note), marked as Jarvis's own so
+# the model does not take it for something the person said.
+MOMENT_NOTE = "[Jarvis's own note with this message, not the user's words: {context}]"
+
+
+def moment_note(now: Optional[datetime] = None) -> str:
+    """turn_context as the note sent with the current question (see Turn.note)."""
+    return MOMENT_NOTE.format(context=turn_context(now))
 
 
 def realtime_rule(tools: list[ToolSpec]) -> str:
@@ -1533,6 +1548,44 @@ _FRONT_DOOR_DATABASE = (
 # A web address in the utterance: "what does https://... say", "summarise www.example.com".
 _HAS_LINK = re.compile(r"\bhttps?://|\bwww\.[a-z0-9-]", re.IGNORECASE)
 _FRONT_DOOR_ROUTES = ("SELF", "ORCHESTRATOR")
+
+# The verdict's shape, sent with the front door's call as a JSON schema (structured outputs:
+# the API makes the cheap model answer with exactly this object). Before it, Haiku would
+# sometimes answer a "thank you" in plain prose, which read as no verdict and sent a
+# pleasantry through a full Plan call with every tool.
+FRONT_DOOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "intent_type": {"type": "string", "enum": list(_FRONT_DOOR_INTENTS)},
+        "route_to": {"type": "string", "enum": list(_FRONT_DOOR_ROUTES)},
+        "response": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "required": ["intent_type", "route_to", "response"],
+    "additionalProperties": False,
+}
+
+# When the answer is plain prose all the same (a provider without structured outputs - the
+# Gemini standby - or a refusal), it is taken as the front door's own CHAT/SELF answer rather
+# than sent on to Plan (_front_door_plain_answer) - except when it reads like a hand-off it
+# failed to make: a claim it cannot do something or has done something (only a tool could),
+# broken JSON (a verdict cut short), or more than a front-door answer's length.
+_FRONT_DOOR_PLAIN_MAX = 400
+_FRONT_DOOR_HANDOFF = re.compile(
+    r"\b(?:can[’']?t|cannot|unable to|not able to|no access|don[’']?t have (?:access|a tool|the ability)"
+    r"|i[’']?ve (?:sent|started|checked|logged|created|opened|run|booked|scheduled)"
+    r"|i(?:[’']ll| will) (?:check|look|send|start|run|create|open|find|search|book))\b",
+    re.IGNORECASE,
+)
+
+
+def _front_door_plain_answer(raw: str) -> Optional["FrontDoorDecision"]:
+    """The front door's plain-prose reply as a CHAT/SELF verdict, or None when it must go to Plan."""
+    text = (raw or "").strip()
+    if not text or len(text) > _FRONT_DOOR_PLAIN_MAX or text.lower() == "null":
+        return None
+    if "{" in text or "}" in text or _FRONT_DOOR_HANDOFF.search(text):
+        return None
+    return FrontDoorDecision("CHAT", "SELF", text)
 
 
 @dataclass
@@ -2829,6 +2882,11 @@ class Turn:
     # True when the output limit ended this answer (Anthropic stop_reason "max_tokens",
     # Gemini finish_reason MAX_TOKENS): a tool call in it may be missing its end.
     cut_off: bool = False
+    # A user turn only: what Jarvis adds after the person's words for this one question -
+    # the time and place (moment_note). Sent as a block of its own after the text, outside
+    # the prompt-cache breakpoint, and never kept in the history: the next question sends
+    # this turn again as the text alone, which is exactly the prefix the cache holds.
+    note: str = ""
 
 
 class ProviderError(Exception):
@@ -2908,17 +2966,19 @@ class _Provider:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
-        json_output: bool = False,
+        json_output: Any = False,
         max_tokens: Optional[int] = None,
     ) -> Turn:
         """
         One model call. `system` is the persona - the same text on every call, so a
-        provider can cache it; `context` is what changes from turn to turn (the
-        date, the place, rules that depend on this turn's tools - see turn_context),
-        sent after it. `json_output` asks for one JSON object where the API has a
-        mode for it (a specialist agent's structured answer, agents/); a provider
-        without one ignores it and the prompt has to say so. `max_tokens` replaces
-        the provider's own output limit for this one call (LONG_OUTPUT_MAX_TOKENS).
+        provider can cache it; `context` is the rules that depend on this turn's tools
+        and on who is asking, sent after it (the time and place travel with the
+        question instead - Turn.note). `json_output` asks for one JSON object where the
+        API has a mode for it (a specialist agent's structured answer, agents/); a
+        dict is a JSON schema the answer must follow (the front door's), which Anthropic
+        enforces with structured outputs; a provider without a JSON mode ignores it and
+        the prompt has to say so. `max_tokens` replaces the provider's own output limit
+        for this one call (LONG_OUTPUT_MAX_TOKENS).
         """
         raise NotImplementedError
 
@@ -2930,7 +2990,7 @@ class _Provider:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
-        json_output: bool = False,
+        json_output: Any = False,
         max_tokens: Optional[int] = None,
     ) -> Turn:
         """
@@ -3087,7 +3147,11 @@ class AnthropicProvider(_Provider):
 
         for turn in transcript:
             if turn.kind == "user":
-                messages.append({"role": "user", "content": text(turn.text)})
+                content = text(turn.text)
+                if turn.note:
+                    # The time and place, as a block of its own after the words (Turn.note).
+                    content = (content or []) + [{"type": "text", "text": turn.note}]
+                messages.append({"role": "user", "content": content})
 
             elif turn.kind == "assistant":
                 messages.append({"role": "assistant", "content": text(turn.text)})
@@ -3139,12 +3203,12 @@ class AnthropicProvider(_Provider):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
-        json_output: bool = False,  # no JSON mode here; only the agents ask, and none runs on Claude
+        json_output: Any = False,  # a schema (dict): structured outputs; True alone: no JSON mode here
         max_tokens: Optional[int] = None,
     ) -> Turn:
         if self._client is None:
             raise ProviderError("no_key", "My Anthropic model isn't configured.")
-        request = self._request(system, transcript, tools, model, effort, context, max_tokens)
+        request = self._request(system, transcript, tools, model, effort, context, max_tokens, json_output)
         try:
             response = self._client.messages.create(**request)
         except Exception as exc:  # noqa: BLE001 - classified immediately below
@@ -3159,13 +3223,13 @@ class AnthropicProvider(_Provider):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
-        json_output: bool = False,
+        json_output: Any = False,
         max_tokens: Optional[int] = None,
     ) -> Turn:
         """complete() on the async client: cancelling the awaiting task closes the request (see _Provider.acomplete)."""
         if self._client is None:
             raise ProviderError("no_key", "My Anthropic model isn't configured.")
-        request = self._request(system, transcript, tools, model, effort, context, max_tokens)
+        request = self._request(system, transcript, tools, model, effort, context, max_tokens, json_output)
         try:
             response = await self._async.get().messages.create(**request)
         except Exception as exc:  # noqa: BLE001 - classified immediately below; a cancellation is not an Exception
@@ -3181,6 +3245,7 @@ class AnthropicProvider(_Provider):
         effort: Optional[str],
         context: str,
         max_tokens: Optional[int],
+        json_output: Any = False,
     ) -> dict[str, Any]:
         """The Messages API request for one call (complete, acomplete)."""
         # `model`/`effort` come from the intent router, per question.
@@ -3199,8 +3264,8 @@ class AnthropicProvider(_Provider):
             "system": [
                 {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
             ]
-            # The per-turn block (date, place, ...) goes after the breakpoint, so the
-            # cached prefix - tools and persona - stays byte-identical turn after turn.
+            # The rules for this call's tools go after the breakpoint. They change only
+            # with the tool set; the time and place go with the question (Turn.note).
             + ([{"type": "text", "text": context}] if context else []),
             "thinking": THINKING_TOOLS if tools else THINKING_PLAIN,
             "output_config": {"effort": effort or self._effort},
@@ -3208,7 +3273,7 @@ class AnthropicProvider(_Provider):
         }
         if tools:
             # The third breakpoint: the end of the conversation (_cache_tail).
-            self._cache_tail(request["messages"])
+            self._cache_tail(request["messages"], transcript)
 
         if target in MODELS_WITHOUT_EFFORT:
             # The cheap tier is a 4.5-generation model, which knows
@@ -3219,6 +3284,15 @@ class AnthropicProvider(_Provider):
             # trade being made here (see _ALWAYS_FAST).
             request.pop("output_config", None)
             request.pop("thinking", None)
+
+        if isinstance(json_output, dict) and not tools:
+            # Structured outputs: the answer is JSON that follows this schema, guaranteed by
+            # the API (the front door's verdict - FRONT_DOOR_SCHEMA). Haiku 4.5 takes it too;
+            # it is only `effort` that it does not know.
+            request["output_config"] = {
+                **request.get("output_config", {}),
+                "format": {"type": "json_schema", "schema": json_output},
+            }
 
         if tools:
             schemas = anthropic_tool_schemas(tools)
@@ -3232,21 +3306,30 @@ class AnthropicProvider(_Provider):
         return request
 
     @staticmethod
-    def _cache_tail(messages: list[dict[str, Any]]) -> None:
+    def _cache_tail(messages: list[dict[str, Any]], transcript: list[Turn]) -> None:
         """
-        Marks the last content block of the last message as a prompt-cache breakpoint - the
-        third of Anthropic's four, after the tools and the persona. Plan's first call of a
-        question writes the prefix up to the question (tools, system, history, question); its
-        second call, which adds only the model's tool calls and their results, reads all of that
-        back at a tenth of the price and marks its own end - the tool results - for a third call.
+        Marks the end of the conversation as a prompt-cache breakpoint - the third of
+        Anthropic's four, after the tools and the persona. Plan's first call of a question
+        writes the prefix up to the question (tools, system, history, question); its second
+        call, which adds only the model's tool calls and their results, reads all of that back
+        at a tenth of the price and marks its own end - the tool results - for a third call.
+        The next question reads it too: its history is this one's, word for word.
+
+        The question's note (the time and place, Turn.note) is its last block and stays
+        OUTSIDE the breakpoint: the history sends this turn again without it, so the cached
+        prefix ends at the question's own words.
+
         Only for calls with tools: the front door and other one-off calls are never followed
         by a call that shares their prefix, and a write that is never read only costs 1.25x.
         """
         if not messages:
             return
         content = messages[-1].get("content")
-        if isinstance(content, list) and content:  # _to_messages writes every non-empty turn as blocks
-            content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+        if not isinstance(content, list) or not content:  # _to_messages writes every non-empty turn as blocks
+            return
+        noted = bool(transcript) and transcript[-1].kind == "user" and bool(transcript[-1].note)
+        index = len(content) - (2 if noted and len(content) > 1 else 1)
+        content[index] = {**content[index], "cache_control": {"type": "ephemeral"}}
 
     @staticmethod
     def _parse(response: Any) -> Turn:
@@ -3434,11 +3517,12 @@ class GeminiProvider(_Provider):
 
         for turn in transcript:
             if turn.kind == "user":
-                contents.append(
-                    genai_types.Content(
-                        role="user", parts=[genai_types.Part.from_text(text=turn.text)]
-                    )
-                )
+                parts = [genai_types.Part.from_text(text=turn.text)]
+                if turn.note:
+                    # The time and place after the words (Turn.note): Gemini's own cache also
+                    # matches on the prefix, which the history then keeps the same.
+                    parts.append(genai_types.Part.from_text(text=turn.note))
+                contents.append(genai_types.Content(role="user", parts=parts))
 
             elif turn.kind == "assistant":
                 contents.append(
@@ -3493,7 +3577,7 @@ class GeminiProvider(_Provider):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
-        json_output: bool = False,
+        json_output: Any = False,
         max_tokens: Optional[int] = None,
     ) -> Turn:
         if self._client is None:
@@ -3518,7 +3602,7 @@ class GeminiProvider(_Provider):
         model: Optional[str] = None,
         effort: Optional[str] = None,
         context: str = "",
-        json_output: bool = False,
+        json_output: Any = False,
         max_tokens: Optional[int] = None,
     ) -> Turn:
         """complete() on the async client: cancelling the awaiting task closes the request (see _Provider.acomplete)."""
@@ -3559,7 +3643,7 @@ class GeminiProvider(_Provider):
         system: str,
         tools: list[ToolSpec],
         context: str,
-        json_output: bool,
+        json_output: Any,
         max_tokens: Optional[int],
     ) -> Any:
         """The GenerateContentConfig for one call (complete, acomplete)."""
@@ -3713,8 +3797,8 @@ class TurnRun:
     # do not take events.
     emit: Optional[Callable[[dict[str, Any]], None]] = None
     started: float = field(default_factory=time.monotonic)
-    # The time every model call of this question is told (turn_context): read once, so the
-    # calls' prompts match up to the end of the history and the prompt cache can serve it.
+    # The time every model call of this question is told (moment_note): read once, so every
+    # call of the question sends the same note and the third call can read the second's cache.
     clock: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     node: str = Node.ANALYZE_INTENT
     next: str = Node.DONE
@@ -5114,12 +5198,18 @@ class LLMBrain:
         # is interrupting. The tool list does not: a router that can call
         # tools is a second supervisor.
         working: list[Turn] = list(self._history)
-        working.append(Turn(kind="user", text=user_text.strip()))
+        working.append(Turn(kind="user", text=user_text.strip(), note=moment_note(run.clock)))
         model, effort = self._route(INTENT_SIMPLE)
 
         try:
             turn = await self._call_model(
-                run, working, tools=[], model=model, effort=effort, system=self._front_door_prompt()
+                run,
+                working,
+                tools=[],
+                model=model,
+                effort=effort,
+                system=self._front_door_prompt(),
+                json_output=FRONT_DOOR_SCHEMA,
             )
         except ProviderError as exc:
             # No speaking the error here: the supervisor is about to make
@@ -5128,6 +5218,14 @@ class LLMBrain:
             return None
 
         decision = _parse_front_door(turn.text) if turn.kind == "assistant" else None
+        if decision is None and turn.kind == "assistant":
+            # Prose instead of the verdict: its own answer, unless it reads like a hand-off.
+            decision = _front_door_plain_answer(turn.text)
+            if decision is not None:
+                print(
+                    f"[Brain] Front door answered in plain text, not JSON ({turn.text[:80]!r}); "
+                    "taken as its direct answer - no Plan call."
+                )
         if decision is None:
             print(
                 f"[Brain] Front door gave no usable verdict ({turn.text[:80]!r}); "
@@ -5381,7 +5479,9 @@ class LLMBrain:
         # A working copy: only the question and the final answer are kept
         # in history. The tool round trips are scaffolding for this one
         # answer and would otherwise dominate the context window.
-        run.working = list(self._history) + [Turn(kind="user", text=user_text.strip())]
+        # The question carries the time and place as its note (moment_note): after the history,
+        # so everything before it is the same as last question's and comes from the prompt cache.
+        run.working = list(self._history) + [Turn(kind="user", text=user_text.strip(), note=moment_note(run.clock))]
         # What this reply may quote a trip link or id from: what the user just
         # typed, plus whatever the tools return below. Never the earlier
         # conversation - that is where a stale link comes from (link_guard.py).
@@ -5545,6 +5645,7 @@ class LLMBrain:
         effort: Optional[str] = None,
         system: Optional[str] = None,
         max_tokens: Optional[int] = None,
+        json_output: Any = False,
     ) -> Turn:
         """
         One provider round trip, with a single failover retry.
@@ -5555,35 +5656,27 @@ class LLMBrain:
         `tools=[]` means no tools, where None means the active set.
         `max_tokens` raises the output limit for this call (LONG_OUTPUT_MAX_TOKENS,
         for a presentation); None keeps the provider's own (MAX_TOKENS).
+        `json_output` is a JSON schema the answer must follow (the front door's,
+        FRONT_DOOR_SCHEMA - see _Provider.complete), or False.
         """
         assert self._provider is not None
         tools = self._active_tools() if tools is None else tools
-        # When and where, on every call - the front door's too, which is what answers
-        # "what day is it?" - plus, for the persona, the real-time rule when this
-        # call can search the web. The question's own clock, not a fresh one per call:
-        # the context sits before the history, and the second Plan call's cache read
-        # needs it byte for byte (TurnRun.clock).
-        context = turn_context(run.clock)
+        # The rules that depend on this call's tools and on who is asking, after the persona
+        # in the system block. Not the time and place: those go with the question (Turn.note),
+        # after the history, so this block - and the history - stay the same from question to
+        # question and the prompt cache serves them.
+        rules: list[str] = []
         if system is None:
             caller = request_context.current()
-            rule = realtime_rule(tools)
-            if rule:
-                context += "\n\n" + rule
-            team = self._team_rule(tools)
-            if team:
-                context += "\n\n" + team
-            images = creative_rule(tools, web=caller is not None and caller.is_web)
-            if images:
-                context += "\n\n" + images
-            decks = publishing_rule(tools, web=caller is not None and caller.is_web)
-            if decks:
-                context += "\n\n" + decks
-            sheets = analytics_rule(tools, web=caller is not None and caller.is_web)
-            if sheets:
-                context += "\n\n" + sheets
-            database = database_rule(tools)
-            if database:
-                context += "\n\n" + database
+            web = caller is not None and caller.is_web
+            rules = [
+                realtime_rule(tools),
+                self._team_rule(tools),
+                creative_rule(tools, web=web),
+                publishing_rule(tools, web=web),
+                analytics_rule(tools, web=web),
+                database_rule(tools),
+            ]
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
@@ -5593,6 +5686,7 @@ class LLMBrain:
                     prompt += VOICE_REPLY_ADDENDUM
         else:
             prompt = system
+        context = "\n\n".join(rule for rule in rules if rule)
 
         async def once(limit: Optional[int]) -> Turn:
             assert self._provider is not None
@@ -5603,8 +5697,10 @@ class LLMBrain:
             chosen = model
             if chosen is not None and chosen.startswith("gemini") != (self._provider.name == "gemini"):
                 chosen = None
-            # Only a raised limit is passed: every other call is made exactly as before.
+            # Only a raised limit or a JSON schema is passed: every other call is made exactly as before.
             extra: dict[str, Any] = {"max_tokens": limit} if limit else {}
+            if json_output:
+                extra["json_output"] = json_output
             try:
                 return await self._send(run, prompt, working, tools, chosen, effort, context, **extra)
             except ProviderError as exc:
