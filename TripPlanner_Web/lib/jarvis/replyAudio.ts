@@ -3,16 +3,17 @@ import { parseMessageContent } from "./messageContent";
 /**
  * Spoken replies: what the brain sends back as audio, and when the page may play it.
  *
- * The brain (Python, reply_audio.py) voices a reply with Edge-TTS and returns it
- * beside the text as `audio: { mime: "audio/mpeg", base64: "..." }`. It does so
- * only when asked (`speak: true`) and only for a reply whose plain text is at most
- * VOICE_REPLY_MAX_CHARS characters - the "conversational" size: a sentence or two,
- * not a plan or a list of search results.
+ * The voice speaks ENGLISH, always. When asked (`speak: true`) the brain (Python)
+ * sends what the voice says - `spoken_audio_text`: the reply itself when it is
+ * already short English, else its English translation and summary, at most
+ * VOICE_REPLY_MAX_CHARS characters - and that text voiced with Edge-TTS's English
+ * voice as `audio: { mime: "audio/mpeg", base64: "..." }`. The reply shown in the
+ * chat may be Thai; it is never what is played.
  *
- * The page enforces that limit itself, too (`canSpeak`): it plays a reply only if
- * its own text passes, whatever audio arrived with it, so a brain that ignored the
- * rule still could not make the page read an essay aloud. The same number is
- * `VOICE_MAX_CHARS` in rich_reply.py.
+ * The page enforces the limit itself, too (`canSpeak`): it plays audio only when the
+ * text it says passes - the spoken text, or for a brain from before it the reply's
+ * own words - so a brain that ignored the rule still could not make the page read
+ * an essay aloud. The same number is `VOICE_MAX_CHARS` in rich_reply.py.
  *
  * Pure: no React, no browser APIs - the API routes use it as well as the page.
  */
@@ -55,10 +56,12 @@ export function canSpeak(text: string | null | undefined): text is string {
 }
 
 /**
- * The audio to hand the page for a stored Jarvis reply: `audio` itself when the
- * reply's text (the words, not a widget's data) passes `canSpeak`, otherwise null.
+ * The audio to hand the page for a stored Jarvis reply: `audio` itself when the text it says
+ * passes `canSpeak` - the brain's English `spokenText` when there is one, else (a brain from
+ * before it) the reply's own words, not a widget's data - otherwise null.
  */
-export function speakableAudio(storedReply: string, audio: ReplyAudio | null): ReplyAudio | null {
+export function speakableAudio(storedReply: string, audio: ReplyAudio | null, spokenText: string | null = null): ReplyAudio | null {
   if (!audio) return null;
-  return canSpeak(parseMessageContent(storedReply, "jarvis").text) ? audio : null;
+  const says = spokenText ?? parseMessageContent(storedReply, "jarvis").text;
+  return canSpeak(says) ? audio : null;
 }

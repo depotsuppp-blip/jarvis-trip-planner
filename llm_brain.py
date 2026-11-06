@@ -154,12 +154,11 @@ Several things were added to this module beyond plain tool calling:
       target_platform is "canva" (Canva only: when Canva cannot make it the
       answer is an ERROR and the manager asks the user whether they want a
       PPTX instead - nothing is built another way), "pptx" (python-pptx) or
-      "any". Canva: when Jarvis's Chrome is signed in to it (python -m
-      utils.canva_auth) the deck is built on canva.com in a hidden browser it
-      drives (agents/canva_browser.py, Playwright, up to JARVIS_CANVA_TIMEOUT
-      seconds on a thread of its own, so this tool stays a plain call) and
-      downloaded; for "any", without a session or when that run fails, it is
-      laid out with python-pptx. Either way the file is checked and kept as
+      "any" - all three are a python-pptx file: Canva is not driven any more
+      (no browser, no API); a deck the user wants in Canva is the same PPTX,
+      and the reply tells them to download it and drag-and-drop it into Canva
+      to edit it (CANVA_READY_HINT, Review_Artifact). The file is checked and
+      kept as
       artifacts/presentation_YYYYMMDD_HHMMSS.pptx (.pdf when
       JARVIS_CANVA_FORMAT=pdf). By voice the reply names the folder and the
       file; in the web chat it carries a download link,
@@ -240,8 +239,8 @@ the same nodes:
                                  setting `cancel` ends the run at once: the model
                                  request in flight is closed, no further tool
                                  starts (_execute), a specialist agent stops after
-                                 its current step, a Canva browser is shut, and
-                                 nothing is added to the history.
+                                 its current step, a Canva job is no longer
+                                 waited for, and nothing is added to the history.
     LLMBrain.ask(text)           the voice assistant: the same run on the caller's
                                  thread with no event loop (events()), every call
                                  made in turn exactly as before; returns the reply.
@@ -506,13 +505,6 @@ MAX_TOKENS = 1024
 # manager's to write: the Head of Publishing's own model writes them from a short brief.)
 LONG_OUTPUT_MAX_TOKENS = 8192
 
-# The web chat waits this long for a whole answer (TripPlanner_Web/lib/jarvisBrain.ts,
-# BRAIN_TIMEOUT_MS). A deck made in Canva gets only what is left of it, less
-# PUBLISHING_REPLY_SECONDS for the reply written after it (LLMBrain._publish): research before
-# it can take most of the two minutes, and a reply that arrives after the page gave up is lost.
-WEB_CHAT_SECONDS = 120.0
-PUBLISHING_REPLY_SECONDS = 15.0
-
 # The answer when a tool call is cut off even with that much room: never half of it run.
 CUT_OFF_REPLY = (
     "That came out too long for me to write in one go, so nothing was made. Ask for a shorter "
@@ -760,7 +752,12 @@ WEB_CHAT_ADDENDUM = """
 
 This conversation is a text chat in the Trip Planner web app, not a voice \
 call: the user reads your reply on a screen instead of hearing it. That \
-changes one rule above. A link that a tool returns is the whole point of \
+changes two rules above. First, the language: "always speak English" is a \
+rule for the voice, not for this chat. Write your reply in the language the \
+user writes in, or the one they ask for - Thai for a message in Thai. When \
+replies are read aloud, an English version of yours is made for the voice \
+automatically, so never refuse a language or apologise for one because of \
+the voice. Second, links. A link that a tool returns is the whole point of \
 the answer, so write it into your reply exactly as the tool gave it - on \
 its own line after a short sentence is best - and never shorten, rewrite, \
 or invent a link, or reuse one from earlier in the conversation. \
@@ -783,6 +780,42 @@ within 200 characters, in plain words that sound natural spoken. That limit \
 is for conversation only: when the task needs more (search results, a plan, \
 what is in a file) write what it needs - it is shown on screen and not read \
 aloud."""
+
+# What the voice says is English, always (the owner's rule): a reply in the chat may be Thai -
+# or any language - but the words read aloud are an English version of it, translated and,
+# where the voice has a limit (rich_reply.VOICE_MAX_CHARS in the web chat), cut down to a
+# sentence or two. Final_Response makes it (LLMBrain._spoken_english) with the cheap tier,
+# only when the reply is not already short English; the reply itself is never changed.
+SPOKEN_PROMPT = (
+    "You turn a chat assistant's reply into what its voice says out loud. Always answer in English, whatever "
+    "language the reply is in: translate it. Keep the meaning and never add facts. {length} Plain spoken "
+    "sentences only: no markdown, lists, emoji, links, file paths or code. When the reply shows a link, a file, "
+    "a picture or a table, say that it is in the chat instead of reading it out. Answer with the words to say "
+    "and nothing else."
+)
+SPOKEN_LENGTH_LIMIT = "At most {limit} characters: one or two short sentences - summarize when the reply is longer."
+SPOKEN_LENGTH_FREE = "About as long as the reply."
+# Said when no English version could be made (the model failed and the reply is not English).
+SPOKEN_FALLBACK = "I've put my answer in the chat."
+
+
+def is_english(text: str) -> bool:
+    """True when every letter in `text` is a Latin one (no Thai, no other script); text without letters counts."""
+    return not any(ch.isalpha() and ord(ch) >= 0x250 for ch in text)
+
+
+def fit_spoken(text: str, limit: Optional[int]) -> str:
+    """`text` on one line and within `limit` characters: cut at a sentence's end, else at a word, never mid-word."""
+    text = " ".join(text.split())
+    if limit is None or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("."))
+    if end >= limit // 3:
+        return cut[: end + 1].strip()
+    space = cut.rfind(" ")
+    return (cut[:space] if space > 0 else cut[: limit - 1]).rstrip(",;:- ") + "."
+
 
 # ---------------------------------------------------------------------
 # Where and when: told to the model on every turn
@@ -939,22 +972,26 @@ DELEGATE_PUBLISHING = "delegate_to_publishing"
 # Added to the per-turn context while the manager has that tool (publishing_rule), in the
 # uncached block for the same reason as CREATIVE_RULE: it is there only with python-pptx.
 PUBLISHING_RULE = (
-    "Presentations: your Head of Publishing writes AND builds real presentation files - in Canva or as a "
-    "PowerPoint (.pptx). You never write the slides yourself, not in your reply and not in the tool call: you "
+    "Presentations: your Head of Publishing writes AND builds real PowerPoint files (.pptx) - Canva-ready ones "
+    "when the user wants Canva. You never write the slides yourself, not in your reply and not in the tool call: you "
     "hand over a short brief. When the user asks for a presentation, slides, a slide deck, a PowerPoint or a "
     "Canva presentation, call {tool} once with: topic - what the deck is about, in the user's own words and "
     "language; num_slides - the number of slides the user asked for, counting the opening slide (5 when they "
     "gave none); target_platform - "
-    '"canva" when the user asks for it in Canva, "pptx" when they ask for a PowerPoint or .pptx file, "any" '
+    '"canva" when the user asks for it in Canva (you cannot build in Canva itself: it makes a PPTX ready to drag '
+    'into Canva), "pptx" when they ask for a PowerPoint or .pptx file, "any" '
     "otherwise; special_instructions - audience, purpose, tone, points that must be covered, and the language "
     "of the slides when it is not the topic's (the user's language: Thai slides for a request in Thai - "
     "speaking English is a rule for your own reply, not for the file){research}. A brief, not the content: a "
     "few sentences. {share} The result lists the slide titles: use them to say in one sentence what the "
-    "deck covers. Say a presentation was made only when the result starts with SUCCESS. When it starts with "
-    "ERROR and is about Canva, tell the user Canva could not make it and why, and ask whether they want a "
-    'PowerPoint (PPTX) file instead - call again with target_platform "pptx" only after they say yes. Any '
-    "other ERROR: tell the user in one sentence what went wrong."
+    "deck covers. When the result has a Canva line, tell the user to download this PPTX and drag-and-drop it "
+    "into Canva to edit it. Say a presentation was made only when the result starts with SUCCESS. When it "
+    "starts with ERROR, tell the user in one sentence what went wrong."
 )
+# Said in the reply to a deck the user wanted in Canva, when the model's own reply does not
+# mention Canva (Review_Artifact): Jarvis makes a PPTX, and Canva opens one dropped into it.
+CANVA_READY_HINT = "Download this PPTX and drag-and-drop it into Canva to edit."
+
 PUBLISHING_RESEARCH = (
     ". When the deck needs facts you are not sure of, figures or anything recent, get them with {tool} "
     "first and put the few key facts in special_instructions"
@@ -1570,10 +1607,19 @@ _FRONT_DOOR_CREATIVE = (
     "cannot make images."
 )
 
+# Added to the front door's instructions in the web chat: its replies are read on a screen, and
+# what the voice says is an English version made for it (Final_Response), so the chat answers in
+# the user's language - the persona's "Speak English only" stays for the voice assistant.
+_FRONT_DOOR_WEB = (
+    "\n- This input comes from a text chat on a screen, not a microphone: write response in the language "
+    "the user writes in, or the one they ask for (Thai for Thai). Spoken replies get an English version "
+    "of it made automatically, so the English-only rule above does not apply here."
+)
+
 # The same while it can build presentations (delegate_to_publishing): the cheap model would
 # otherwise write the slides into the chat as text.
 _FRONT_DOOR_PUBLISHING = (
-    "\n- The assistant behind you can also build presentations - in Canva or as PowerPoint files: a "
+    "\n- The assistant behind you can also build presentations as PowerPoint files (ready for Canva, too): a "
     "request for a presentation, slides, a slide deck, a PowerPoint or a Canva design, or to change one, "
     "is route_to \"ORCHESTRATOR\" with response null. Never write the slides yourself, and never say that "
     "you cannot make a presentation."
@@ -3949,6 +3995,12 @@ class TurnRun:
     remember: bool = False
     remembered: str = ""
     finished: bool = False
+    # Make an English spoken version of the reply (Final_Response: "spoken" in the final event),
+    # at most `speak_limit` characters (None: as long as it needs).
+    speak: bool = False
+    speak_limit: Optional[int] = None
+    # A deck the user wanted in Canva was made during this run (_publish): the reply says how to use it.
+    canva_ready: bool = False
     # What went to the background during this run (_execute) - the replay note in the history.
     dispatched: list[str] = field(default_factory=list)
     # The Markdown lines for what was made during this run - a picture, a presentation's or a
@@ -4338,8 +4390,7 @@ class LLMBrain:
                  {"OPENAI_API_KEY": "needs OPENAI_API_KEY", "openai package": "needs the openai package",
                   "JARVIS_IMAGE_MODEL": "needs JARVIS_IMAGE_MODEL"}),
             head("publishing", "Head of Publishing", DELEGATE_PUBLISHING, self._publishing, "JARVIS_PUBLISHING",
-                 {"python-pptx": "needs python-pptx", "Canva": "Canva is not ready",
-                  "write the slides": "needs OPENAI_API_KEY"}),
+                 {"python-pptx": "needs python-pptx", "write the slides": "needs OPENAI_API_KEY"}),
             head("analytics", "Head of Analytics", DELEGATE_ANALYTICS, self._analytics, "JARVIS_ANALYTICS",
                  {"pandas": "needs pandas and openpyxl"}),
             # Read-only SQL on the live database; offered to the owner only (_database_allowed).
@@ -4628,8 +4679,8 @@ class LLMBrain:
                 name=DELEGATE_PUBLISHING,
                 description=(
                     "Hand a presentation request to your Head of Publishing, who WRITES the slides itself (with "
-                    "OpenAI's GPT-4o) and builds a real presentation file - in Canva (up to about a minute and a "
-                    "half) or as a 16:9 PowerPoint file - and saves it on this computer. Use it whenever the user "
+                    "OpenAI's GPT-4o) and builds a real 16:9 PowerPoint file (.pptx) in seconds - Canva-ready when "
+                    "the user wants Canva - and saves it on this computer. Use it whenever the user "
                     "asks for a presentation, slides, a slide deck, a PowerPoint or a Canva presentation. Send a "
                     "brief, never the slides: you do not write slide content. Returns SUCCESS with where the file "
                     "is - the saved file's path, or in the web chat a Markdown download link - and the slide "
@@ -4657,9 +4708,9 @@ class LLMBrain:
                             "type": "string",
                             "enum": list(PLATFORMS),
                             "description": (
-                                '"canva" when the user asks for the presentation in Canva (Canva only: if Canva '
-                                'cannot make it, the answer is an ERROR - nothing is built another way); "pptx" '
-                                'when they ask for a PowerPoint or .pptx file; "any" otherwise.'
+                                '"canva" when the user asks for the presentation in Canva - the deck is a '
+                                'PowerPoint file ready to drag into Canva, and the reply says so; "pptx" when they '
+                                'ask for a PowerPoint or .pptx file; "any" otherwise.'
                             ),
                         },
                         "special_instructions": {
@@ -4694,25 +4745,20 @@ class LLMBrain:
         remembered so the reply is sure to carry it (_with_artifacts). By voice the path
         stays and the URL goes: a web address means nothing through a speaker.
 
-        A web request has a clock (WEB_CHAT_SECONDS): the agent is told how much of it is left
-        for writing the slides and a Canva run; for "any" it builds the deck with python-pptx
-        when that is too little, for "canva" it says so.
+        A deck the user wanted in Canva is a PPTX like any other: its run is marked so the
+        reply is sure to tell them to drag it into Canva (CANVA_READY_HINT, Review_Artifact).
         """
         caller = request_context.current()
         web = caller is not None and caller.is_web
-        time_left = None
-        if web:
-            time_left = WEB_CHAT_SECONDS - (time.monotonic() - _current_run().started) - PUBLISHING_REPLY_SECONDS
-        later = f", {time_left:.0f} s left for it" if time_left is not None else ""
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
         shown = str(topic or "")[:120].encode(encoding, errors="backslashreplace").decode(encoding)
         print(
             f"[Brain] Delegating to the Head of Publishing: {shown!r}, {num_slides or 5} slides, "
-            f"platform {target_platform or 'any'}{later}."
+            f"platform {target_platform or 'any'}."
         )
-        result = self._publishing.create_presentation(
-            topic, num_slides, target_platform, special_instructions, time_left=time_left
-        )
+        result = self._publishing.create_presentation(topic, num_slides, target_platform, special_instructions)
+        if result.startswith("SUCCESS") and str(target_platform or "").strip().lower() == "canva":
+            _current_run().canva_ready = True
 
         from agents.publishing_agent import markdown_link  # the agents package imports this module
 
@@ -5033,6 +5079,9 @@ class LLMBrain:
         "Long-term memory of the person you are talking to ..." does.
         """
         base = FRONT_DOOR_PROMPT
+        caller = request_context.current()
+        if caller is not None and caller.is_web:
+            base += _FRONT_DOOR_WEB
         if self._creative is not None and self._creative.available:
             base += _FRONT_DOOR_CREATIVE
         if self._publishing is not None and self._publishing.available:
@@ -5516,19 +5565,22 @@ class LLMBrain:
         error becomes a short spoken sentence.
         """
         reply = ""
-        for event in self.events(user_text):
+        # What the voice engine says is English, always: the spoken version of the reply, which
+        # is the reply itself when that is already English (Final_Response, _spoken_english).
+        for event in self.events(user_text, speak=True):
             if event["type"] == "final":
-                reply = event["message"]
+                reply = event.get("spoken") or event["message"]
         return reply
 
-    def events(self, user_text: str) -> Iterator[dict[str, Any]]:
+    def events(self, user_text: str, speak: bool = False, speak_limit: Optional[int] = None) -> Iterator[dict[str, Any]]:
         """
         The run's events (see run()) as a plain iterator, for a caller without an
         event loop - the voice assistant, through ask(). Blocking: each node's model
         call and tools run on this thread as the iterator is advanced. Cannot be
         cancelled; nothing waits on an event loop (_drive_inline checks that).
+        `speak` adds the English spoken version to the final event ("spoken").
         """
-        run = TurnRun(user_text=user_text, inline=True)
+        run = TurnRun(user_text=user_text, inline=True, speak=speak, speak_limit=speak_limit)
         yield from _drive_inline(self._machine(run))
 
     async def run(
@@ -5537,6 +5589,7 @@ class LLMBrain:
         cancel: Optional[threading.Event] = None,
         progress: Optional[Callable[[str], None]] = None,
         emit: Optional[Callable[[dict[str, Any]], None]] = None,
+        speak: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """
         Answers `user_text` on the running event loop (api_server.py), yielding
@@ -5546,6 +5599,8 @@ class LLMBrain:
              "status": "Delegating to Head of Analytics..."}     as each step starts
             {"type": "final", "node": "Final_Response", "status": "Done",
              "message": "<the reply>"}                           once, last
+             (+ "spoken": "<what the voice says, in English>" when `speak` is set:
+             at most rich_reply.VOICE_MAX_CHARS characters - see _spoken_english)
 
         Model calls are awaited on the providers' async clients, and tools run on
         worker threads (asyncio.to_thread), so the loop stays free and the run can
@@ -5574,6 +5629,8 @@ class LLMBrain:
             cancel=cancel or threading.Event(),
             progress=progress,
             emit=emit,
+            speak=speak,
+            speak_limit=rich_reply.VOICE_MAX_CHARS,
         )
         async for event in self._machine(state):
             yield event
@@ -5837,6 +5894,10 @@ class LLMBrain:
                 return
             reply = LINK_FALLBACK
 
+        # A deck the user wanted in Canva: a PPTX they drag into it - said even when the model did not.
+        if run.canva_ready and "canva" not in reply.lower():
+            reply = f"{reply.rstrip()}\n\n{CANVA_READY_HINT}"
+
         # Web chat: what was made for this request is in the reply, as the Markdown
         # lines the page draws - a picture, a download link (_create_image, _publish).
         reply = self._with_artifacts(reply)
@@ -5866,7 +5927,13 @@ class LLMBrain:
         self._answer(run, reply, remember=True, remembered=remembered)
 
     async def _final_response(self, run: "TurnRun") -> AsyncIterator[dict[str, Any]]:
-        """Final_Response: the exchange goes into the history (when it should) and the reply out."""
+        """
+        Final_Response: the exchange goes into the history (when it should) and the reply out -
+        with, when the run is to be spoken, what the voice says: English, always (_spoken_english).
+        """
+        final: dict[str, Any] = {"type": "final", "node": Node.FINAL_RESPONSE, "status": "Done", "message": run.reply}
+        if run.speak:
+            final["spoken"] = await self._spoken_english(run, run.reply, run.speak_limit)
         if run.remember:
             self._history.append(Turn(kind="user", text=run.user_text.strip()))
             self._history.append(Turn(kind="assistant", text=run.remembered or run.reply))
@@ -5874,7 +5941,40 @@ class LLMBrain:
         run.next = Node.DONE
         run.finished = True
         print(f"[Brain] Done in {time.monotonic() - run.started:.1f} s ({' -> '.join(run.trail)}).")
-        yield {"type": "final", "node": Node.FINAL_RESPONSE, "status": "Done", "message": run.reply}
+        yield final
+
+    async def _spoken_english(self, run: "TurnRun", reply: str, limit: Optional[int]) -> str:
+        """
+        What the voice says for `reply`: English, whatever language the chat shows, and at most
+        `limit` characters. The reply's own words when they already are short English (no model
+        call); else the cheap tier translates and, for a limit, summarizes them (SPOKEN_PROMPT).
+        Never anything but English: when no English version can be made, SPOKEN_FALLBACK.
+        "" for a reply with nothing to say (only a widget, a picture or a link).
+        """
+        words = rich_reply.speech_text(reply)
+        if not words:
+            return ""
+        if is_english(words) and (limit is None or len(words) <= limit):
+            return words
+        length = SPOKEN_LENGTH_LIMIT.format(limit=limit) if limit else SPOKEN_LENGTH_FREE
+        model, effort = self._route(INTENT_SIMPLE)
+        spoken = ""
+        try:
+            turn = await self._call_model(
+                run, [Turn(kind="user", text=words)], tools=[], model=model, effort=effort, system=SPOKEN_PROMPT.format(length=length)
+            )
+            if turn.kind == "assistant":
+                spoken = rich_reply.speech_text(turn.text.strip().strip('"\u201c\u201d'))
+        except ProviderError as exc:
+            print(f"[Brain] No spoken English version ({exc.kind}).")
+        if spoken and is_english(spoken):
+            result = fit_spoken(spoken, limit)
+        elif is_english(words):
+            result = fit_spoken(words, limit)
+        else:
+            result = SPOKEN_FALLBACK
+        print(f"[Brain] Spoken (English): {len(result)} characters for a {len(words)}-character reply.")
+        return result
 
     async def _send(self, run: "TurnRun", *args: Any, **extra: Any) -> Turn:
         """One request to the active provider: complete() inline, acomplete() on the event loop."""

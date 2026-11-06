@@ -62,6 +62,8 @@ export interface TurnData {
   reply: ServerMessageLike;
   /** The reply read aloud, when `speak` was asked for and the reply was short enough. Not stored: it is for this response only. */
   audio?: ReplyAudio | null;
+  /** The English words that audio says (the reply itself may be Thai and is never played). */
+  spokenAudioText?: string | null;
 }
 
 /** A spoken turn: the same answer as a typed one, plus the words that were heard. */

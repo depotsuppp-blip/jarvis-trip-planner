@@ -20,9 +20,9 @@ turns the team off: one model with every built-in tool, as before (no calendar).
 Not in the team, though they live here: the Head of Creative (creative_agent.py), which
 makes images, the Head of Publishing (publishing_agent.py), which builds PowerPoint
 files, and the Head of Analytics (analytics_agent.py), which builds Excel spreadsheets.
-None is a model loop - one OpenAI Images API call per picture; a browser building the
-planned slides in Canva (canva_browser.py, once signed in with utils/canva_auth.py), or
-python-pptx laying them out; pandas and openpyxl writing the table - and all three save
+None is a tool loop - one OpenAI Images API call per picture; one model call writing the
+slides, then python-pptx laying them out (a Canva-ready PPTX when the user wants Canva);
+pandas and openpyxl writing the table - and all three save
 what they make in artifacts/, so the manager holds delegate_to_creative,
 delegate_to_publishing and delegate_to_analytics itself (LLMBrain._creative_tool,
 _publishing_tool, _analytics_tool), with or without the team: images whenever

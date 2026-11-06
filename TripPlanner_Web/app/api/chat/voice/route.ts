@@ -136,14 +136,15 @@ export async function POST(request: NextRequest) {
     const conversation = existing ?? (await createConversation(userId, heard.transcript));
     const userMessage = await saveUserMessage(conversation.id, heard.transcript);
     const reply = await saveReply(conversation.id, heard.reply);
-    const audio = speakableAudio(heard.reply, heard.audio);
+    // What is played is the brain's English spoken text, never the (maybe Thai) reply.
+    const audio = speakableAudio(heard.reply, heard.audio, heard.spokenText);
     return NextResponse.json({
       conversationId: conversation.id,
       userMessage,
       reply,
       transcript: heard.transcript,
       engine: heard.engine,
-      ...(audio ? { audio } : {}),
+      ...(audio ? { audio, ...(heard.spokenText ? { spokenAudioText: heard.spokenText } : {}) } : {}),
     });
   } catch (error) {
     console.error("POST /api/chat/voice failed saving the turn:", error);

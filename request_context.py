@@ -21,7 +21,7 @@ RUNS (cancellation and progress). The same module also carries what one run of t
 brain's state machine (llm_brain.py) shares with the code it calls on worker threads:
 whether the run was stopped, and where a step reports what it is doing. A web request
 whose person pressed Stop sets the run's cancel event; code that can stop between two
-steps (a specialist agent's loop, the Canva browser, a tool call that has not started)
+steps (a specialist agent's loop, a tool call that has not started)
 calls check_cancelled() and gets Cancelled. The voice assistant's runs are never
 cancelled and report progress nowhere, so for it both are no-ops.
 

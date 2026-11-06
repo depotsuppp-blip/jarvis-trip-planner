@@ -5,8 +5,8 @@
  *   - pictures (agents/creative_agent.py): image_YYYYMMDD_HHMMSS.png (.jpg or .webp if that
  *     is what came back), shown in a web chat reply as one Markdown image line:
  *       ![Generated Image](/artifacts/image_20261029_160717.png)
- *   - presentations (agents/publishing_agent.py): presentation_YYYYMMDD_HHMMSS.pptx (.pdf when
- *     the brain downloads them from Canva as PDFs), offered as one Markdown link:
+ *   - presentations (agents/publishing_agent.py): presentation_YYYYMMDD_HHMMSS.pptx (a .pdf
+ *     name is still accepted, from older decks), offered as one Markdown link:
  *       [Download Presentation](/artifacts/presentation_20261101_103000.pptx)
  *   - spreadsheets (agents/analytics_agent.py): spreadsheet_YYYYMMDD_HHMMSS.xlsx, offered the same way:
  *       [Download Spreadsheet](/artifacts/spreadsheet_20261102_093000.xlsx)

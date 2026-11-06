@@ -142,9 +142,10 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  * clickable. The link itself is never a secret: opening it needs the same
  * sign-in as any trip page.
  *
- * With `speak: true` the brain also voices the reply, and the response carries it as
- * `audio: { mime, base64 }` - only when the reply's own text is at most 200 characters
- * (lib/jarvis/replyAudio.ts) and the voice worked. The audio is for this response only:
+ * With `speak: true` the brain also voices the reply - in English, always: the response
+ * carries `spokenAudioText` (the English words the voice says, at most 200 characters,
+ * whatever language the reply is in) and `audio: { mime, base64 }` when the voice worked
+ * (lib/jarvis/replyAudio.ts). The reply itself is never read aloud. The audio is for this response only:
  * it is not saved with the message, and a reply without it is just text.
  *
  * Responses: 200 { conversationId, userMessage, reply, audio? }, 400 bad body, 401
@@ -315,6 +316,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
   const { conversationId, userMessage } = turn;
   let replyText: string;
   let audio: ReplyAudio | null = null;
+  let spokenAudioText: string | null = null;
   try {
     const answer = await askJarvis(turn.message, turn.history, {
       userId: turn.userId,
@@ -326,7 +328,8 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
     });
     replyText = answer.reply.trim();
     if (!replyText) throw new Error("The brain returned an empty reply.");
-    audio = speakableAudio(replyText, answer.audio);
+    audio = speakableAudio(replyText, answer.audio, answer.spokenText);
+    spokenAudioText = audio ? answer.spokenText : null;
   } catch (error) {
     if (error instanceof JarvisBrainCancelled || signal.aborted) return { kind: "stopped" };
     console.error(`POST /api/chat: the brain failed for conversation ${conversationId}:`, error);
@@ -342,7 +345,10 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
 
   try {
     const reply = await saveReply(conversationId, replyText);
-    return { kind: "answered", body: { conversationId, userMessage, reply, ...(audio ? { audio } : {}) } };
+    return {
+      kind: "answered",
+      body: { conversationId, userMessage, reply, ...(audio ? { audio, ...(spokenAudioText ? { spokenAudioText } : {}) } : {}) },
+    };
   } catch (error) {
     console.error("POST /api/chat failed saving the reply:", error);
     return { kind: "failed", status: 500, body: { error: "Couldn't save Jarvis's reply. Please try again." } };

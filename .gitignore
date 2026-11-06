@@ -5,9 +5,9 @@
 *.key
 # Credential files such as the Google service account key (GOOGLE_SERVICE_ACCOUNT_FILE in .env)
 .secrets/
-# Jarvis's Chrome profile for Canva (utils/canva_auth.py; .data/canva_profile by default, and
-# .data/ is ignored below) and the session file of its first version: either signs whoever has
-# it in to the Canva account. Any folder, any copy.
+# The Chrome profile Jarvis once drove Canva with (the browser automation is gone; .data/canva_profile
+# by default, and .data/ is ignored below) and the session file of its first version: on a machine
+# that used it, either still signs whoever has it in to the Canva account. Any folder, any copy.
 canva_profile/
 canva_state.json
 # Google Classroom sign-in (utils/classroom_auth.py): the OAuth client and the saved user token.

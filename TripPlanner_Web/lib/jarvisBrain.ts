@@ -15,7 +15,8 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *           { type: "action_required", approval_id, tool, prompt, details: [{ name, value }], expires_in }
  *                                     a confirmation-gated tool is WAITING for the person's Allow or Deny
  *           { type: "action_resolved", approval_id, decision: "allow" | "deny" | "timeout" }   it was answered
- *           { type: "final", status: "Done", message: string | object, audio?: { mime, base64 } | null }
+ *           { type: "final", status: "Done", message: string | object, chat_text?: string,
+ *             spoken_audio_text?: string | null, audio?: { mime, base64 } | null }
  *           { type: "error", status: "Failed", message, code }                            instead of final
  *         (a brain from before the stream answers { reply, audio } as JSON, and that is read too)
  *
@@ -46,11 +47,14 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *           with no words. A user turn in `history` carries its attachments the same
  *           way, so a follow-up question can still find the file.
  *
- *   speak = the person has voice replies on: the brain also voices the reply
- *           (Edge-TTS) when its plain text is at most 200 characters, and sends
- *           the MP3 as `audio`. It is null otherwise - too long, or the voice
- *           failed - and the reply is then just text. The audio is checked here
- *           (parseReplyAudio) and handed to the page; it is never stored.
+ *   speak = the person has voice replies on: the brain also sends what the voice
+ *           says - `spoken_audio_text`, ENGLISH ALWAYS (the reply when it is already
+ *           short English, else its English translation and summary, at most 200
+ *           characters) - and that text voiced (Edge-TTS, English voice) as `audio`.
+ *           The reply itself (`message` / `chat_text`) may be Thai and is never read
+ *           aloud. audio is null when the voice failed, and the reply is then just
+ *           text. Both are checked here (parseReplyAudio, spokenText) and handed to
+ *           the page; neither is stored.
  *
  *   reply is normally a string: a plain sentence, or - when a tool showed the
  *   person a widget - a JSON string (see lib/jarvis/messageContent.ts for the
@@ -75,7 +79,7 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *   body  multipart/form-data: audio (the recording), history (a JSON list of
  *         the same turns as above), user_id?, app_url?, speak? ("true")
  *   reply { transcript: string, reply: string | object, engine: "openai" | "local",
- *           audio?: { mime, base64 } | null }
+ *           spoken_audio_text?: string | null, audio?: { mime, base64 } | null }
  *   422 { detail }                 nothing was heard in the recording
  *   502 { detail, transcript? }    transcription failed (no transcript), or the
  *                                  words were heard but the brain had no answer
@@ -148,6 +152,18 @@ export type AskContext = ChatContext & {
 export interface BrainAnswer {
   reply: string;
   audio: ReplyAudio | null;
+  /** What the voice says: the English spoken text the audio is made from (null without a voice). */
+  spokenText: string | null;
+}
+
+// The brain keeps the spoken text within 200 characters; this only refuses a runaway value.
+const MAX_SPOKEN_CHARS = 400;
+
+/** The brain's `spoken_audio_text` as one trimmed line, or null when there is none (or it is not text). */
+function spokenText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.replace(/\s+/g, " ").trim();
+  return text && text.length <= MAX_SPOKEN_CHARS ? text : null;
 }
 
 /** What a paused action is, as the Approval Card shows it. Nothing here is trusted as markup. */
@@ -243,11 +259,15 @@ export async function askJarvis(
   const data =
     streamed && response.body
       ? await readBrainStream(response.body, context)
-      : ((await response.json().catch(() => null)) as { reply?: unknown; audio?: unknown } | null);
+      : ((await response.json().catch(() => null)) as { reply?: unknown; audio?: unknown; spoken?: unknown } | null);
   if (context.signal?.aborted) throw new JarvisBrainCancelled();
   const reply = replyAsText(data?.reply);
   if (!reply) throw new JarvisBrainError("Jarvis brain sent an empty reply.");
-  return { reply, audio: context.speak ? parseReplyAudio(data?.audio) : null };
+  return {
+    reply,
+    audio: context.speak ? parseReplyAudio(data?.audio) : null,
+    spokenText: context.speak ? spokenText(data?.spoken) : null,
+  };
 }
 
 // One progress line as the page may show it: one line, no control characters, a sensible length.
@@ -355,7 +375,7 @@ function parseEvent(block: string): Record<string, unknown> | null {
 async function readBrainStream(
   body: ReadableStream<Uint8Array>,
   context: AskContext
-): Promise<{ reply?: unknown; audio?: unknown }> {
+): Promise<{ reply?: unknown; audio?: unknown; spoken?: unknown }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -388,7 +408,7 @@ async function readBrainStream(
           const resolved = readApprovalResolved(event);
           if (resolved) context.onApprovalResolved?.(resolved);
         } else if (event.type === "final") {
-          return { reply: event.message, audio: event.audio };
+          return { reply: event.message, audio: event.audio, spoken: event.spoken_audio_text };
         } else if (event.type === "error") {
           const code = typeof event.code === "number" ? event.code : 502;
           console.error(`Jarvis brain reported an error (${code}) mid-turn.`);
@@ -425,6 +445,8 @@ export interface VoiceAnswer {
   engine: string;
   /** The answer voiced, when it was asked for and the brain could (see BrainAnswer). */
   audio: ReplyAudio | null;
+  /** The English text that audio says (see BrainAnswer). */
+  spokenText: string | null;
 }
 
 /** Transcribes `audio` and answers what it says, in one trip to the brain. */
@@ -480,6 +502,7 @@ export async function askJarvisByVoice(
     reply,
     engine: typeof body.engine === "string" ? body.engine : "unknown",
     audio: context.speak ? parseReplyAudio(body.audio) : null,
+    spokenText: context.speak ? spokenText(body.spoken_audio_text) : null,
   };
 }
 

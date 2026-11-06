@@ -461,7 +461,8 @@ export class ChatController {
       const sent = toChatMessage(result.data.userMessage);
       const { conversationId } = result.data;
       if (epoch === this.epoch) {
-        toSpeak = { audio: result.data.audio, text: reply.content.text };
+        // The English spoken text is what the audio says; the reply's words only for a brain from before it.
+        toSpeak = { audio: result.data.audio, text: result.data.spokenAudioText ?? reply.content.text };
         this.chat.setState((state) => ({
           access: "signed-in",
           activeSessionId: conversationId,
@@ -619,7 +620,8 @@ export class ChatController {
       const reply = toChatMessage(result.data.reply);
       const { conversationId } = result.data;
       if (epoch === this.epoch) {
-        toSpeak = { audio: result.data.audio, text: reply.content.text };
+        // The English spoken text is what the audio says; the reply's words only for a brain from before it.
+        toSpeak = { audio: result.data.audio, text: result.data.spokenAudioText ?? reply.content.text };
         this.chat.setState((state) => ({
           access: "signed-in",
           activeSessionId: conversationId,

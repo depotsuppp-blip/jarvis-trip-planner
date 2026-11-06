@@ -14,7 +14,8 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                              as each step starts; "node" is left out of the finer steps a
                              specialist agent reports ("Head of Research: Searching the web...")
                    final     {"type": "final", "node": "Final_Response", "status": "Done",
-                              "message": "...", "audio": null}           once, last
+                              "message": "...", "chat_text": "...",
+                              "spoken_audio_text": "..." | null, "audio": null}   once, last
                    error     {"type": "error", "status": "Failed", "message": "...",
                               "code": 502}                    instead of final, last
                    action_required  {"type": "action_required", "approval_id": "...",
@@ -26,18 +27,22 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                               "decision": "allow"|"deny"|"timeout"}   the card is closed
                  plus a ": keep-alive" comment line after 10 s without an event.
 
-                 message is a plain sentence, or - when a tool showed the person a widget -
-                 a JSON string, see rich_reply.py; a picture or a file Jarvis made is in it
-                 as its Markdown line (see GET /artifacts). audio is {"mime": "audio/mpeg",
-                 "base64": "..."} only when "speak" was true AND the reply's plain text is at
-                 most 200 characters AND the voice worked (reply_audio.py, Edge-TTS); in every
-                 other case it is null and the reply is just text. A provider failure is not
+                 message (= chat_text) is what the chat shows, in any language: a plain
+                 sentence, or - when a tool showed the person a widget - a JSON string, see
+                 rich_reply.py; a picture or a file Jarvis made is in it as its Markdown line
+                 (see GET /artifacts). spoken_audio_text is what the voice says, ENGLISH
+                 ALWAYS - the reply when it is already short English, else the brain's
+                 English translation and summary of it, at most 200 characters - and null
+                 unless "speak" was true. audio is that text voiced, {"mime": "audio/mpeg",
+                 "base64": "..."}, when the voice worked (reply_audio.py, Edge-TTS, English
+                 voice); otherwise null and the reply is just text. The voice never reads
+                 chat_text itself. A provider failure is not
                  an error event: it is a final message saying what went wrong, as before.
                  Before the stream opens, the usual HTTP errors: 422 a bad body, 503 no model.
 
                  STOP. Closing the connection stops the turn (a watcher checks every 0.25 s):
                  the model request in flight is closed, no further tool starts, a specialist
-                 agent ends after its current step, Canva's browser is shut, nothing is kept
+                 agent ends after its current step, nothing is kept
                  in the brain's history, and the brain is free for the next message at once.
                  attachments are files the person attached in the web hub, which the web
                  app has already saved in this folder's uploads/ (path is relative to this
@@ -47,7 +52,8 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  came with no words. User turns in history carry theirs the same way.
     POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
                    history (a JSON list shaped like /chat's), user_id, app_url, speak
-              -> { "transcript": "...", "reply": "...", "engine": "openai"|"local", "audio": null }
+              -> { "transcript": "...", "reply": "...", "engine": "openai"|"local",
+                   "spoken_audio_text": "..." | null, "audio": null }
                  Speech-to-text (stt.py: OpenAI Whisper with OPENAI_API_KEY, otherwise
                  faster-whisper on this machine) first, then the transcript is asked
                  exactly as a typed /chat prompt would be - the same state machine,
@@ -89,8 +95,8 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  (TripPlanner_Web: GET /api/chat/tools).
     GET  /artifacts/<file> -> the file itself: what Jarvis made and saved in artifacts/ - the
                  images from agents/creative_agent.py (image_YYYYMMDD_HHMMSS.png) and the
-                 presentations from agents/publishing_agent.py (presentation_YYYYMMDD_HHMMSS.pptx,
-                 or .pdf when Canva sends PDFs) and the spreadsheets from agents/analytics_agent.py
+                 presentations from agents/publishing_agent.py (presentation_YYYYMMDD_HHMMSS.pptx)
+                 and the spreadsheets from agents/analytics_agent.py
                  (spreadsheet_YYYYMMDD_HHMMSS.xlsx).
                  A web chat reply shows a picture as ![Generated Image](/artifacts/<file>) and
                  offers a presentation as [Download Presentation](/artifacts/<file>) (a spreadsheet
@@ -239,6 +245,8 @@ class VoiceResponse(BaseModel):
     reply: str
     # Who did the listening: "openai" (the Whisper API) or "local" (faster-whisper on this machine).
     engine: str
+    # What the voice says, in English, and its audio: see POST /chat's final event.
+    spoken_audio_text: Optional[str] = None
     audio: Optional[ReplyAudio] = None
 
 
@@ -429,7 +437,14 @@ async def _turn(
                     # The context is current only while this request is being answered, on
                     # this task and the worker threads it starts - see request_context.py.
                     with request_context.use(caller):
-                        async for event in brain.run(question, cancel=cancel, progress=progress, emit=push if interactive else None):
+                        async for event in brain.run(
+                            question,
+                            cancel=cancel,
+                            progress=progress,
+                            emit=push if interactive else None,
+                            # The English spoken version is made only when it will be voiced.
+                            speak=caller.voice_reply,
+                        ):
                             push(event)
                 finally:
                     # Nothing is carried to the next request; the caller owns the transcript.
@@ -484,17 +499,17 @@ def _sse(event: dict[str, Any]) -> str:
     return f"event: {event.get('type', 'message')}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-def _audio_for(reply: str, speak: bool) -> Optional[ReplyAudio]:
+def _audio_for(spoken: str, speak: bool) -> Optional[ReplyAudio]:
     """
-    The spoken version of `reply`, or None: not asked for, longer than the voice limit,
-    or the voice is unavailable. Called once the reply is out of the brain - the network
-    round trip to the voice must not hold up anyone else's message - and it never raises,
-    so a voice failure leaves the person with the text.
+    `spoken` - the brain's English spoken text, never the chat reply - voiced, or None: not
+    asked for, nothing to say, or the voice is unavailable. Called once the reply is out of the
+    brain - the network round trip to the voice must not hold up anyone else's message - and it
+    never raises, so a voice failure leaves the person with the text.
     """
-    if not speak:
+    if not speak or not spoken:
         return None
     try:
-        payload = reply_audio.for_reply(reply)
+        payload = reply_audio.for_speech(spoken)
         return ReplyAudio(**payload) if payload else None
     except Exception as exc:  # noqa: BLE001 - audio is an extra; a bug in it must not cost the person their answer
         print(f"[API] Spoken reply failed: {type(exc).__name__}: {exc}")
@@ -538,14 +553,18 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
                 if not reply:
                     yield _sse({"type": "error", "status": "Failed", "message": "The brain returned an empty reply.", "code": 502})
                     return
-                if body.speak and reply_audio.enabled():
+                # Only the English spoken text goes to the voice; the chat gets the reply as it is.
+                spoken = str(event.get("spoken") or "").strip() if body.speak else ""
+                if spoken and reply_audio.enabled():
                     yield _sse({"type": "progress", "status": "Recording the spoken reply..."})
-                audio = await asyncio.to_thread(_audio_for, reply, body.speak)
+                audio = await asyncio.to_thread(_audio_for, spoken, body.speak)
                 yield _sse({
                     "type": "final",
                     "node": event.get("node"),
                     "status": "Done",
                     "message": reply,
+                    "chat_text": reply,
+                    "spoken_audio_text": spoken or None,
                     "audio": audio.model_dump() if audio else None,
                 })
                 return
@@ -611,11 +630,12 @@ async def voice(
     if not transcript:
         raise HTTPException(status_code=422, detail="I couldn't hear anything in that recording.")
 
-    reply = ""
+    reply = spoken_text = ""
     async with aclosing(_turn(request, brain, transcript, turns, user_id, app_url, speak)) as events:
         async for event in events:
             if event.get("type") == "final":
                 reply = str(event.get("message") or "").strip()
+                spoken_text = str(event.get("spoken") or "").strip() if speak else ""
                 break
             if event.get("type") in ("cancelled", "error"):
                 break
@@ -628,8 +648,10 @@ async def voice(
             status_code=502,
             content={"detail": "The brain returned an empty reply.", "transcript": transcript, "engine": heard.engine},
         )
-    spoken = await asyncio.to_thread(_audio_for, reply, speak)
-    return VoiceResponse(transcript=transcript, reply=reply, engine=heard.engine, audio=spoken)
+    voiced = await asyncio.to_thread(_audio_for, spoken_text, speak)
+    return VoiceResponse(
+        transcript=transcript, reply=reply, engine=heard.engine, spoken_audio_text=spoken_text or None, audio=voiced
+    )
 
 
 if __name__ == "__main__":

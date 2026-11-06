@@ -11,7 +11,7 @@ const ARTIFACT_RATE_LIMIT = 120;
 const ARTIFACT_RATE_WINDOW_MS = 60_000;
 // The brain never saves anything bigger: pictures are capped at this size
 // (agents/creative_agent.py, MAX_IMAGE_BYTES), and a deck of text slides is a few
-// dozen KB from python-pptx, a few MB at most from Canva (agents/publishing_agent.py).
+// dozen KB from python-pptx (agents/publishing_agent.py).
 const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
 
 // params is a Promise in this Next.js version, not a plain object.

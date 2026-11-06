@@ -164,14 +164,26 @@ def speech_for(reply: str, limit: int = VOICE_MAX_CHARS) -> Optional[str]:
     """
     What to read aloud for `reply`, or None when it should not be spoken: there is
     no text, or the text is longer than `limit` characters (counted on the text as
-    the person reads it, before anything is stripped for the voice). A link, or
-    markdown a voice would pronounce as symbols, is taken out of what is spoken, and a
-    Markdown image (a picture Jarvis made) or a download link to a file Jarvis made (a
-    presentation) is left out entirely, its label included.
+    the person reads it, before anything is stripped for the voice). What is said is
+    speech_text's.
     """
     text = spoken_text(reply)
     if not text or len(text) > limit:
         return None
+    return speech_text(reply) or None
+
+
+def speech_text(reply: str) -> str:
+    """
+    The words of `reply` as a voice can say them, whatever their length ("" when nothing
+    is left to say). A link, or markdown a voice would pronounce as symbols, is taken out,
+    and a Markdown image (a picture Jarvis made) or a download link to a file Jarvis made
+    (a presentation) is left out entirely, its label included. The brain makes the English
+    spoken version from these (llm_brain.LLMBrain._spoken_english).
+    """
+    text = spoken_text(reply)
+    if not text:
+        return ""
 
     cleaned = _MD_IMAGE.sub(" ", text)
     cleaned = _MD_ARTIFACT_LINK.sub(" ", cleaned)
@@ -181,4 +193,4 @@ def speech_for(reply: str, limit: int = VOICE_MAX_CHARS) -> Optional[str]:
     cleaned = _MD_MARKS.sub("", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     # Nothing left that a voice could say (a bare link, only punctuation).
-    return cleaned if re.search(r"\w", cleaned) else None
+    return cleaned if re.search(r"\w", cleaned) else ""

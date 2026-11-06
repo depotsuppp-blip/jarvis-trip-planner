@@ -6,17 +6,20 @@ neural voices. This is the same voice for the web chat, reached differently: the
 brain cannot play sound in the person's browser, so the audio travels back in the
 chat response (api_server.py: `audio: {mime, base64}`) and the page plays it.
 
-WHEN A REPLY IS SPOKEN
-----------------------
-Only when the page asked for it (`speak: true` - the person has voice replies on)
-AND the reply's plain text is at most rich_reply.VOICE_MAX_CHARS (200) characters.
-Anything longer is shown, not read out - a plan or a list of search results is
-not something to listen to. A reply that is only a widget has no text to say.
+WHAT IS SPOKEN: ENGLISH, ALWAYS
+-------------------------------
+Only when the page asked for it (`speak: true` - the person has voice replies on).
+The chat may show a reply in Thai, but the voice never reads it: the brain makes an
+English spoken version of every reply (llm_brain: `spoken` in the final event - the
+reply itself when it is already short English, else translated and summarized to at
+most rich_reply.VOICE_MAX_CHARS (200) characters), and api_server.py hands only that
+to for_speech. The voice is always the English one (EDGE_TTS_VOICE); a text with
+letters of another script is refused rather than read out in an English voice.
 
 HOW IT FAILS
 ------------
 Never loudly. No network, a timeout, a Microsoft error or a missing package all
-mean "no audio": `for_reply` returns None and the person simply gets the text,
+mean "no audio": `for_speech` returns None and the person simply gets the text,
 as they always did. Synthesis runs after the brain has answered and outside its
 lock, so a slow voice never holds up another person's message.
 
@@ -31,8 +34,7 @@ SETTINGS (.env, all optional)
 -----------------------------
     JARVIS_WEB_TTS=0            no spoken replies in the web chat
     JARVIS_WEB_TTS_TIMEOUT      seconds to wait for the voice (default 10)
-    EDGE_TTS_VOICE              the English voice (default en-GB-RyanNeural, as the assistant)
-    EDGE_TTS_VOICE_TH           the voice for a Thai reply (default th-TH-NiwatNeural)
+    EDGE_TTS_VOICE              the voice, English (default en-GB-RyanNeural, as the assistant)
     EDGE_TTS_RATE / _VOLUME / _PITCH   prosody, shared with the assistant
 
 edge-tts must be 7.3.1 or newer: 7.2.8 and older are refused by Microsoft's service
@@ -45,7 +47,6 @@ import asyncio
 import base64
 import concurrent.futures
 import os
-import re
 from typing import Optional
 
 import rich_reply
@@ -60,14 +61,11 @@ except Exception as exc:  # noqa: BLE001 - no edge-tts just means no spoken repl
 
 MIME = "audio/mpeg"
 DEFAULT_VOICE = "en-GB-RyanNeural"
-DEFAULT_THAI_VOICE = "th-TH-NiwatNeural"
 DEFAULT_TIMEOUT = 10.0
 # 200 characters is about 15 seconds of speech, well under 200 KB; this only stops a
 # misbehaving service from filling a JSON response.
 MAX_AUDIO_BYTES = 1_500_000
 
-_THAI = re.compile(r"[฀-๿]")
-_LATIN = re.compile(r"[A-Za-z]")
 
 
 def _env(name: str, default: str = "") -> str:
@@ -101,12 +99,14 @@ def enabled() -> bool:
     return not unavailable_reason()
 
 
-def pick_voice(text: str) -> str:
-    """The Thai voice when the words are mostly Thai, the English one otherwise."""
-    thai = len(_THAI.findall(text))
-    if thai and thai >= len(_LATIN.findall(text)):
-        return _env("EDGE_TTS_VOICE_TH", DEFAULT_THAI_VOICE)
+def pick_voice(text: str = "") -> str:
+    """The English voice - for every text: what is spoken is English (see the top)."""
     return _env("EDGE_TTS_VOICE", DEFAULT_VOICE)
+
+
+def is_english(text: str) -> bool:
+    """True when every letter is a Latin one (the same test as llm_brain.is_english)."""
+    return not any(ch.isalpha() and ord(ch) >= 0x250 for ch in text)
 
 
 async def _collect(text: str, voice: str) -> bytes:
@@ -164,16 +164,19 @@ def synthesize(text: str, voice: Optional[str] = None) -> Optional[bytes]:
     return audio or None
 
 
-def for_reply(reply: str) -> Optional[dict[str, str]]:
+def for_speech(spoken: str) -> Optional[dict[str, str]]:
     """
-    The `audio` field for a chat response - {"mime": "audio/mpeg", "base64": "..."} -
-    or None when this reply is not to be spoken (too long, nothing to say, voice
-    unavailable or failed).
+    The `audio` field for a chat response - {"mime": "audio/mpeg", "base64": "..."} - for the
+    brain's English spoken text (never the chat reply itself), or None: nothing to say, longer
+    than rich_reply.VOICE_MAX_CHARS, not English, voice unavailable or failed.
     """
     if not enabled():
         return None
-    speech = rich_reply.speech_for(reply)
-    if speech is None:
+    speech = " ".join((spoken or "").split())
+    if not speech or len(speech) > rich_reply.VOICE_MAX_CHARS:
+        return None
+    if not is_english(speech):
+        print("[TTS] Refused a spoken text that is not English - the voice speaks English only.")
         return None
     audio = synthesize(speech)
     if audio is None:
