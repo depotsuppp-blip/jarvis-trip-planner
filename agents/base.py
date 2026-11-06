@@ -148,6 +148,9 @@ class SpecialistAgent:
     # `finish` then checks and tidies the final text, or raises ValueError to get one retry.
     json_output: bool = False
     finish: Optional[Callable[[str], str]] = None
+    # The output limit of each of its model calls; None keeps the provider's own (MAX_TOKENS).
+    # An agent whose answer is a whole document (the Head of Publishing's slides) needs more.
+    max_tokens: Optional[int] = None
     # The delegation tool the manager sees.
     delegate_description: str = ""
     task_description: str = "The whole task, self-contained: what to do and everything needed to do it."
@@ -286,6 +289,8 @@ class SpecialistAgent:
                     None,
                     context,
                     json_output=self.json_output and json_ok and not tools,
+                    # Only a raised limit is passed: every other agent's calls are made exactly as before.
+                    **({"max_tokens": self.max_tokens} if self.max_tokens else {}),
                 )
             except ProviderError as exc:
                 kind = _skip_kind(exc)

@@ -145,24 +145,27 @@ Several things were added to this module beyond plain tool calling:
       team, so it works with JARVIS_AGENTS=0 too; there only when
       OPENAI_API_KEY is set, JARVIS_CREATIVE=0 turns it off.
 
-  PRESENTATIONS  delegate_to_publishing(presentation_data) hands a slide
-      plan - JSON the manager writes after planning the content, with the
-      Head of Research first when it needs facts - to the Head of Publishing
-      (agents/publishing_agent.py). When Jarvis's Chrome is signed in to Canva
-      (python -m utils.canva_auth) it builds the deck on canva.com in a
-      hidden browser it drives (agents/canva_browser.py, Playwright, up to
-      JARVIS_CANVA_TIMEOUT seconds on a thread of its own, so this tool stays
-      a plain call) and downloads it; without one, or when that run fails, it
-      lays the deck out itself with python-pptx. Either way the file is
-      checked and kept as artifacts/presentation_YYYYMMDD_HHMMSS.pptx (.pdf
-      when JARVIS_CANVA_FORMAT=pdf). By voice the reply names
-      the folder and the file; in the web chat it carries a download link,
+  PRESENTATIONS  delegate_to_publishing(topic, num_slides, target_platform,
+      special_instructions) hands a BRIEF - never the slides - to the Head of
+      Publishing (agents/publishing_agent.py), whose own model writes them
+      (OpenAI GPT-4o, then GPT-4o-mini, then Gemini as the last resort). The
+      manager researches first when the deck needs facts (the Head of
+      Research) and passes the few it must use in special_instructions.
+      target_platform is "canva" (Canva only: when Canva cannot make it the
+      answer is an ERROR and the manager asks the user whether they want a
+      PPTX instead - nothing is built another way), "pptx" (python-pptx) or
+      "any". Canva: when Jarvis's Chrome is signed in to it (python -m
+      utils.canva_auth) the deck is built on canva.com in a hidden browser it
+      drives (agents/canva_browser.py, Playwright, up to JARVIS_CANVA_TIMEOUT
+      seconds on a thread of its own, so this tool stays a plain call) and
+      downloaded; for "any", without a session or when that run fails, it is
+      laid out with python-pptx. Either way the file is checked and kept as
+      artifacts/presentation_YYYYMMDD_HHMMSS.pptx (.pdf when
+      JARVIS_CANVA_FORMAT=pdf). By voice the reply names the folder and the
+      file; in the web chat it carries a download link,
       [Download Presentation](/artifacts/<file>) (PUBLISHING_RULE, _publish,
-      _with_artifacts). The slides travel inside the tool call, so a
-      presentation question may write up to LONG_OUTPUT_MAX_TOKENS instead
-      of MAX_TOKENS, and a tool call cut off by the limit is asked for again
-      with that room (_call_model). No key and no cost: there whenever
-      python-pptx is installed, JARVIS_PUBLISHING=0 turns it off.
+      _with_artifacts). Needs python-pptx and a model key (OPENAI_API_KEY for
+      GPT-4o); JARVIS_PUBLISHING=0 turns it off.
 
   SPREADSHEETS  delegate_to_analytics(tabular_data) hands a table - JSON the
       manager writes after working out the data (rows as objects, or lists
@@ -493,14 +496,14 @@ When you answer, the response is converted to speech and played through a speake
 # and avoids the assistant monologuing at the user through the speakers.
 MAX_TOKENS = 1024
 
-# ...except where the answer is a document. A presentation's slides (or a spreadsheet's
-# rows) are written as the JSON argument of one tool call (delegate_to_publishing,
-# delegate_to_analytics), and MAX_TOKENS cuts a
-# deck of any size off in the middle: Claude then hands back half a tool call, Gemini
-# an empty answer. A presentation question may write this much instead (LLMBrain.ask),
-# and a tool call that still comes back cut off is asked for once more with it
-# (LLMBrain._call_model). A ceiling, not a target - only what is written is billed -
-# and kept within what the Anthropic SDK allows a request that is not streamed.
+# ...except where the answer is a document. A spreadsheet's rows are written as the JSON
+# argument of one tool call (delegate_to_analytics), and MAX_TOKENS cuts a table of any size
+# off in the middle: Claude then hands back half a tool call, Gemini an empty answer. A
+# spreadsheet question may write this much instead (Analyze_Intent), and a tool call that
+# still comes back cut off is asked for once more with it (LLMBrain._call_model). A ceiling,
+# not a target - only what is written is billed - and kept within what the Anthropic SDK
+# allows a request that is not streamed. (A presentation's slides are no longer the
+# manager's to write: the Head of Publishing's own model writes them from a short brief.)
 LONG_OUTPUT_MAX_TOKENS = 8192
 
 # The web chat waits this long for a whole answer (TripPlanner_Web/lib/jarvisBrain.ts,
@@ -936,24 +939,24 @@ DELEGATE_PUBLISHING = "delegate_to_publishing"
 # Added to the per-turn context while the manager has that tool (publishing_rule), in the
 # uncached block for the same reason as CREATIVE_RULE: it is there only with python-pptx.
 PUBLISHING_RULE = (
-    "Presentations: you can build real PowerPoint files (.pptx) - you are a slide deck builder. When the "
-    "user asks for a presentation, slides, a slide deck or a PowerPoint, build the file instead of writing "
-    "the slides into your reply. First plan it: who it is for, the storyline, one idea per slide{research}. "
-    "Then write it as JSON: "
-    '{{"title": "...", "subtitle": "...", "slides": [{{"title": "...", "bullet_points": ["...", "..."]}}]}}. '
-    "The title and subtitle make the opening slide. Each slide has a short title and two to six bullet "
-    "points of about one line each, plain text without bullet characters or markdown; a slide whose "
-    "bullet_points list is empty becomes a section divider. Make five to twelve slides unless the user asks "
-    "for a number. Write the slides in the language the user wants - the one they wrote in, unless they say "
-    "otherwise: Thai slides for a request in Thai. Speaking English is a rule for your own reply, not for "
-    "the file. Call "
-    "{tool} once with that JSON as presentation_data. {share} Say a presentation was made only when the "
-    "result starts with SUCCESS. When it starts with ERROR and says what to change in the data, change "
-    "exactly that and call again once; otherwise tell the user in one sentence what went wrong."
+    "Presentations: your Head of Publishing writes AND builds real presentation files - in Canva or as a "
+    "PowerPoint (.pptx). You never write the slides yourself, not in your reply and not in the tool call: you "
+    "hand over a short brief. When the user asks for a presentation, slides, a slide deck, a PowerPoint or a "
+    "Canva presentation, call {tool} once with: topic - what the deck is about, in the user's own words and "
+    "language; num_slides - only when the user gave a number (it counts the opening slide); target_platform - "
+    '"canva" when the user asks for it in Canva, "pptx" when they ask for a PowerPoint or .pptx file, "any" '
+    "otherwise; special_instructions - audience, purpose, tone, points that must be covered, and the language "
+    "of the slides when it is not the topic's (the user's language: Thai slides for a request in Thai - "
+    "speaking English is a rule for your own reply, not for the file){research}. A brief, not the content: a "
+    "few sentences. {share} The result lists the slide titles: use them to say in one sentence what the "
+    "deck covers. Say a presentation was made only when the result starts with SUCCESS. When it starts with "
+    "ERROR and is about Canva, tell the user Canva could not make it and why, and ask whether they want a "
+    'PowerPoint (PPTX) file instead - call again with target_platform "pptx" only after they say yes. Any '
+    "other ERROR: tell the user in one sentence what went wrong."
 )
 PUBLISHING_RESEARCH = (
-    " - when it needs facts you are not sure of, figures or anything recent, get them with {tool} before "
-    "you write a single slide"
+    ". When the deck needs facts you are not sure of, figures or anything recent, get them with {tool} "
+    "first and put the few key facts in special_instructions"
 )
 # The web chat cannot open a file on this computer: there the result's Download line is a
 # Markdown link to /artifacts/<file> (LLMBrain._publish), which the page offers as a download.
@@ -1414,7 +1417,7 @@ def _asks_for_image(text: str) -> bool:
 # substrings: slide / present(ation) (two spellings) / to present / PowerPoint (two
 # spellings); "ppt" also catches "ทำppt" with no space before it.
 _PRESENTATION_WORDS = frozenset({
-    "presentation", "presentations", "slide", "slides", "slideshow", "deck", "decks", "powerpoint", "pptx",
+    "presentation", "presentations", "slide", "slides", "slideshow", "deck", "decks", "powerpoint", "pptx", "canva",
 })
 _PRESENTATION_SUBSTRINGS: tuple[str, ...] = (
     "สไลด์", "พรีเซน", "พรีเซ้น", "นำเสนอ", "พาวเวอร์พอย", "เพาเวอร์พอย", "power point", "ppt",
@@ -1569,10 +1572,10 @@ _FRONT_DOOR_CREATIVE = (
 # The same while it can build presentations (delegate_to_publishing): the cheap model would
 # otherwise write the slides into the chat as text.
 _FRONT_DOOR_PUBLISHING = (
-    "\n- The assistant behind you can also build PowerPoint presentations and save them as files: a "
-    "request for a presentation, slides, a slide deck or a PowerPoint, or to change one, is route_to "
-    "\"ORCHESTRATOR\" with response null. Never write the slides yourself, and never say that you "
-    "cannot make a presentation."
+    "\n- The assistant behind you can also build presentations - in Canva or as PowerPoint files: a "
+    "request for a presentation, slides, a slide deck, a PowerPoint or a Canva design, or to change one, "
+    "is route_to \"ORCHESTRATOR\" with response null. Never write the slides yourself, and never say that "
+    "you cannot make a presentation."
 )
 
 # The same while it can build spreadsheets (delegate_to_analytics): the cheap model would
@@ -4334,7 +4337,8 @@ class LLMBrain:
                  {"OPENAI_API_KEY": "needs OPENAI_API_KEY", "openai package": "needs the openai package",
                   "JARVIS_IMAGE_MODEL": "needs JARVIS_IMAGE_MODEL"}),
             head("publishing", "Head of Publishing", DELEGATE_PUBLISHING, self._publishing, "JARVIS_PUBLISHING",
-                 {"python-pptx": "needs python-pptx", "Canva": "Canva is not ready"}),
+                 {"python-pptx": "needs python-pptx", "Canva": "Canva is not ready",
+                  "write the slides": "needs OPENAI_API_KEY"}),
             head("analytics", "Head of Analytics", DELEGATE_ANALYTICS, self._analytics, "JARVIS_ANALYTICS",
                  {"pandas": "needs pandas and openpyxl"}),
             # Read-only SQL on the live database; offered to the owner only (_database_allowed).
@@ -4617,40 +4621,59 @@ class LLMBrain:
     def _publishing_tool(self) -> ToolSpec:
         """delegate_to_publishing: built once, the same object every turn (the tool list stays cacheable)."""
         if self._publishing_spec is None:
-            from agents.publishing_agent import MAX_BULLETS, MAX_SLIDES  # the agents package imports this module
+            from agents.publishing_agent import MAX_ASKED_SLIDES, PLATFORMS  # the agents package imports this module
 
             self._publishing_spec = ToolSpec(
                 name=DELEGATE_PUBLISHING,
                 description=(
-                    "Hand a finished slide plan to your Head of Publishing, who builds a real presentation file "
-                    "from it - in Canva when it is signed in there (up to about a minute and a half), otherwise "
-                    "as a 16:9 PowerPoint file in seconds - and saves it on this computer. Use it whenever the "
-                    "user asks for a presentation, slides, a slide deck or a PowerPoint, after you have planned "
-                    "the content (research first when it needs facts). It writes nothing itself: it lays out "
-                    "exactly the slides you send, as an opening slide from the title and subtitle, then one "
-                    "slide per entry. Returns SUCCESS with where the file is - the saved file's path, or in the "
-                    "web chat a Markdown download link - or ERROR with what to change in the data. Call it once "
-                    "per deck: a slow answer is Canva working, not a failure."
+                    "Hand a presentation request to your Head of Publishing, who WRITES the slides itself (with "
+                    "OpenAI's GPT-4o) and builds a real presentation file - in Canva (up to about a minute and a "
+                    "half) or as a 16:9 PowerPoint file - and saves it on this computer. Use it whenever the user "
+                    "asks for a presentation, slides, a slide deck, a PowerPoint or a Canva presentation. Send a "
+                    "brief, never the slides: you do not write slide content. Returns SUCCESS with where the file "
+                    "is - the saved file's path, or in the web chat a Markdown download link - and the slide "
+                    "titles, or ERROR with what went wrong. Call it once per deck: a slow answer is the slides "
+                    "being written and Canva working, not a failure."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "presentation_data": {
+                        "topic": {
+                            "type": "string",
+                            "description": "What the presentation is about, in the user's own words and language.",
+                        },
+                        "num_slides": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_ASKED_SLIDES,
+                            "description": (
+                                "How many slides in all, the opening slide included - only when the user gave a "
+                                "number; leave it out and the Head of Publishing picks one (usually 8)."
+                            ),
+                        },
+                        "target_platform": {
+                            "type": "string",
+                            "enum": list(PLATFORMS),
+                            "description": (
+                                '"canva" when the user asks for the presentation in Canva (Canva only: if Canva '
+                                'cannot make it, the answer is an ERROR - nothing is built another way); "pptx" '
+                                'when they ask for a PowerPoint or .pptx file; "any" otherwise.'
+                            ),
+                        },
+                        "special_instructions": {
                             "type": "string",
                             "description": (
-                                "The whole deck as one JSON object, written as a string: "
-                                '{"title": "Deck title", "subtitle": "Optional line under it", "slides": '
-                                '[{"title": "Slide title", "bullet_points": ["First point", "Second point"]}]}. '
-                                f"title and subtitle are optional and make the opening slide; slides is required: 1 "
-                                f"to {MAX_SLIDES} slides, each with a short title and a list of up to {MAX_BULLETS} "
-                                "bullet points (plain text, about one line each). An empty bullet_points list makes a "
-                                "section slide."
+                                "A short brief: audience, purpose, tone, points that must be covered, the "
+                                "language of the slides when it is not the topic's, and any key facts from your "
+                                "research the deck must use. A few sentences - not slide content."
                             ),
-                        }
+                        },
                     },
-                    "required": ["presentation_data"],
+                    "required": ["topic", "target_platform"],
                 },
-                handler=lambda presentation_data="": self._publish(presentation_data),
+                handler=lambda topic="", num_slides=None, target_platform="any", special_instructions="": self._publish(
+                    topic, num_slides, target_platform, special_instructions
+                ),
                 requires_confirmation=False,
                 # Foreground: the saved file's path IS the answer.
                 background=False,
@@ -4659,27 +4682,35 @@ class LLMBrain:
             )
         return self._publishing_spec
 
-    def _publish(self, presentation_data: Any = "") -> str:
+    def _publish(self, topic: Any = "", num_slides: Any = None, target_platform: Any = "any", special_instructions: Any = "") -> str:
         """
-        Runs one deck on the Head of Publishing; its SUCCESS/ERROR text goes back to the
-        model. In the web chat a SUCCESS's Path and URL lines become one
+        Runs one brief on the Head of Publishing, which writes the slides with its own model and
+        builds the file (create_presentation); its SUCCESS/ERROR text goes back to the model. In
+        the web chat a SUCCESS's Path and URL lines become one
         "Download: [Download Presentation](/artifacts/<file>)" line - the link the page
         offers as a download (api_server.py serves the folder, the web app passes it on) -
         remembered so the reply is sure to carry it (_with_artifacts). By voice the path
         stays and the URL goes: a web address means nothing through a speaker.
 
         A web request has a clock (WEB_CHAT_SECONDS): the agent is told how much of it is left
-        for a Canva run, and builds the deck with python-pptx when that is too little.
+        for writing the slides and a Canva run; for "any" it builds the deck with python-pptx
+        when that is too little, for "canva" it says so.
         """
-        size = len(presentation_data) if isinstance(presentation_data, str) else len(json.dumps(presentation_data, default=str))
         caller = request_context.current()
         web = caller is not None and caller.is_web
         time_left = None
         if web:
             time_left = WEB_CHAT_SECONDS - (time.monotonic() - _current_run().started) - PUBLISHING_REPLY_SECONDS
         later = f", {time_left:.0f} s left for it" if time_left is not None else ""
-        print(f"[Brain] Delegating to the Head of Publishing: {size:,} characters of slides{later}.")
-        result = self._publishing.build_presentation(presentation_data, time_left=time_left)
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        shown = str(topic or "")[:120].encode(encoding, errors="backslashreplace").decode(encoding)
+        print(
+            f"[Brain] Delegating to the Head of Publishing: {shown!r}, {num_slides or 'any number of'} slides, "
+            f"platform {target_platform or 'any'}{later}."
+        )
+        result = self._publishing.create_presentation(
+            topic, num_slides, target_platform, special_instructions, time_left=time_left
+        )
 
         from agents.publishing_agent import markdown_link  # the agents package imports this module
 
@@ -5676,11 +5707,10 @@ class LLMBrain:
             f"[Brain] Routing: {intent.upper()} ({why}) "
             f"-> {run.model or self._provider.model}, effort {run.effort}."
         )
-        # A deck's slides, or a spreadsheet's rows, are written into one tool call: room for
-        # all of them (LONG_OUTPUT_MAX_TOKENS). Every other question keeps the spoken-answer limit.
-        if (any(tool.name == DELEGATE_PUBLISHING for tool in run.tools) and _asks_for_presentation(routed)) or (
-            any(tool.name == DELEGATE_ANALYTICS for tool in run.tools) and _asks_for_spreadsheet(routed)
-        ):
+        # A spreadsheet's rows are written into one tool call: room for all of them
+        # (LONG_OUTPUT_MAX_TOKENS). Every other question - a presentation's brief included -
+        # keeps the spoken-answer limit.
+        if any(tool.name == DELEGATE_ANALYTICS for tool in run.tools) and _asks_for_spreadsheet(routed):
             run.max_tokens = LONG_OUTPUT_MAX_TOKENS
 
         # Feature 6: greetings and general conversation stop here, answered

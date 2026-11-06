@@ -297,8 +297,9 @@ beautifulsoup4>=4.12
 # standard library: both are SQLite through Python's own sqlite3 module.
 
 # --- Presentations (agents/publishing_agent.py) -------------------------
-# The Head of Publishing lays out the slide plan the brain writes
-# (delegate_to_publishing) as a PowerPoint file and saves it in artifacts/.
+# The Head of Publishing lays out the slides its writer model makes (GPT-4o
+# through the openai package above; delegate_to_publishing) as a PowerPoint
+# file and saves it in artifacts/.
 # Pure Python on lxml (which ddgs above already brings), XlsxWriter and the
 # Pillow declared above: no key, no service, nothing billed. 1.0 is the first
 # release with type hints; the API used here is the same as 0.6's. Without it

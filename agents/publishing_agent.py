@@ -1,11 +1,19 @@
 """
-The Head of Publishing: presentations as real files, built from a slide plan.
+The Head of Publishing: presentations as real files - it writes the slides and builds the file.
 
 Phase 2 of the capability orchestrator gave Jarvis python-pptx decks; Phase 4 (browser
 agents) has it build them in Canva instead, in a browser it drives, whenever it is signed in
-to Canva - with python-pptx kept as the engine that always works.
+to Canva - with python-pptx kept as the engine that always works. Since then the manager no
+longer writes the slides: it hands over a brief, and this agent's own model writes them.
 
-    manager (llm_brain) --delegate_to_publishing(presentation_data)--> PublishingAgent
+    manager (llm_brain) --delegate_to_publishing(topic, num_slides, target_platform,
+                                                 special_instructions)--> create_presentation
+        -> THE WRITER: one call to OpenAI's GPT-4o (JARVIS_PUBLISHING_MODEL), then GPT-4o-mini
+           (JARVIS_PUBLISHING_FALLBACK_MODEL), then Jarvis's own Gemini model as the last
+           resort (agents/base.py routes), in JSON mode: the deck as the JSON below, checked
+           (finish_deck: the shape, the slide count asked for, every slide fits) with one
+           retry that says what was wrong
+        -> build_presentation, with that JSON:
         -> the JSON read and checked against the shape below (parse_deck)
         -> a text size chosen for every slide, or an ERROR when it cannot fit (plan_deck)
         -> CANVA (agents/canva_browser.py), when Jarvis's own Chrome profile is signed in
@@ -18,8 +26,22 @@ to Canva - with python-pptx kept as the engine that always works.
         <- "SUCCESS: ...\nPath: <absolute path>\nURL: /artifacts/<file name>"
            or "ERROR: <what was wrong and what to change>"
 
-JARVIS_PUBLISHING_ENGINE picks: auto (Canva when signed in, else python-pptx) [default],
-canva (Canva only: its failure is the answer) or pptx (python-pptx only). Why python-pptx
+THE PLATFORM (target_platform), the manager's choice from what the user asked for:
+
+    canva   Canva only. When Canva cannot make it - not signed in, resting after a bot check,
+            no time left, or the run fails (Cloudflare, a timeout) - the answer is an ERROR that
+            says so and tells the manager to ask the user whether they want a PPTX instead.
+            Nothing is built another way: the user asked for Canva. It is checked BEFORE the
+            slides are written, so a Canva that cannot run costs no model call.
+    pptx    python-pptx only, even when Canva is signed in.
+    any     JARVIS_PUBLISHING_ENGINE decides, as below.
+
+The slides the writer made are kept for DRAFT_SECONDS by their brief, so "yes, a PPTX then"
+after a failed Canva run builds the same slides without writing them again.
+
+JARVIS_PUBLISHING_ENGINE picks for "any": auto (Canva when signed in, else python-pptx) [default],
+canva (Canva only: its failure is the answer) or pptx (python-pptx only; Canva is then off
+for "canva" too). Why python-pptx
 stays: a website's editor changes without notice, a Canva session ends, the Docker image has
 no browser, and a Canva run takes a minute where python-pptx takes a tenth of a second - none
 of which may cost Jarvis the ability to hand over a deck.
@@ -29,12 +51,14 @@ In the web chat the brain swaps the Path and URL lines for a Markdown download l
 folder at that path, and the web app hands the file to the person whose chat shows the
 link (TripPlanner_Web/app/artifacts/[name]).
 
-NOT A LANGUAGE-MODEL LOOP, like the Head of Creative. The manager plans the content -
-with the Head of Research when it needs facts - and writes the JSON; this lays it out.
-No API key. Canva decks are made in the Canva account Jarvis's Chrome is signed in to - every
-web user's included - so they are in that account's designs too.
+ONE MODEL CALL, NOT A TOOL LOOP. The writer has no tools: the manager researches first
+(the Head of Research) and passes the few facts the deck must use in special_instructions;
+the writer turns the brief into slides, and the code here lays them out. OPENAI_API_KEY for
+GPT-4o (without it, Gemini writes them). Canva decks are made in the Canva account Jarvis's
+Chrome is signed in to - every web user's included - so they are in that account's designs too.
 
-THE DATA. One JSON object, as a string or as the dict itself:
+THE DATA (what the writer produces, and what build_presentation takes). One JSON object,
+as a string or as the dict itself:
 
     {"title": "Solar power in Thailand",              optional: makes the opening slide
      "subtitle": "Market briefing, November 2026",    optional: under that title
@@ -64,10 +88,13 @@ was asked for, or the file is deleted and the answer is an ERROR. A file is neve
 overwritten (_2, _3... when two decks land in the same second), and the same deck asked
 for again within SAME_REQUEST_SECONDS returns the file already made.
 
-NEVER RAISES. Every failure comes back as one sentence starting "ERROR:".
+NEVER RAISES. Every failure comes back as one sentence starting "ERROR:" (the one exception
+is request_context.Cancelled when the request it works for was stopped).
 
-    python -m agents.publishing_agent --check            both engines, a test deck in memory, the folder
-    python -m agents.publishing_agent deck.json          builds one deck from a JSON file
+    python -m agents.publishing_agent --check            the writer, both engines, a test deck in memory, the folder
+    python -m agents.publishing_agent --topic "..." [--slides N] [--platform canva|pptx|any] [--instructions "..."]
+                                                         writes and builds one deck (calls the writer's model)
+    python -m agents.publishing_agent deck.json          builds one deck from a JSON file (no model)
     python -m agents.publishing_agent --canva-test       a two-slide deck in Canva only (add --headed to watch)
 """
 
@@ -89,9 +116,13 @@ from typing import Any, Callable, Optional
 import request_context
 from utils import canva_auth
 
+from llm_brain import ToolCall, ToolResult, _env
+
 from . import canva_browser
+from .base import AgentUnavailable, Route, SpecialistAgent, last_resort_route, parse_json_object
 from .canva_browser import CanvaError, CanvaSettings, CanvaSlide
 from .creative_agent import ARTIFACTS_DIR, web_url
+from .openai_compat import OpenAIProvider
 
 try:
     import pptx
@@ -124,6 +155,37 @@ SAME_REQUEST_SECONDS = 120
 
 DECK_FIELDS = ("title", "subtitle", "slides")
 SLIDE_FIELDS = ("title", "bullet_points")
+
+# --- The brief (delegate_to_publishing) and the writer -------------------------------
+PLATFORMS = ("canva", "pptx", "any")
+MAX_TOPIC_CHARS = 500
+MAX_INSTRUCTIONS_CHARS = 4000
+# A deck asked for by number has at most this many slides in all (the opening slide included).
+MAX_ASKED_SLIDES = 30
+# Without a number the writer picks one: usually this many, within the range.
+DEFAULT_SLIDES = 8
+AUTO_SLIDES = (6, 12)
+WRITER_MODEL = "gpt-4o"
+WRITER_FALLBACK_MODEL = "gpt-4o-mini"
+# Room for a whole deck as JSON (thirty slides of five bullets is about 4,000 tokens).
+WRITER_MAX_TOKENS = 8192
+# The slides written for a brief are kept this long, so the same brief - "yes, a PPTX then" after a
+# failed Canva run - builds them again without paying for them twice.
+DRAFT_SECONDS = 15 * 60
+# What writing the slides takes, about: Canva is not started for a brief whose web request will
+# not have MIN_CANVA_SECONDS left once they are written.
+WRITING_SECONDS = 20.0
+
+WRITER_PROMPT = """You are the Head of Publishing on Jarvis's team. You write presentations: every word on every slide. You get a brief - the topic, how many slides, and instructions (audience, purpose, tone, language, points to cover, facts to use) - and you answer with the deck as ONE JSON object and nothing else:
+
+{"title": "...", "subtitle": "...", "slides": [{"title": "...", "bullet_points": ["...", "..."]}]}
+
+- "title" and "subtitle" make the opening slide: the deck's title, and one line under it (who it is for, or what it covers).
+- Each entry of "slides" is one slide: a short title of a few words and 2 to 5 bullet points. A bullet is one clear statement of at most about 15 words, in plain text: no bullet characters, numbering, markdown or emoji. An empty bullet_points list makes a section divider - use one only to separate the parts of a long deck.
+- Tell a story: open with why it matters, build the argument one idea per slide, and end with a slide of conclusions or next steps.
+- The number of slides counts the opening slide: "8 slides" is the opening slide and 7 entries in "slides". When the brief asks for exactly 1 slide, leave title and subtitle empty and write one entry.
+- Language: write every word in the language the instructions ask for; when they name none, in the language the topic is written in (a topic in Thai gets Thai slides).
+- Facts: use the facts in the instructions as they are given. Never invent statistics, figures, dates, names or quotes you are not sure of - make the point without the number instead."""
 
 # --- Geometry (EMU: 914400 to the inch, 12700 to the point) ----------------------------
 EMU_PER_INCH = 914400
@@ -239,7 +301,7 @@ def parse_deck(data: Any) -> DeckSpec:
     if isinstance(data, list):
         data = {"slides": data}
     if not isinstance(data, dict):
-        raise DeckError(f"presentation_data must be a JSON object with a \"slides\" list, not {_kind(data)}.")
+        raise DeckError(f"the deck must be a JSON object with a \"slides\" list, not {_kind(data)}.")
 
     left_out = [f'"{key}"' for key in data if key not in DECK_FIELDS]
     title = _text_field(data.get("title"), "the deck's title", MAX_TITLE_CHARS, heading=True)
@@ -251,7 +313,7 @@ def parse_deck(data: Any) -> DeckSpec:
     raw_slides = data.get("slides")
     if raw_slides is None:
         raise DeckError(
-            'presentation_data has no "slides" list. Send {"title": "...", "slides": [{"title": "...", '
+            'the deck has no "slides" list. Write {"title": "...", "slides": [{"title": "...", '
             '"bullet_points": ["...", "..."]}]}.'
         )
     if not isinstance(raw_slides, list):
@@ -305,7 +367,7 @@ def parse_deck(data: Any) -> DeckSpec:
 def _load_json(text: str) -> Any:
     text = text.strip()
     if not text:
-        raise DeckError("no presentation data was given. Call again with the whole deck as JSON in presentation_data.")
+        raise DeckError("no deck was given. Write the whole deck as one JSON object.")
     if len(text) > MAX_INPUT_CHARS:
         raise DeckError(
             f"the presentation data is {len(text):,} characters long, more than the {MAX_INPUT_CHARS:,} allowed. "
@@ -322,8 +384,8 @@ def _load_json(text: str) -> Any:
     except json.JSONDecodeError as exc:
         cut = " - it looks cut off before the end" if exc.pos >= len(text.rstrip()) - 1 else ""
         raise DeckError(
-            f"presentation_data is not valid JSON ({exc.msg} at character {exc.pos}){cut}. "
-            "Send the whole deck again as one JSON object."
+            f"the deck is not valid JSON ({exc.msg} at character {exc.pos}){cut}. "
+            "Write the whole deck again as one JSON object."
         ) from exc
     return value
 
@@ -663,8 +725,13 @@ class PublishingAgent:
         engine: Optional[str] = None,
         canva: Optional[CanvaSettings] = None,
         canva_runner: Optional[Callable[[list[CanvaSlide], Path, CanvaSettings], Path]] = None,
+        writer: Optional[SpecialistAgent] = None,
     ) -> None:
         self.artifacts_dir = Path(artifacts_dir) if artifacts_dir else ARTIFACTS_DIR
+        # Writes the slides from a brief (create_presentation); its routes are its models in order.
+        self.writer = writer if writer is not None else build_writer()
+        self._writer_lock = threading.Lock()  # one deck written at a time (the agent keeps per-task state)
+        self._drafts: dict[str, tuple[float, str]] = {}  # the brief's fingerprint -> (when, the deck's JSON)
         self._now = now or datetime.now
         self._lock = threading.Lock()  # the list of recent decks, and python-pptx's saving
         self._canva_lock = threading.Lock()  # one Canva run at a time: one account, one browser
@@ -683,11 +750,21 @@ class PublishingAgent:
         return canva_browser.readiness(self.canva)
 
     @property
-    def unavailable_reason(self) -> str:
+    def layout_problem(self) -> str:
+        """Why no file can be built from a deck's JSON (build_presentation), or ""."""
         if pptx is None:
             return f"python-pptx is not installed ({_PPTX_IMPORT_ERROR})"
         if self.engine == "canva" and self.canva_problem:
             return f"JARVIS_PUBLISHING_ENGINE=canva, and Canva cannot be used: {self.canva_problem}"
+        return ""
+
+    @property
+    def unavailable_reason(self) -> str:
+        """Why the manager's delegate_to_publishing cannot work: no layout, or no model to write the slides."""
+        if self.layout_problem:
+            return self.layout_problem
+        if not self.writer.available:
+            return "no model can write the slides (it needs OPENAI_API_KEY, or GEMINI_API_KEY for the last resort)"
         return ""
 
     @property
@@ -705,18 +782,98 @@ class PublishingAgent:
             where = f"{local} (Canva: {self.canva_problem})"
         else:
             where = f"{canva}, then {local} when Canva fails"
-        return f"{where}; into {self.artifacts_dir}"
+        return f"slides written by {self.writer.describe_routes()}; built in {where}; into {self.artifacts_dir}"
 
     # -- the work ------------------------------------------------------------
 
-    def build_presentation(self, presentation_data: Any, time_left: Optional[float] = None) -> str:
+    def create_presentation(
+        self,
+        topic: Any,
+        num_slides: Any = None,
+        target_platform: Any = "any",
+        special_instructions: Any = "",
+        time_left: Optional[float] = None,
+    ) -> str:
         """
-        Builds a deck from `presentation_data` and saves it. Returns SUCCESS + its path and URL,
-        or ERROR + why. `time_left` - seconds the caller can still wait (a web chat request) -
-        caps a Canva run; None means no limit beyond JARVIS_CANVA_TIMEOUT (the voice assistant).
+        The manager's delegate_to_publishing: writes the slides for this brief with the writer's
+        model, then builds the file on `target_platform` (see THE PLATFORM at the top). Returns
+        SUCCESS + its path, URL and slide titles, or ERROR + why. `time_left` - seconds the
+        caller can still wait (a web chat request) - covers the writing and the build; None
+        means no limit (the voice assistant).
         """
+        started = time.monotonic()
         if not self.available:
             return f"ERROR: presentations are not set up ({self.unavailable_reason}). Tell the user; do not try again."
+        brief = _brief(topic, num_slides, target_platform, special_instructions)
+        if isinstance(brief, str):
+            return brief
+        topic, wanted, platform, instructions = brief
+
+        # Canva asked for and it cannot run: said before a single slide is written (and paid for).
+        if self._engine_for(platform) == "canva":
+            blocker = self._canva_blocker(None if time_left is None else time_left - WRITING_SECONDS)
+            if blocker:
+                print(f"[Agent:publishing] Canva asked for but not possible: {_shown(blocker, 200)}")
+                return self._canva_failed(blocker)
+
+        deck_json = self._write(topic, wanted, instructions)
+        if deck_json.startswith("ERROR"):
+            return deck_json
+        left = None if time_left is None else time_left - (time.monotonic() - started)
+        result = self.build_presentation(deck_json, time_left=left, platform=platform)
+        if result.startswith("SUCCESS"):
+            # The manager did not write the slides: it gets their titles to talk about the deck.
+            deck = json.loads(deck_json)
+            titles = ([deck.get("title")] if deck.get("title") else []) + [s.get("title", "") for s in deck.get("slides", [])]
+            result += "\nSlide titles: " + "; ".join(f"{n}. {t}" for n, t in enumerate(titles, start=1))
+        return result
+
+    def _write(self, topic: str, wanted: Optional[int], instructions: str) -> str:
+        """The deck's JSON for this brief - written now, or the draft kept for the same brief - or an ERROR."""
+        key = hashlib.sha256(json.dumps([topic, wanted, instructions], ensure_ascii=False).encode("utf-8")).hexdigest()
+        now = time.monotonic()
+        with self._lock:
+            for old, (when, _deck) in list(self._drafts.items()):
+                if now - when > DRAFT_SECONDS:
+                    del self._drafts[old]
+            kept = self._drafts.get(key)
+        if kept is not None:
+            print(f"[Agent:publishing] Same brief {now - kept[0]:.0f} s ago; its slides are used again.")
+            return kept[1]
+
+        request_context.report_progress("Head of Publishing: writing the slides...")
+        # One deck at a time: a task a stopped request left behind ends at its next step.
+        while not self._writer_lock.acquire(timeout=0.25):
+            request_context.check_cancelled()
+        made: dict[str, Any] = {}
+        try:
+            self.writer.finish = lambda answer: finish_deck(answer, wanted, made)
+            print(f"[Agent:publishing] Writing {wanted or 'some'} slides: {_shown(topic)}")
+            self.writer.run(_writer_task(topic, wanted, instructions), [], _no_tools)
+        except AgentUnavailable as exc:
+            return f"ERROR: no model could write the slides ({_shown(str(exc), 300)})"
+        except ValueError as exc:
+            print(f"[Agent:publishing] The written slides could not be used: {_shown(str(exc), 200)}")
+            return f"ERROR: the slides that were written could not be used ({_shown(str(exc), 200)}). Tell the user; do not call again."
+        finally:
+            self.writer.finish = None
+            self._writer_lock.release()
+        deck_json = json.dumps(made["deck"], ensure_ascii=False)
+        with self._lock:
+            self._drafts[key] = (time.monotonic(), deck_json)
+        return deck_json
+
+    def build_presentation(self, presentation_data: Any, time_left: Optional[float] = None, platform: str = "any") -> str:
+        """
+        Builds a deck from `presentation_data` (THE DATA) and saves it, on `platform` (canva,
+        pptx or any - see THE PLATFORM). Returns SUCCESS + its path and URL, or ERROR + why.
+        `time_left` - seconds the caller can still wait (a web chat request) - caps a Canva run;
+        None means no limit beyond JARVIS_CANVA_TIMEOUT (the voice assistant).
+        """
+        if self.layout_problem:
+            return f"ERROR: presentations are not set up ({self.layout_problem}). Tell the user; do not try again."
+        if platform not in PLATFORMS:
+            return f"ERROR: target_platform must be one of {', '.join(PLATFORMS)}, not {platform!r}."
         try:
             deck = parse_deck(presentation_data)
             planned = plan_deck(deck)
@@ -724,8 +881,10 @@ class PublishingAgent:
             print(f"[Agent:publishing] Not built: {_shown(str(err), 240)}")
             return f"ERROR: {err}"
 
+        engine = self._engine_for(platform)
+        # The platform is part of what was asked for: the same slides as a PPTX are not a Canva deck.
         fingerprint = hashlib.sha256(
-            json.dumps([deck.title, deck.subtitle, [[s.title, s.bullets] for s in deck.slides]], ensure_ascii=False).encode("utf-8")
+            json.dumps([engine, deck.title, deck.subtitle, [[s.title, s.bullets] for s in deck.slides]], ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         summary = _summary(planned)
         with self._lock:
@@ -733,16 +892,15 @@ class PublishingAgent:
         if again:
             return again
 
-        canva_note = ""
-        if not self.canva_problem:
-            resting = self._canva_resting()
-            if resting:
-                canva_note = f"it was not tried: {resting}"
-            elif time_left is not None and time_left < MIN_CANVA_SECONDS:
-                canva_note = f"there was not enough time left in this request for Canva ({max(0.0, time_left):.0f} s)"
-            # Not blocking: a second deck asked for while Canva works on one is built here instead.
-            elif self._canva_lock.acquire(blocking=False):
+        if engine == "pptx" or (engine == "auto" and self.canva_problem):
+            return self._with_pptx(deck, planned, summary, fingerprint, "")
+
+        canva_note = self._canva_blocker(time_left)
+        if not canva_note:
+            # Not blocking: a second deck asked for while Canva works on one is not waited for.
+            if self._canva_lock.acquire(blocking=False):
                 try:
+                    request_context.report_progress("Head of Publishing: building it in Canva...")
                     made, canva_note = self._in_canva(planned, summary, time_left)
                 finally:
                     self._canva_lock.release()
@@ -753,12 +911,35 @@ class PublishingAgent:
                     return self._answer(made, f"made in Canva and downloaded as {kind}", summary, deck)
             else:
                 canva_note = "Canva was busy making another presentation"
-            if self.engine == "canva":
-                return (
-                    f"ERROR: Canva could not make the presentation ({canva_note}). Tell the user in one sentence; "
-                    "asking again later may work."
-                )
+        if engine == "canva":
+            return self._canva_failed(canva_note)
         return self._with_pptx(deck, planned, summary, fingerprint, canva_note)
+
+    def _engine_for(self, platform: str) -> str:
+        """What builds a deck for `platform`: "canva" (Canva only), "pptx" (python-pptx only) or "auto"."""
+        if platform in ("canva", "pptx"):
+            return platform
+        return self.engine
+
+    def _canva_blocker(self, time_left: Optional[float]) -> str:
+        """Why Canva cannot be tried for a deck right now, or "" (busy is found out when it is tried)."""
+        if self.canva_problem:
+            return self.canva_problem
+        resting = self._canva_resting()
+        if resting:
+            return f"it was not tried: {resting}"
+        if time_left is not None and time_left < MIN_CANVA_SECONDS:
+            return f"there was not enough time left in this request for Canva ({max(0.0, time_left):.0f} s)"
+        return ""
+
+    @staticmethod
+    def _canva_failed(why: str) -> str:
+        """The answer when the deck had to be made in Canva and was not. Nothing is built another way."""
+        return (
+            f"ERROR: Failed to create the presentation in Canva ({_canva_reason(why)}). Nothing was built another "
+            "way. Tell the user that in one sentence and ask whether they want a PowerPoint (PPTX) file instead; "
+            'call again with target_platform "pptx" only after they say yes.'
+        )
 
     def _in_canva(self, planned: list[PlannedSlide], summary: str, time_left: Optional[float] = None) -> tuple[Optional[Path], str]:
         """(the checked file Canva made, "") or (None, why it did not). The run never outlasts `time_left`."""
@@ -816,6 +997,7 @@ class PublishingAgent:
 
     def _with_pptx(self, deck: DeckSpec, planned: list[PlannedSlide], summary: str, fingerprint: str, canva_note: str) -> str:
         """The deck laid out here with python-pptx, saved and checked; SUCCESS or ERROR."""
+        request_context.report_progress("Head of Publishing: laying out the PowerPoint file...")
         with self._lock:
             started = time.monotonic()
             print(f"[Agent:publishing] Building {summary} with python-pptx: {_shown(planned[0].title)}")
@@ -899,6 +1081,7 @@ class PublishingAgent:
     def check(self) -> list[str]:
         """Lines on the setup: python-pptx and a test deck built in memory, the folder, Canva. Saves nothing."""
         lines = [f"Presentations: {self.describe()}"]
+        lines.append(f"  writer: {self.writer.describe_routes()}")
         if pptx is not None:
             try:
                 sample = parse_deck({"title": "Setup check", "slides": [{"title": "It works", "bullet_points": ["ทดสอบภาษาไทย", "English"]}]})
@@ -1055,6 +1238,109 @@ def _summary(planned: list[PlannedSlide]) -> str:
     return f"{len(planned)} slide{'s' if len(planned) != 1 else ''}: {listed}"
 
 
+def _brief(topic: Any, num_slides: Any, target_platform: Any, special_instructions: Any) -> "tuple[str, Optional[int], str, str] | str":
+    """The brief as (topic, slide count or None, platform, instructions), or an ERROR saying what to change."""
+    topic = " ".join(str(topic or "").split())
+    if not topic:
+        return "ERROR: no topic was given. Call again with what the presentation is about in topic."
+    if len(topic) > MAX_TOPIC_CHARS:
+        topic = topic[:MAX_TOPIC_CHARS].rstrip()
+    platform = str(target_platform or "any").strip().lower()
+    if platform not in PLATFORMS:
+        return f"ERROR: target_platform must be one of {', '.join(PLATFORMS)}, not {target_platform!r}."
+    wanted: Optional[int] = None
+    if num_slides not in (None, "", 0, "0"):
+        try:
+            wanted = int(float(str(num_slides).strip()))
+        except ValueError:
+            return f"ERROR: num_slides must be a whole number of slides, not {num_slides!r}."
+        if not 1 <= wanted <= MAX_ASKED_SLIDES:
+            return f"ERROR: num_slides must be between 1 and {MAX_ASKED_SLIDES}; ask the user to split a bigger deck."
+    instructions = str(special_instructions or "").strip()
+    if len(instructions) > MAX_INSTRUCTIONS_CHARS:
+        instructions = instructions[:MAX_INSTRUCTIONS_CHARS].rstrip()
+    return topic, wanted, platform, instructions
+
+
+def _writer_task(topic: str, wanted: Optional[int], instructions: str) -> str:
+    """The writer's one message: the brief, self-contained."""
+    if wanted == 1:
+        count = "exactly 1 slide: no opening slide (title and subtitle empty), one entry in slides"
+    elif wanted:
+        # Said as the length of the list: "N slides" alone gets N entries plus the opening slide.
+        count = (
+            f'{wanted} in all - the opening slide (title and subtitle) plus EXACTLY {wanted - 1} entries '
+            f'in "slides", not {wanted}'
+        )
+    else:
+        low, high = AUTO_SLIDES
+        count = f"your choice - usually {DEFAULT_SLIDES} in all, between {low} and {high}, the opening slide included"
+    return (
+        "Write this presentation as JSON.\n"
+        f"Topic: {topic}\n"
+        f"Slides: {count}\n"
+        f"Instructions: {instructions or 'none'}"
+    )
+
+
+def finish_deck(answer: str, wanted: Optional[int], made: dict[str, Any]) -> str:
+    """
+    The writer's answer checked: one JSON object with the deck's shape (parse_deck), every slide
+    fitting (plan_deck), and the slide count asked for. Raises ValueError, which gets the writer
+    one retry with the reason; the deck goes into `made["deck"]` (the report itself stays short).
+    """
+    deck_value = parse_json_object(answer)
+    try:
+        deck = parse_deck(deck_value)
+        plan_deck(deck)
+    except DeckError as err:
+        raise ValueError(str(err)) from None
+    total = len(deck.slides) + (1 if deck.title else 0)
+    if wanted and total != wanted:
+        raise ValueError(f"the deck has {total} slides in all (the opening slide included), but exactly {wanted} were asked for")
+    made["deck"] = deck_value
+    return f"{total} slides"
+
+
+def _no_tools(call: ToolCall) -> ToolResult:
+    return ToolResult(call=call, content="There are no tools here. Answer with the deck's JSON.", is_error=True)
+
+
+def _canva_reason(why: str) -> str:
+    """Why Canva did not make it, in words for the user (from _in_canva's or _canva_blocker's note)."""
+    lowered = why.lower()
+    if "stopped at blocked" in lowered or "cloudflare" in lowered or "bot check" in lowered:
+        return f"Canva's bot protection stopped the browser - {why}"
+    if "stopped at timeout" in lowered or "took longer" in lowered:
+        return f"it timed out - {why}"
+    if "stopped at session" in lowered or "signed out" in lowered:
+        return f"Jarvis's Canva sign-in has ended - {why}"
+    return why
+
+
+def build_writer(last_resort: Optional[Route] = None) -> SpecialistAgent:
+    """
+    The model that writes the slides: GPT-4o, then GPT-4o-mini, then Jarvis's own Gemini model
+    (JARVIS_PUBLISHING_MODEL / JARVIS_PUBLISHING_FALLBACK_MODEL; agents/base.py ROUTES). One call
+    in JSON mode with room for a whole deck, checked by finish_deck (set per brief).
+    """
+    primary = _env("JARVIS_PUBLISHING_MODEL", WRITER_MODEL)
+    fallback = _env("JARVIS_PUBLISHING_FALLBACK_MODEL", WRITER_FALLBACK_MODEL)
+    routes = [Route(OpenAIProvider(model=primary, max_tokens=WRITER_MAX_TOKENS), primary, "primary")]
+    if fallback and fallback != primary:
+        routes.append(Route(OpenAIProvider(model=fallback, max_tokens=WRITER_MAX_TOKENS), fallback, "fallback"))
+    routes.append(last_resort or last_resort_route())
+    return SpecialistAgent(
+        name="publishing",
+        title="Head of Publishing",
+        system_prompt=WRITER_PROMPT,
+        routes=routes,
+        max_steps=1,
+        json_output=True,
+        max_tokens=WRITER_MAX_TOKENS,
+    )
+
+
 def markdown_link(path: Path | str, label: str = DOWNLOAD_LABEL) -> str:
     """The Markdown line the web chat shows as a download: [Download Presentation](/artifacts/<file name>)."""
     return f"[{label}]({web_url(path)})"
@@ -1091,6 +1377,16 @@ if __name__ == "__main__":
         print(_shown(result, 2000))
         if not result.startswith("SUCCESS"):
             print(f"Where it stopped: the newest screenshot and page outline in {canva_browser.DEBUG_DIR}")
+        raise SystemExit(0 if result.startswith("SUCCESS") else 1)
+    if arguments[0] == "--topic":
+        options = dict(zip(arguments[::2], arguments[1::2]))
+        result = agent.create_presentation(
+            options.get("--topic", ""),
+            options.get("--slides"),
+            options.get("--platform", "any"),
+            options.get("--instructions", ""),
+        )
+        print(_shown(result, 2000))
         raise SystemExit(0 if result.startswith("SUCCESS") else 1)
     source = Path(arguments[0])
     result = agent.build_presentation(source.read_text(encoding="utf-8"))
