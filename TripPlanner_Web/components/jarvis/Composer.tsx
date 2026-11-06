@@ -23,13 +23,15 @@ import { focusRing, thinScroll } from "./styles";
  * ruled control - and every control of a turn in progress. Jarvis's face is the
  * Signal Orb in the sidebar (JarvisOrb.tsx); nothing is drawn over the conversation.
  *
- * The field is a textarea that grows with the draft, a line at a time, up to about
- * seven lines (less on a short screen: 35% of its height); past that it scrolls inside
- * itself. A long message wraps instead of running off sideways. Enter sends and
- * Shift+Enter starts a new line - on a touch screen Enter starts a new line and Send
- * sends, as phones' own keyboards expect. Enter never sends half a word an input
- * method (Thai, Japanese...) is still composing. The buttons stay at the foot of the
- * dock as it grows.
+ * Two layers inside the one rule: the field across the dock's whole width, and under
+ * it a row of its own for the buttons - Attach at the start, (Cancel,) Talk and Send
+ * at the end - so the buttons take no width from the words. The field is a textarea
+ * that grows with the draft, a line at a time, up to about seven lines (less on a
+ * short screen: 35% of its height); past that it scrolls inside itself. A long message
+ * wraps instead of running off sideways. Enter sends and Shift+Enter starts a new line
+ * - on a touch screen Enter starts a new line and Send sends, as phones' own keyboards
+ * expect. Enter never sends half a word an input method (Thai, Japanese...) is still
+ * composing.
  *
  * Talk records for real (lib/jarvis/voiceRecorder.ts) and is a toggle: one press
  * starts, the next sends. While it records, the field gives its place to a
@@ -217,16 +219,18 @@ export const Composer = memo(function Composer() {
         className="hidden"
       />
 
-      {/* items-end: as the field grows, Send, Attach and Talk stay on its last line. */}
+      {/* Two layers inside one rule: the field across the whole width, then the buttons' own row -
+          Attach at the start, Talk and Send at the end. In tab order as on screen. */}
       <form
         onSubmit={submit}
-        className="mx-auto flex max-w-2xl items-end gap-1.5 rounded-md border border-slate-300 bg-white p-1.5 has-[textarea:focus-visible]:border-slate-900 has-[textarea:focus-visible]:outline-2 has-[textarea:focus-visible]:outline-offset-2 has-[textarea:focus-visible]:outline-rose-600"
+        className="mx-auto flex max-w-2xl flex-col gap-1 rounded-md border border-slate-300 bg-white p-1.5 has-[textarea:focus-visible]:border-slate-900 has-[textarea:focus-visible]:outline-2 has-[textarea:focus-visible]:outline-offset-2 has-[textarea:focus-visible]:outline-rose-600"
       >
         {listening ? (
           <RecordingClock />
         ) : (
-          // One line is 44px (24px line + 10px above and below), the buttons' height. It grows to
-          // 12rem - about seven lines - or 35% of a short screen, then scrolls (fitField).
+          // One line is 44px (24px line + 10px above and below). It grows to 12rem - about seven
+          // lines - or 35% of a short screen, then scrolls (fitField). The full width of the dock:
+          // the buttons are on the row below, so they take no width from the words.
           <textarea
             ref={field}
             rows={1}
@@ -237,61 +241,65 @@ export const Composer = memo(function Composer() {
             placeholder="Message Jarvis"
             aria-label="Message Jarvis"
             autoComplete="off"
-            className={`block max-h-[min(12rem,35dvh)] min-h-11 min-w-0 flex-1 resize-none overflow-y-hidden bg-transparent px-2 py-2.5 text-base leading-6 text-slate-900 caret-rose-600 outline-none wrap-break-word placeholder:text-slate-500 disabled:cursor-not-allowed ${thinScroll}`}
+            className={`block max-h-[min(12rem,35dvh)] min-h-11 w-full resize-none overflow-y-hidden bg-transparent px-2.5 py-2.5 text-base leading-6 text-slate-900 caret-rose-600 outline-none wrap-break-word placeholder:text-slate-500 disabled:cursor-not-allowed ${thinScroll}`}
           />
         )}
 
-        <button
-          type="submit"
-          disabled={!canSend}
-          aria-label="Send"
-          className={`grid size-11 shrink-0 place-items-center rounded-md bg-slate-900 text-white transition-[background-color,scale] duration-150 hover:bg-slate-700 active:scale-[0.97] disabled:bg-slate-100 disabled:text-slate-500 disabled:hover:bg-slate-100 ${focusRing}`}
-        >
-          <ArrowUp className="size-5" aria-hidden="true" />
-        </button>
-
-        <button
-          ref={attach}
-          type="button"
-          onClick={() => picker.current?.click()}
-          disabled={busy}
-          aria-label={file ? `Attach a different file (now ${file.name})` : "Attach a file"}
-          title="Attach a PDF, Word or text file"
-          className={`grid size-11 shrink-0 place-items-center rounded-md border border-slate-300 text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:border-slate-300 ${focusRing}`}
-        >
-          <Paperclip className="size-5" aria-hidden="true" />
-        </button>
-
-        {listening && (
+        <div className="flex items-center gap-1.5">
           <button
+            ref={attach}
             type="button"
-            onClick={actions.endVoice}
-            aria-label="Cancel recording"
-            title="Cancel (Esc)"
-            className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] sm:w-auto sm:px-3.5 ${focusRing}`}
+            onClick={() => picker.current?.click()}
+            disabled={busy}
+            aria-label={file ? `Attach a different file (now ${file.name})` : "Attach a file"}
+            title="Attach a PDF, Word or text file"
+            className={`grid size-11 shrink-0 place-items-center rounded-md border border-slate-300 text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:border-slate-300 ${focusRing}`}
           >
-            <X className="size-5" aria-hidden="true" />
-            <span className="hidden sm:inline">Cancel</span>
+            <Paperclip className="size-5" aria-hidden="true" />
           </button>
-        )}
 
-        <button
-          ref={talk}
-          type="button"
-          onClick={actions.toggleVoice}
-          // While Jarvis is answering, Stop generating (under the thinking bubble) is the way out; Talk waits for the next turn.
-          disabled={busy && !listening}
-          aria-label={listening ? "Stop recording and send" : "Talk to Jarvis"}
-          aria-pressed={voice}
-          className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[background-color,border-color,color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:hover:border-slate-300 aria-pressed:border-slate-900 aria-pressed:bg-slate-900 aria-pressed:text-white aria-pressed:disabled:opacity-60 sm:w-auto sm:px-3.5 ${focusRing}`}
-        >
-          {listening ? (
-            <Square className="size-4 fill-current" aria-hidden="true" />
-          ) : (
-            <Mic className="size-5" aria-hidden="true" />
-          )}
-          <span className="hidden sm:inline">{listening ? "Send" : "Talk"}</span>
-        </button>
+          <div className="ml-auto flex items-center gap-1.5">
+            {listening && (
+              <button
+                type="button"
+                onClick={actions.endVoice}
+                aria-label="Cancel recording"
+                title="Cancel (Esc)"
+                className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] sm:w-auto sm:px-3.5 ${focusRing}`}
+              >
+                <X className="size-5" aria-hidden="true" />
+                <span className="hidden sm:inline">Cancel</span>
+              </button>
+            )}
+
+            <button
+              ref={talk}
+              type="button"
+              onClick={actions.toggleVoice}
+              // While Jarvis is answering, Stop generating (under the thinking bubble) is the way out; Talk waits for the next turn.
+              disabled={busy && !listening}
+              aria-label={listening ? "Stop recording and send" : "Talk to Jarvis"}
+              aria-pressed={voice}
+              className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[background-color,border-color,color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:hover:border-slate-300 aria-pressed:border-slate-900 aria-pressed:bg-slate-900 aria-pressed:text-white aria-pressed:disabled:opacity-60 sm:w-auto sm:px-3.5 ${focusRing}`}
+            >
+              {listening ? (
+                <Square className="size-4 fill-current" aria-hidden="true" />
+              ) : (
+                <Mic className="size-5" aria-hidden="true" />
+              )}
+              <span className="hidden sm:inline">{listening ? "Send" : "Talk"}</span>
+            </button>
+
+            <button
+              type="submit"
+              disabled={!canSend}
+              aria-label="Send"
+              className={`grid size-11 shrink-0 place-items-center rounded-md bg-slate-900 text-white transition-[background-color,scale] duration-150 hover:bg-slate-700 active:scale-[0.97] disabled:bg-slate-100 disabled:text-slate-500 disabled:hover:bg-slate-100 ${focusRing}`}
+            >
+              <ArrowUp className="size-5" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
       </form>
     </div>
   );
@@ -314,8 +322,8 @@ function RecordingClock() {
 
   const seconds = Math.floor(elapsedMs / 1000);
   return (
-    // One line even on a phone, where four buttons share the dock: 14px there, 16px from sm up.
-    <p className="flex h-11 min-w-0 flex-1 items-center gap-2 overflow-hidden whitespace-nowrap px-2 text-sm tabular-nums text-slate-700 sm:text-base">
+    // The field's place: the dock's whole width, one 44px line, the buttons on the row below.
+    <p className="flex h-11 w-full items-center gap-2 overflow-hidden whitespace-nowrap px-2.5 text-base tabular-nums text-slate-700">
       <span aria-hidden="true" className="relative grid size-2.5 shrink-0 place-items-center">
         <span className="absolute size-full rounded-full bg-slate-900/30 motion-safe:animate-ping" />
         <span className="size-2.5 rounded-full bg-slate-900" />

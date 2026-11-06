@@ -30,6 +30,7 @@ export const ChatFeed = memo(function ChatFeed() {
   const sendingId = useChat((state) => state.sendingId);
 
   const scroller = useRef<HTMLDivElement | null>(null);
+  const column = useRef<HTMLDivElement | null>(null);
   const seenEpoch = useRef(epoch);
 
   // Follow the conversation to its foot - the newest message, or the thinking bubble under the
@@ -42,24 +43,40 @@ export const ChatFeed = memo(function ChatFeed() {
     element.scrollTo({ top: element.scrollHeight, behavior: jump ? "auto" : "smooth" });
   }, [messages, epoch, waiting]);
 
-  // The dock grows with a long draft (Composer) and the conversation's window gets shorter from the
-  // bottom: someone reading the newest message keeps it in view. Someone scrolled up stays where they are.
+  // Someone reading the newest message keeps it in view while the layout moves under them: the dock
+  // growing with a long draft (Composer) makes the window shorter from the bottom, and words re-wrapping
+  // (a narrower window, a phone turned) or a picture arriving make the conversation taller. Someone
+  // scrolled up stays where they are.
+  //
+  // "Reading the newest message" is decided by the person's own scrolling only. A scroll the layout
+  // caused - the browser keeping its place (scroll anchoring) when the content above re-wraps - comes
+  // with a size that changed since the last look, and is not taken as the person scrolling away.
   useEffect(() => {
     const element = scroller.current;
-    if (!element || typeof ResizeObserver === "undefined") return;
+    const content = column.current;
+    if (!element || !content || typeof ResizeObserver === "undefined") return;
     const atFoot = () => element.scrollHeight - element.scrollTop - element.clientHeight < 32;
     let pinned = atFoot();
-    let height = element.clientHeight;
+    let last = { height: element.clientHeight, content: element.scrollHeight };
     const onScroll = () => {
+      if (element.clientHeight !== last.height || element.scrollHeight !== last.content) return;
       pinned = atFoot();
     };
     const observer = new ResizeObserver(() => {
-      const shorter = element.clientHeight < height;
-      height = element.clientHeight;
-      if (shorter && pinned) element.scrollTop = element.scrollHeight;
+      const shorter = element.clientHeight < last.height;
+      const taller = element.scrollHeight > last.content;
+      last = { height: element.clientHeight, content: element.scrollHeight };
+      if (!pinned) return;
+      if (shorter) {
+        element.scrollTop = element.scrollHeight; // the dock grew: at once, so the words never slip under it
+      } else if (taller) {
+        const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        element.scrollTo({ top: element.scrollHeight, behavior: still ? "auto" : "smooth" });
+      }
     });
     element.addEventListener("scroll", onScroll, { passive: true });
     observer.observe(element);
+    observer.observe(content);
     return () => {
       observer.disconnect();
       element.removeEventListener("scroll", onScroll);
@@ -68,7 +85,7 @@ export const ChatFeed = memo(function ChatFeed() {
 
   return (
     <div ref={scroller} className={`min-h-0 flex-1 overflow-y-auto ${thinScroll}`}>
-      <div className="mx-auto w-full max-w-2xl px-4 py-8">
+      <div ref={column} className="mx-auto w-full max-w-2xl px-4 py-8">
         {conversation === "loading" && messages.length === 0 && <FeedSkeleton />}
         {conversation === "error" && <FeedError />}
         {conversation === "ready" && messages.length === 0 && <EmptyState access={access} />}
