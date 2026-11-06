@@ -50,6 +50,34 @@ class ToolSpec:
     # console and the status tool can tell them apart from built-ins.
     source: str = "builtin"
 
+    # Confirmation per call instead of always: a tool whose actions differ - delegate_to_calendar
+    # reads freely, but writing an event needs a yes - asks only when this returns True for the
+    # call's arguments (on top of requires_confirmation). Fails closed: if it raises, it asks.
+    confirm_when: Optional[Callable[[dict[str, Any]], bool]] = None
+
+    # The question, and the details shown with it (the web hub's Approval Card lists them), built
+    # from the call's arguments when the template and the raw arguments would not say it well -
+    # nested arguments, times to put in words. ValueError means the call cannot run as it stands:
+    # nothing is asked, and the message goes back to the model instead (LLMBrain._execute).
+    confirmation_text: Optional[Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]] = None
+
+    def needs_confirmation(self, args: Optional[dict[str, Any]] = None) -> bool:
+        """True when this call must be approved by a person before it runs."""
+        if self.requires_confirmation:
+            return True
+        if self.confirm_when is None:
+            return False
+        try:
+            return bool(self.confirm_when(dict(args or {})))
+        except Exception:  # noqa: BLE001 - an unreadable call is asked about, never waved through
+            return True
+
+    def confirmation_for(self, args: Optional[dict[str, Any]] = None) -> tuple[str, dict[str, Any]]:
+        """(question, details) for this call's approval. ValueError: nothing to approve - see confirmation_text."""
+        if self.confirmation_text is not None:
+            return self.confirmation_text(dict(args or {}))
+        return self.confirmation_question(args or {}), dict(args or {})
+
     def confirmation_question(self, args: dict[str, Any]) -> str:
         # The tool's own arguments win over the defaults: create_new_tool
         # takes an argument called "name", and passing both as keywords

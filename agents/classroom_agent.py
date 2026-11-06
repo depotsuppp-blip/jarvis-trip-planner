@@ -12,13 +12,15 @@ Each returns a compact JSON string for the language model and never raises: a
 problem comes back as {"error": "..."} worded for the model to pass on - most
 often "not signed in yet: run python utils/classroom_auth.py".
 
-It signs in as the owner with token.json, made once by utils/classroom_auth.py
-from credentials.json (an OAuth "Desktop app" client). The scopes are read-only
+It signs in as the owner with token.json, made once by utils/google_auth.py (the
+one Google sign-in Jarvis uses, shared with the Calendar) from credentials.json (an
+OAuth "Desktop app" client). The Classroom scopes are read-only
 (classroom.courses.readonly, classroom.coursework.me.readonly): nothing here can
 post, submit, grade or change anything. An expired access token is refreshed with
-the saved refresh token, and the refreshed token is written back when the file
-is writable (in Docker it is mounted read-only; the refresh then just lives in
-memory).
+the saved refresh token by utils/google_auth.load_credentials - with every scope the
+token holds, so a Classroom refresh never takes the Calendar's access away - and the
+refreshed token is written back when the file is writable (in Docker it is mounted
+read-only; the refresh then just lives in memory).
 
 Who may ask is decided by the caller (llm_brain's Classroom tools: the owner
 only), not here - this module only talks to Google.
@@ -33,14 +35,15 @@ import threading
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 
-from utils.classroom_auth import SCOPES, token_file
+from utils.google_auth import SCOPES_BY_SERVICE, SIGN_IN_COMMAND, GoogleAuthError, load_credentials, token_file
 
+SCOPES = SCOPES_BY_SERVICE["classroom"]
 MAX_COURSES = 100
 MAX_COURSEWORK = 40          # newest first by due date; more is not useful in one answer
 MAX_DESCRIPTION = 200
 PAGE_SIZE = 50
 HTTP_TIMEOUT = 20            # seconds per request; the manager's whole turn has a budget too
-AUTH_HINT = "Ask the owner to run:  python utils/classroom_auth.py"
+AUTH_HINT = f"Ask the owner to run:  {SIGN_IN_COMMAND}"
 _COURSE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")  # numeric ids, or "d:<alias>" / "p:<alias>"
 
 _lock = threading.Lock()
@@ -59,42 +62,11 @@ def _dump(payload: dict[str, Any]) -> str:
 
 
 def _credentials() -> Any:
+    """The owner's sign-in with the Classroom scopes (utils/google_auth.load_credentials), or ClassroomError."""
     try:
-        from google.auth.exceptions import RefreshError
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-    except ImportError:
-        raise ClassroomError("The Google client libraries are not installed. Ask the owner to run: pip install -r requirements.txt") from None
-
-    path = token_file()
-    if not path.is_file():
-        raise ClassroomError(f"Google Classroom is not connected yet. {AUTH_HINT}")
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-        creds = Credentials.from_authorized_user_info(saved, SCOPES)
-    except (ValueError, OSError, TypeError, AttributeError):
-        raise ClassroomError(f"The saved Google sign-in (token.json) is unreadable. {AUTH_HINT}") from None
-    # What the token was granted is in the file's own "scopes" (google-auth does not check it
-    # against the scopes passed above). A token made for something else cannot read Classroom.
-    granted = saved.get("scopes") if isinstance(saved, dict) else None
-    if isinstance(granted, str):
-        granted = granted.split()
-    if granted and not set(SCOPES) <= set(granted):
-        raise ClassroomError(f"The saved Google sign-in does not include Classroom access. {AUTH_HINT}")
-    if not creds.valid:
-        if not creds.refresh_token:
-            raise ClassroomError(f"The Google sign-in has expired. {AUTH_HINT}")
-        try:
-            creds.refresh(Request())
-        except RefreshError:
-            raise ClassroomError(f"The Google sign-in was revoked or has expired. {AUTH_HINT}") from None
-        except Exception:  # noqa: BLE001 - a network problem while refreshing
-            raise ClassroomError("Could not reach Google to renew the sign-in. Check the internet connection and try again.") from None
-        try:
-            path.write_text(creds.to_json(), encoding="utf-8")
-        except OSError:
-            pass  # a read-only mount: the refreshed token still works for this process
-    return creds
+        return load_credentials(SCOPES, "Google Classroom", AUTH_HINT)
+    except GoogleAuthError as exc:
+        raise ClassroomError(str(exc)) from None
 
 
 def _service() -> Any:

@@ -193,6 +193,18 @@ Several things were added to this module beyond plain tool calling:
       There whenever asyncpg is installed and a URL is set, JARVIS_DATABASE=0
       turns it off.
 
+  CALENDAR  delegate_to_calendar(action, params) - the Head of Schedule
+      (agents/calendar_agent.py) - reads the owner's Google Calendar
+      ("list_upcoming_events", days_ahead) and adds events ("create_event":
+      title, start_time, end_time, description), signed in as the owner with
+      the one Google token Jarvis keeps (utils/google_auth.py, shared with
+      Classroom). Reading runs freely; a new event is approved first, per call
+      (ToolSpec.confirm_when): in the web hub the owner's Approval Card shows
+      the event in words (calendar_agent.confirmation) and nothing is written
+      until Allow, by voice it is the spoken yes/no. Owner only, like Classroom
+      (_calendar_allowed); CALENDAR_RULE tells the model how; JARVIS_CALENDAR=0
+      turns it off.
+
 -------------------------------------------------------------------
 THE STATE MACHINE
 -------------------------------------------------------------------
@@ -205,7 +217,7 @@ Every question is one run through these nodes (LLMBrain._machine):
                        (-> Review_Artifact) or tool calls
     Delegate_to_Agent  the calls, when any hands work to a specialist
                        (Research, Data, Productivity, Creative, Publishing,
-                       Analytics, Database, Classroom)           (-> Plan)
+                       Analytics, Database, Schedule, Classroom) (-> Plan)
     Use_Tools          the calls, when none does: MCP tools, built-ins (-> Plan)
     Review_Artifact    the link guard (one correction back through Plan),
                        the Markdown line of every file made during the run,
@@ -466,7 +478,7 @@ How this deployment reads your output:
 - Reply with the JSON object and nothing else: no code fence, no commentary before or after it. That holds for every input, a thank-you or a one-word greeting included - "thanks" gets {"intent_type": "CHAT", "route_to": "SELF", "response": "You're welcome."}.
 - Use route_to "SELF" only with intent_type "CHAT" and a real answer in response. Every other case is route_to "ORCHESTRATOR" with response null.
 - intent_type says what the input is about and route_to says who answers it, so they are separate decisions. "TRIP_PLANNING" is only for input about a trip: planning one, its group poll, voting, or finalizing the plan. Every other input is "CHAT", including a request that needs a tool, which is "CHAT" with route_to "ORCHESTRATOR".
-- The assistant behind you has tools that you do not. It logs and reads Subtrack expenses and records, runs n8n workflows, looks at the user's screen, reads the user's Google Calendar for today, sends LINE messages, starts and stops apps and servers, plans trips and trip polls, and reports what it can do and what is still running. A request that needs one of those, or live information about the user's own systems, is never yours to answer: route it to "ORCHESTRATOR" with response null. Never say or imply that you have done, started, or checked anything.
+- The assistant behind you has tools that you do not. It logs and reads Subtrack expenses and records, runs n8n workflows, looks at the user's screen, reads the user's Google Calendar and adds events to it, sends LINE messages, starts and stops apps and servers, plans trips and trip polls, and reports what it can do and what is still running. A request that needs one of those, or live information about the user's own systems, is never yours to answer: route it to "ORCHESTRATOR" with response null. Never say or imply that you have done, started, or checked anything.
 - If the input answers a question the assistant just asked, or accepts or declines something it offered, route it to "ORCHESTRATOR".
 - Never write a trip link or a trip id, and never say a trip was created or is ready: you cannot make one, and a link from earlier in the conversation belongs to an earlier trip. Anything about planning, creating or finding a trip, a poll or a link is route_to "ORCHESTRATOR" with response null.
 
@@ -1053,6 +1065,40 @@ DATABASE_SPREADSHEET = (
 )
 
 
+# The owner's Google Calendar (agents/calendar_agent.py): told while the manager has the tool,
+# which only the owner gets - in the per-turn rules, like DATABASE_RULE.
+DELEGATE_CALENDAR = "delegate_to_calendar"
+
+CALENDAR_RULE = (
+    "Calendar: you can read the user's Google Calendar and add events to it through your Head of Schedule "
+    "({tool}). For anything about their calendar - what is on today, tomorrow or this week, when they are free - "
+    'call it with action "list_upcoming_events" and params {{"days_ahead": N}} (1 is the next 24 hours, 7 a week, '
+    "at most 60) and answer from the events it returns, never from memory. To put something in their calendar, "
+    'call it with action "create_event" and params {{"title": "...", "start_time": "...", "end_time": "...", '
+    '"description": "..."}}: times in ISO 8601 in the user\'s time zone, like 2026-11-07T15:00, worked out from '
+    "the date and time in the note with their message - a weekday (\"on Monday\", \"next Monday\") is the nearest "
+    "one still ahead unless they say otherwise; a date alone (2026-11-07) is an all-day event; leave out "
+    "end_time when they gave no end or length (it becomes one hour), and description when there is nothing to "
+    "add. If the day or the time of a new event is not clear, ask for it first. The user approves every new event "
+    "before it is written - on screen, or out loud - so call create_event once per event and say it was added "
+    'only when the result\'s status is "created"; when the result says it was declined or nothing was added, say '
+    "so in one sentence and do not call it again. It cannot move or delete events.{team}"
+)
+CALENDAR_TEAM = (
+    " Calendar questions go to {tool}, not to the Head of Productivity, which reads today's calendar only for "
+    "the daily LINE briefing."
+)
+
+
+def calendar_rule(tools: list[ToolSpec]) -> str:
+    """CALENDAR_RULE when this call has delegate_to_calendar (the owner); else ""."""
+    names = {tool.name for tool in tools}
+    if DELEGATE_CALENDAR not in names:
+        return ""
+    team = CALENDAR_TEAM.format(tool=DELEGATE_CALENDAR) if "delegate_to_productivity" in names else ""
+    return CALENDAR_RULE.format(tool=DELEGATE_CALENDAR, team=team)
+
+
 def database_rule(tools: list[ToolSpec]) -> str:
     """DATABASE_RULE when this call can query the database (naming the files and spreadsheet tools there are); else ""."""
     if not any(tool.name == DELEGATE_DATABASE for tool in tools):
@@ -1282,6 +1328,8 @@ _TOOL_WORDS: tuple[str, ...] = (
     # Today's agenda: the productivity agent reads the calendar; the front door would
     # answer "I can't see your calendar".
     "calendar", "agenda", "schedule", "briefing",
+    # The Head of Schedule reads and adds events: "add a meeting tomorrow at 3".
+    "meeting", "meetings", "appointment", "appointments", "event", "events",
     # Google Classroom: the front door would answer "I can't see your classes".
     # ("course" is not here: "of course" would lose the cheap path.)
     "classroom", "homework", "assignment", "assignments", "coursework",
@@ -1296,8 +1344,8 @@ _DATABASE_SUBSTRINGS: tuple[str, ...] = ("ฐานข้อมูล", "ดา�
 _CLASSROOM_SUBSTRINGS: tuple[str, ...] = ("การบ้าน", "ห้องเรียน", "งานที่ต้องส่ง")
 
 # The same for Thai, as substrings: calendar / work schedule / appointment schedule /
-# appointment / LINE (the app).
-_AGENDA_SUBSTRINGS: tuple[str, ...] = ("ปฏิทิน", "ตารางงาน", "ตารางนัด", "นัดหมาย", "ไลน์")
+# appointment / LINE (the app) / meeting / an appointment (to make one).
+_AGENDA_SUBSTRINGS: tuple[str, ...] = ("ปฏิทิน", "ตารางงาน", "ตารางนัด", "นัดหมาย", "ไลน์", "ประชุม", "นัด")
 
 # The same for Thai, as substrings: weather / news / forecast. ("อากาศ" is also in
 # "air conditioner"; a tool-capable model answering that costs nothing.)
@@ -2195,6 +2243,83 @@ DATABASE_OWNER_ONLY = (
 
 def _database_allowed() -> bool:
     return mcp_client.caller_scope() == "owner"
+
+
+# -- Google Calendar: the Head of Schedule (agents/calendar_agent.py) -----------
+#
+# The owner's own calendar, signed in as the owner (token.json, utils/google_auth.py).
+# Owner only, like Classroom: nobody else is offered the tool (LLMBrain._active_tools)
+# and the handler checks again. Reading runs freely; creating an event is confirmed per
+# call (ToolSpec.confirm_when) through the one gate in _execute - the owner's Approval
+# Card in the web hub (approvals.py), the spoken yes/no by voice - with the event put in
+# words by calendar_agent.confirmation, which checks it exactly as the write will.
+
+CALENDAR_READ = "list_upcoming_events"
+CALENDAR_CREATE = "create_event"
+CALENDAR_ACTIONS = (CALENDAR_READ, CALENDAR_CREATE)
+
+CALENDAR_OWNER_ONLY = json.dumps({
+    "error": "Google Calendar is connected to the owner's Google account, so only the owner can use it "
+             "here. Tell the user it is not available to them."
+})
+
+
+def _calendar_allowed() -> bool:
+    return mcp_client.caller_scope() == "owner"
+
+
+def _calendar_call(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """(action, params) from a delegate_to_calendar call; params may arrive as a JSON string. ValueError if unreadable."""
+    action = str(args.get("action") or "").strip().lower().replace(" ", "_").replace("-", "_")
+    params = args.get("params")
+    if params in (None, ""):
+        params = {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except json.JSONDecodeError:
+            raise ValueError("params must be a JSON object, like {\"days_ahead\": 7}.") from None
+    if not isinstance(params, dict):
+        raise ValueError("params must be a JSON object, like {\"days_ahead\": 7}.")
+    return action, params
+
+
+def _calendar_needs_yes(args: dict[str, Any]) -> bool:
+    """Everything but reading is approved first - an action this does not know too (fail closed)."""
+    try:
+        action, _ = _calendar_call(args)
+    except ValueError:
+        return True
+    return action != CALENDAR_READ
+
+
+def _calendar_confirmation(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The approval question and card details for a create_event call; ValueError when there is nothing to approve."""
+    action, params = _calendar_call(args)
+    if action != CALENDAR_CREATE:
+        raise ValueError(f"action must be one of {', '.join(CALENDAR_ACTIONS)}.")
+    from agents import calendar_agent  # lazy: the agents package imports this module
+
+    return calendar_agent.confirmation(params)
+
+
+def _tool_calendar(action: str = "", params: Any = None) -> str:
+    """delegate_to_calendar. A create_event reaches here only once it was approved (_execute)."""
+    if not _calendar_allowed():
+        return CALENDAR_OWNER_ONLY
+    try:
+        verb, values = _calendar_call({"action": action, "params": params})
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    from agents import calendar_agent  # lazy: the agents package imports this module
+
+    if verb == CALENDAR_READ:
+        return calendar_agent.list_upcoming_events(values.get("days_ahead", calendar_agent.DEFAULT_DAYS))
+    if verb == CALENDAR_CREATE:
+        return calendar_agent.create_event(
+            values.get("title"), values.get("start_time"), values.get("end_time", ""), values.get("description", "")
+        )
+    return json.dumps({"error": f"action must be one of {', '.join(CALENDAR_ACTIONS)}."})
 
 
 def _tool_classroom_courses() -> str:
@@ -4006,6 +4131,9 @@ class LLMBrain:
         # Read-only SQL (agents/database_agent.py): delegate_to_database, for the owner, while a URL and asyncpg are there.
         self._database: Any = self._start_database()
         self._database_spec: Optional[ToolSpec] = None
+        # The owner's Google Calendar (agents/calendar_agent.py): delegate_to_calendar, for the owner, unless JARVIS_CALENDAR=0.
+        self._calendar_on = _env("JARVIS_CALENDAR", "1").lower() not in ("0", "false", "no", "off")
+        self._calendar_spec: Optional[ToolSpec] = None
         # What was made during a question, what went to the background and when it arrived
         # live on its run (TurnRun), not here: a stopped run's worker thread can still be
         # finishing while the next question is answered.
@@ -4091,6 +4219,10 @@ class LLMBrain:
             print(f"[Brain] Spreadsheets: {DELEGATE_ANALYTICS} -> {self._analytics.describe()}.")
         if self._database is not None:
             print(f"[Brain] Database: {DELEGATE_DATABASE} (owner only) -> {self._database.describe()}.")
+        if self._calendar_on:
+            row = next((r for r in self.heads_status() if r["name"] == "schedule"), {})
+            state = "signed in" if row.get("state") == "ready" else row.get("why", "not set up")
+            print(f"[Brain] Calendar: {DELEGATE_CALENDAR} (owner only; new events need approval) -> {state}.")
 
     # -- capabilities --------------------------------------------------
 
@@ -4168,10 +4300,10 @@ class LLMBrain:
     def heads_status(self) -> list[dict[str, Any]]:
         """
         The capabilities that are not LLM agents, for /health and the web hub's sidebar: the
-        Head of Creative (images), of Publishing (PowerPoint), of Analytics (Excel) and of
-        Database (read-only SQL, owner only) - plain Python behind a delegate_to_* tool, so they
-        have no model routes and are not in team_status() - and Google Classroom
-        (delegate_to_classroom_*, read-only, owner only).
+        Head of Creative (images), of Publishing (PowerPoint), of Analytics (Excel), of
+        Database (read-only SQL, owner only) and of Schedule (Google Calendar, owner only) -
+        plain Python behind a delegate_to_* tool, so they have no model routes and are not in
+        team_status() - and Google Classroom (delegate_to_classroom_*, read-only, owner only).
 
             {"name": "creative", "title": "Head of Creative", "tools": ["delegate_to_creative"],
              "state": "ready" | "not configured" | "off", "why": "needs OPENAI_API_KEY",
@@ -4211,6 +4343,27 @@ class LLMBrain:
              "owner_only": True},
         ]
 
+        # The owner's Google sign-in (utils/google_auth.py, one token.json): signed in for a service
+        # when the token holds that service's scopes. Read from the file - no network call.
+        def signed_in(service: str) -> bool:
+            try:
+                from utils import google_auth  # lazy: not needed unless asked
+
+                scopes = google_auth.SCOPES_BY_SERVICE[service]
+                return google_auth.token_file().is_file() and not google_auth.missing_scopes(scopes)
+            except Exception:  # noqa: BLE001 - a status row must never fail /health
+                return False
+
+        # Google Calendar: read freely, new events approved first; owner only (_calendar_allowed).
+        schedule: dict[str, Any] = {"name": "schedule", "title": "Head of Schedule", "tools": [DELEGATE_CALENDAR], "owner_only": True}
+        if not self._calendar_on:
+            schedule.update(state="off", why="switched off (JARVIS_CALENDAR=0)")
+        elif signed_in("calendar"):
+            schedule.update(state="ready", why="")
+        else:
+            schedule.update(state="not configured", why="not signed in (run utils/google_auth.py)")
+        rows.append(schedule)
+
         classroom_tools = [t.name for t in TOOLS if t.name.startswith("delegate_to_classroom_")]
         classroom: dict[str, Any] = {
             "name": "classroom",
@@ -4218,14 +4371,9 @@ class LLMBrain:
             "tools": classroom_tools,
             "owner_only": True,
         }
-        try:
-            from utils import classroom_auth  # lazy: not needed unless asked
-
-            signed_in = classroom_auth.token_file().is_file()
-        except Exception:  # noqa: BLE001 - a status row must never fail /health
-            signed_in = False
-        classroom["state"] = "ready" if signed_in else "not configured"
-        classroom["why"] = "" if signed_in else "not signed in (run utils/classroom_auth.py)"
+        ready = signed_in("classroom")
+        classroom["state"] = "ready" if ready else "not configured"
+        classroom["why"] = "" if ready else "not signed in (run utils/google_auth.py)"
         rows.append(classroom)
         return rows
 
@@ -4238,7 +4386,8 @@ class LLMBrain:
         a capability away. An agent's own tools (the calendar, LINE) are never here.
         Last, delegate_to_creative while image generation is set up,
         delegate_to_publishing while presentations are, delegate_to_analytics while
-        spreadsheets are, and delegate_to_database while a database is - for the owner only.
+        spreadsheets are, and - for the owner only - delegate_to_database while a database
+        is and delegate_to_calendar.
         """
         working = self._working_agents()
         replaced = self._replaced_tool_names(working)
@@ -4248,6 +4397,7 @@ class LLMBrain:
         publishing = [self._publishing_tool()] if self._publishing is not None and self._publishing.available else []
         analytics = [self._analytics_tool()] if self._analytics is not None and self._analytics.available else []
         database = [self._database_tool()] if self._database_ready() and _database_allowed() else []
+        calendar = [self._calendar_tool()] if self._calendar_on and _calendar_allowed() else []
         return (
             builtins
             + list(self._plugin_tools)
@@ -4257,6 +4407,7 @@ class LLMBrain:
             + publishing
             + analytics
             + database
+            + calendar
         )
 
     def _replaced_tool_names(self, working: Optional[list[Any]] = None) -> set[str]:
@@ -4738,6 +4889,62 @@ class LLMBrain:
             "for your answer (do not copy them anywhere):\n" + result.to_text(limit=4_000)
         )
 
+    # -- the owner's Google Calendar (agents/calendar_agent.py) ----------------------
+
+    def _calendar_tool(self) -> ToolSpec:
+        """delegate_to_calendar: built once, the same object every turn (the tool list stays cacheable)."""
+        if self._calendar_spec is None:
+            from agents.calendar_agent import MAX_DAYS  # the agents package imports this module
+
+            self._calendar_spec = ToolSpec(
+                name=DELEGATE_CALENDAR,
+                description=(
+                    "Your Head of Schedule: the user's own Google Calendar (their primary calendar). "
+                    f'action "{CALENDAR_READ}" with params {{"days_ahead": 1-{MAX_DAYS}}} returns their events from now '
+                    "on as JSON - title, when, start and end in their time zone, all_day, place, a short description, "
+                    f'a link. action "{CALENDAR_CREATE}" with params {{"title", "start_time", "end_time", "description"}} '
+                    "adds one event: ISO 8601 times such as 2026-11-07T15:00 in the user's time zone (a date alone is an "
+                    "all-day event), end_time optional (one hour). Every new event is approved by the user before it is "
+                    'written; the result\'s status is "created", or it says why nothing was added. It cannot move or '
+                    "delete events."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": list(CALENDAR_ACTIONS),
+                            "description": f"{CALENDAR_READ} to read what is coming up, {CALENDAR_CREATE} to add one event.",
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": (
+                                f'For {CALENDAR_READ}: {{"days_ahead": 7}}. For {CALENDAR_CREATE}: {{"title": "Dentist", '
+                                '"start_time": "2026-11-07T15:00", "end_time": "2026-11-07T16:00", "description": "..."}}.'
+                            ),
+                            "properties": {
+                                "days_ahead": {"type": "integer", "description": f"How many days ahead to read, 1 to {MAX_DAYS} (default 7)."},
+                                "title": {"type": "string", "description": "The new event's title."},
+                                "start_time": {"type": "string", "description": "ISO 8601 start, e.g. 2026-11-07T15:00, or 2026-11-07 for all day."},
+                                "end_time": {"type": "string", "description": "ISO 8601 end; leave out for one hour."},
+                                "description": {"type": "string", "description": "Notes to put in the event (optional)."},
+                            },
+                        },
+                    },
+                    "required": ["action"],
+                },
+                handler=_tool_calendar,
+                # Reading runs freely; anything else - a new event - waits for the owner's yes (_execute).
+                requires_confirmation=False,
+                confirm_when=_calendar_needs_yes,
+                confirmation_text=_calendar_confirmation,
+                # Foreground: the events ARE the answer, the approval needs the request's context.
+                background=False,
+                label="the Head of Schedule",
+                source="agent",
+            )
+        return self._calendar_spec
+
     def _team_rule(self, tools: list[ToolSpec]) -> str:
         """TEAM_RULE naming the agents this call can delegate to, or "" when it can delegate to none."""
         members = [
@@ -4949,13 +5156,21 @@ class LLMBrain:
 
         print(f"[Brain] Tool call: {call.name}({json.dumps(call.args, default=str)})")
 
-        if tool.requires_confirmation:
-            question = tool.confirmation_question(call.args)
+        # Every call that must be approved - always for a requires_confirmation tool, per call for
+        # one with confirm_when (delegate_to_calendar's create_event) - goes through the one gate
+        # here: the voice yes/no, or in the web hub the owner's Approval Card (approvals.py).
+        if tool.needs_confirmation(call.args):
+            try:
+                question, shown = tool.confirmation_for(call.args)
+            except ValueError as exc:
+                # The call cannot run as it stands (an event with no start time): nothing to approve.
+                print(f"[Brain] Not asked for {call.name}: {exc}")
+                return ToolResult(call=call, content=f"ERROR: nothing was done: {exc}", is_error=True)
             question = self._augment_confirmation(tool, call, question)
             print(f"[Brain] Confirmation required for {call.name}.")
             # The gate is told which tool and arguments it is asking about: the web's Approval Card
             # shows them (approvals.py); the voice gate only speaks `question`.
-            with request_context.confirming(call.name, call.args):
+            with request_context.confirming(call.name, shown):
                 approved = self._ask_confirmation(question)
             if not approved:
                 print(f"[Brain] Tool call denied by the user: {call.name}.")
@@ -5676,6 +5891,7 @@ class LLMBrain:
                 publishing_rule(tools, web=web),
                 analytics_rule(tools, web=web),
                 database_rule(tools),
+                calendar_rule(tools),
             ]
             prompt = self._system_prompt
             # A chat is read, not heard: lift the one voice rule that would
