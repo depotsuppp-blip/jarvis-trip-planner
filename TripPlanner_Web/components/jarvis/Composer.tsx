@@ -23,11 +23,13 @@ import { focusRing, thinScroll } from "./styles";
  * ruled control - and every control of a turn in progress. Jarvis's face is the
  * Signal Orb in the sidebar (JarvisOrb.tsx); nothing is drawn over the conversation.
  *
- * Two layers inside the one rule: the field across the dock's whole width, and under
- * it a row of its own for the buttons - Attach at the start, (Cancel,) Talk and Send
- * at the end - so the buttons take no width from the words. The field is a textarea
- * that grows with the draft, a line at a time, up to about seven lines (less on a
- * short screen: 35% of its height); past that it scrolls inside itself. A long message
+ * At rest it is ONE compact row: Attach, the field, (Cancel,) Talk and Send. Once
+ * the words would wrap onto a second line beside the buttons - or Shift+Enter starts
+ * one - the field takes the dock's whole width and the buttons drop to a row of their
+ * own under it, Attach at the start and Talk and Send at the end; it goes back to one
+ * row when the words fit beside the buttons again (or the message is sent). The field
+ * is a textarea that grows with the draft, a line at a time, up to about seven lines
+ * (less on a short screen: 35% of its height); past that it scrolls inside itself. A long message
  * wraps instead of running off sideways. Enter sends and Shift+Enter starts a new line
  * - on a touch screen Enter starts a new line and Send sends, as phones' own keyboards
  * expect. Enter never sends half a word an input method (Thai, Japanese...) is still
@@ -66,6 +68,7 @@ export const Composer = memo(function Composer() {
   const [draft, setDraft] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [fileProblem, setFileProblem] = useState<string | null>(null);
+  const dock = useRef<HTMLFormElement>(null);
   const field = useRef<HTMLTextAreaElement>(null);
   const talk = useRef<HTMLButtonElement>(null);
   const attach = useRef<HTMLButtonElement>(null);
@@ -75,28 +78,52 @@ export const Composer = memo(function Composer() {
   // Edit put words in the field while it was switched off: it takes the keyboard when the turn ends.
   const focusFieldWhenFree = useRef(false);
 
+  // The words no longer fit on one line beside the buttons: the field takes a row of its own.
+  const [stacked, setStacked] = useState(false);
+  const twoRows = stacked && !listening; // the recording clock is always one line
+
   const canSend = (draft.trim().length > 0 || file !== null) && !busy;
 
-  // The field as tall as its words, up to its max-height (the class below); scrolling past that.
-  // "auto" first, so a draft that got shorter (a line deleted, a message sent) lets it shrink.
+  // Two jobs, before paint. First, one row or two: would the words fit on ONE line in the place
+  // beside the buttons (the grid's middle column)? That is asked at that width whichever layout is
+  // showing - so text that wraps there and fits on the wider row of its own stays on its own row,
+  // and the dock never flips back and forth on the edge. A new line (Shift+Enter) is two lines.
+  // Second, the field as tall as its words, up to its max-height (the class below); scrolling past
+  // that. "auto" first, so a draft that got shorter (a line deleted, a message sent) lets it shrink.
   const fitField = useCallback(() => {
     const element = field.current;
     if (!element) return;
+    const style = window.getComputedStyle(element);
+    const oneLine = Number.parseFloat(style.lineHeight) + Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+    const empty = element.value === "";
     element.style.height = "auto";
-    const limit = Number.parseFloat(window.getComputedStyle(element).maxHeight);
+
+    let wraps = false;
+    if (!empty) {
+      const beside = besideWidth(element);
+      if (beside > 0) element.style.width = `${beside}px`;
+      wraps = element.value.includes("\n") || element.scrollHeight > oneLine + 1;
+      element.style.width = "";
+    }
+    setStacked(wraps);
+
+    // Empty, it is one line, whatever the placeholder would take on a very narrow screen: it stays on
+    // one line (the class below) and is cut at the field's edge.
+    const needed = empty ? oneLine : element.scrollHeight;
+    const limit = Number.parseFloat(style.maxHeight);
     const tallest = Number.isFinite(limit) ? limit : Number.POSITIVE_INFINITY;
-    element.style.height = `${Math.min(element.scrollHeight, tallest)}px`;
-    element.style.overflowY = element.scrollHeight > tallest ? "auto" : "hidden";
+    element.style.height = `${Math.min(needed, tallest)}px`;
+    element.style.overflowY = needed > tallest ? "auto" : "hidden";
   }, []);
 
-  // Before paint, so a new line never shows a frame of scrollbar first. `listening` too: the field
-  // comes back after a recording, as one line again or as tall as the words it kept.
-  useLayoutEffect(fitField, [draft, listening, fitField]);
+  // `listening`: the field comes back after a recording with the words it kept. `twoRows`: the field
+  // just got wider or narrower, so its words re-wrap - fitted again before the same paint.
+  useLayoutEffect(fitField, [draft, listening, twoRows, fitField]);
 
-  // A narrower field wraps the same words onto more lines - the window, or the sidebar opening and
-  // closing. Only a change of WIDTH re-fits: the height is this effect's own doing.
+  // A narrower dock wraps the same words onto more lines - the window, or the sidebar opening and
+  // closing. Only a change of WIDTH re-fits: the height is this component's own doing.
   useEffect(() => {
-    const element = field.current;
+    const element = dock.current;
     if (!element || typeof ResizeObserver === "undefined") return;
     let width = element.clientWidth;
     const observer = new ResizeObserver(() => {
@@ -106,7 +133,7 @@ export const Composer = memo(function Composer() {
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, [listening, fitField]);
+  }, [fitField]);
 
   // Enter sends, Shift+Enter breaks the line. Not on a touch screen, where Enter is the keyboard's
   // own new-line key and Send is the button. Never while an input method is still composing a word.
@@ -219,18 +246,35 @@ export const Composer = memo(function Composer() {
         className="hidden"
       />
 
-      {/* Two layers inside one rule: the field across the whole width, then the buttons' own row -
-          Attach at the start, Talk and Send at the end. In tab order as on screen. */}
+      {/* One rule, a grid of three columns: Attach | the field | (Cancel,) Talk and Send. At rest
+          and while the words fit on one line it is ONE row. Once they would wrap there (or a new
+          line starts), the field takes the whole first row and the buttons drop to a second one,
+          Attach at its start, Talk and Send at its end - the same buttons in the same columns, so
+          nothing jumps sideways, and the field keeps its caret (only its place changes). Tab order
+          is the one-row order: Attach, the field, Talk, Send. */}
       <form
+        ref={dock}
         onSubmit={submit}
-        className="mx-auto flex max-w-2xl flex-col gap-1 rounded-md border border-slate-300 bg-white p-1.5 has-[textarea:focus-visible]:border-slate-900 has-[textarea:focus-visible]:outline-2 has-[textarea:focus-visible]:outline-offset-2 has-[textarea:focus-visible]:outline-rose-600"
+        className="mx-auto grid max-w-2xl grid-cols-[auto_minmax(0,1fr)_auto] items-end gap-x-1.5 gap-y-1 rounded-md border border-slate-300 bg-white p-1.5 has-[textarea:focus-visible]:border-slate-900 has-[textarea:focus-visible]:outline-2 has-[textarea:focus-visible]:outline-offset-2 has-[textarea:focus-visible]:outline-rose-600"
       >
+        <button
+          ref={attach}
+          type="button"
+          onClick={() => picker.current?.click()}
+          disabled={busy}
+          aria-label={file ? `Attach a different file (now ${file.name})` : "Attach a file"}
+          title="Attach a PDF, Word or text file"
+          className={`col-start-1 ${twoRows ? "row-start-2" : "row-start-1"} grid size-11 shrink-0 place-items-center rounded-md border border-slate-300 text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:border-slate-300 ${focusRing}`}
+        >
+          <Paperclip className="size-5" aria-hidden="true" />
+        </button>
+
         {listening ? (
           <RecordingClock />
         ) : (
           // One line is 44px (24px line + 10px above and below). It grows to 12rem - about seven
-          // lines - or 35% of a short screen, then scrolls (fitField). The full width of the dock:
-          // the buttons are on the row below, so they take no width from the words.
+          // lines - or 35% of a short screen, then scrolls (fitField). Beside the buttons while the
+          // words fit on one line there; the whole width of the dock once they don't.
           <textarea
             ref={field}
             rows={1}
@@ -241,64 +285,50 @@ export const Composer = memo(function Composer() {
             placeholder="Message Jarvis"
             aria-label="Message Jarvis"
             autoComplete="off"
-            className={`block max-h-[min(12rem,35dvh)] min-h-11 w-full resize-none overflow-y-hidden bg-transparent px-2.5 py-2.5 text-base leading-6 text-slate-900 caret-rose-600 outline-none wrap-break-word placeholder:text-slate-500 disabled:cursor-not-allowed ${thinScroll}`}
+            className={`${twoRows ? "col-span-full" : "col-start-2"} row-start-1 block max-h-[min(12rem,35dvh)] min-h-11 w-full min-w-0 resize-none overflow-y-hidden bg-transparent px-2.5 py-2.5 text-base leading-6 text-slate-900 caret-rose-600 outline-none wrap-break-word placeholder:whitespace-nowrap placeholder:text-slate-500 disabled:cursor-not-allowed ${thinScroll}`}
           />
         )}
 
-        <div className="flex items-center gap-1.5">
+        <div className={`col-start-3 ${twoRows ? "row-start-2" : "row-start-1"} flex items-center gap-1.5`}>
+          {listening && (
+            <button
+              type="button"
+              onClick={actions.endVoice}
+              aria-label="Cancel recording"
+              title="Cancel (Esc)"
+              className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] sm:w-auto sm:px-3.5 ${focusRing}`}
+            >
+              <X className="size-5" aria-hidden="true" />
+              <span className="hidden sm:inline">Cancel</span>
+            </button>
+          )}
+
           <button
-            ref={attach}
+            ref={talk}
             type="button"
-            onClick={() => picker.current?.click()}
-            disabled={busy}
-            aria-label={file ? `Attach a different file (now ${file.name})` : "Attach a file"}
-            title="Attach a PDF, Word or text file"
-            className={`grid size-11 shrink-0 place-items-center rounded-md border border-slate-300 text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:border-slate-300 ${focusRing}`}
+            onClick={actions.toggleVoice}
+            // While Jarvis is answering, Stop generating (under the thinking bubble) is the way out; Talk waits for the next turn.
+            disabled={busy && !listening}
+            aria-label={listening ? "Stop recording and send" : "Talk to Jarvis"}
+            aria-pressed={voice}
+            className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[background-color,border-color,color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:hover:border-slate-300 aria-pressed:border-slate-900 aria-pressed:bg-slate-900 aria-pressed:text-white aria-pressed:disabled:opacity-60 sm:w-auto sm:px-3.5 ${focusRing}`}
           >
-            <Paperclip className="size-5" aria-hidden="true" />
+            {listening ? (
+              <Square className="size-4 fill-current" aria-hidden="true" />
+            ) : (
+              <Mic className="size-5" aria-hidden="true" />
+            )}
+            <span className="hidden sm:inline">{listening ? "Send" : "Talk"}</span>
           </button>
 
-          <div className="ml-auto flex items-center gap-1.5">
-            {listening && (
-              <button
-                type="button"
-                onClick={actions.endVoice}
-                aria-label="Cancel recording"
-                title="Cancel (Esc)"
-                className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[border-color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] sm:w-auto sm:px-3.5 ${focusRing}`}
-              >
-                <X className="size-5" aria-hidden="true" />
-                <span className="hidden sm:inline">Cancel</span>
-              </button>
-            )}
-
-            <button
-              ref={talk}
-              type="button"
-              onClick={actions.toggleVoice}
-              // While Jarvis is answering, Stop generating (under the thinking bubble) is the way out; Talk waits for the next turn.
-              disabled={busy && !listening}
-              aria-label={listening ? "Stop recording and send" : "Talk to Jarvis"}
-              aria-pressed={voice}
-              className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-md border border-slate-300 text-sm font-semibold text-slate-900 transition-[background-color,border-color,color,scale] duration-150 hover:border-slate-900 active:scale-[0.97] disabled:cursor-not-allowed disabled:hover:border-slate-300 aria-pressed:border-slate-900 aria-pressed:bg-slate-900 aria-pressed:text-white aria-pressed:disabled:opacity-60 sm:w-auto sm:px-3.5 ${focusRing}`}
-            >
-              {listening ? (
-                <Square className="size-4 fill-current" aria-hidden="true" />
-              ) : (
-                <Mic className="size-5" aria-hidden="true" />
-              )}
-              <span className="hidden sm:inline">{listening ? "Send" : "Talk"}</span>
-            </button>
-
-            <button
-              type="submit"
-              disabled={!canSend}
-              aria-label="Send"
-              className={`grid size-11 shrink-0 place-items-center rounded-md bg-slate-900 text-white transition-[background-color,scale] duration-150 hover:bg-slate-700 active:scale-[0.97] disabled:bg-slate-100 disabled:text-slate-500 disabled:hover:bg-slate-100 ${focusRing}`}
-            >
-              <ArrowUp className="size-5" aria-hidden="true" />
-            </button>
-          </div>
+          <button
+            type="submit"
+            disabled={!canSend}
+            aria-label="Send"
+            className={`grid size-11 shrink-0 place-items-center rounded-md bg-slate-900 text-white transition-[background-color,scale] duration-150 hover:bg-slate-700 active:scale-[0.97] disabled:bg-slate-100 disabled:text-slate-500 disabled:hover:bg-slate-100 ${focusRing}`}
+          >
+            <ArrowUp className="size-5" aria-hidden="true" />
+          </button>
         </div>
       </form>
     </div>
@@ -322,13 +352,31 @@ function RecordingClock() {
 
   const seconds = Math.floor(elapsedMs / 1000);
   return (
-    // The field's place: the dock's whole width, one 44px line, the buttons on the row below.
-    <p className="flex h-11 w-full items-center gap-2 overflow-hidden whitespace-nowrap px-2.5 text-base tabular-nums text-slate-700">
+    // The field's place beside the buttons, one 44px line. Where that place is too narrow for the
+    // word (a phone, with Cancel in the row too) the clock shows the dot and the time, and the word
+    // is kept for screen readers.
+    <p className="@container col-start-2 row-start-1 flex h-11 w-full min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap px-2.5 text-base tabular-nums text-slate-700">
       <span aria-hidden="true" className="relative grid size-2.5 shrink-0 place-items-center">
         <span className="absolute size-full rounded-full bg-slate-900/30 motion-safe:animate-ping" />
         <span className="size-2.5 rounded-full bg-slate-900" />
       </span>
-      Recording {Math.floor(seconds / 60)}:{String(seconds % 60).padStart(2, "0")}
+      <span>
+        <span className="sr-only @min-[8.5rem]:not-sr-only">Recording </span>
+        {Math.floor(seconds / 60)}:{String(seconds % 60).padStart(2, "0")}
+      </span>
     </p>
   );
+}
+
+/**
+ * The width the field has beside the buttons: the dock grid's middle column. It is the same in the
+ * one-row and the two-row layout - Attach and the button group size the outer columns either way.
+ * 0 when it cannot be read (the field is then measured at the width it has).
+ */
+function besideWidth(element: HTMLElement): number {
+  const form = element.closest("form");
+  if (!form) return 0;
+  const columns = window.getComputedStyle(form).gridTemplateColumns.split(" ");
+  const middle = columns.length === 3 ? Number.parseFloat(columns[1]) : Number.NaN;
+  return Number.isFinite(middle) ? middle : 0;
 }
