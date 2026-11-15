@@ -65,6 +65,7 @@ import os
 import re
 import ssl
 import sys
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -593,6 +594,16 @@ SELECT to_regclass('{SCHEMA}.entities') IS NOT NULL AND to_regclass('{SCHEMA}.re
 _pool: Any = None
 _settings: Optional[DbSettings] = None
 _search_path = ""  # set once the tables are known to exist; then every transaction uses it
+# When the last transaction ended (time.monotonic()); 0 before the first.
+_last_used = 0.0
+# Between two tool calls the event loop is stopped (_run: one run_until_complete per call), so
+# nothing reads the pool's idle sockets and the pool's own idle timer cannot fire. A connection the
+# server closed meanwhile - Neon suspending an idle compute, pg_terminate_backend - still looks open,
+# and the goodbye it never read breaks the first query sent on it (asyncpg InternalClientError
+# "cannot switch to state 15; another operation (2) is in progress"). So after this long without a
+# call, the pool's connections are replaced before one is used; a failure like that within the
+# window is caught by the retry in _db.
+IDLE_EXPIRE_SECONDS = 60.0
 
 
 async def _get_pool() -> Any:
@@ -637,31 +648,52 @@ async def ensure_schema(conn: Any, *, force: bool = False) -> str:
 
 @contextlib.asynccontextmanager
 async def _transaction(*, readonly: bool = False) -> Any:
-    global _search_path
+    """
+    One transaction on a connection of its own from the pool (never one shared by two operations),
+    with the search path set. After IDLE_EXPIRE_SECONDS without a call, the pool's connections are
+    replaced first: they may have been closed by the server while nobody was listening.
+    """
+    global _search_path, _last_used
     pool = await _get_pool()
-    async with pool.acquire() as conn:
-        if not _search_path:
-            _search_path = await ensure_schema(conn)
-        async with conn.transaction(readonly=readonly):
-            await conn.execute(
-                "SELECT set_config('search_path', $1, true), set_config('statement_timeout', $2, true)",
-                _search_path, STATEMENT_TIMEOUT,
-            )
-            yield conn
+    if _last_used and time.monotonic() - _last_used > IDLE_EXPIRE_SECONDS:
+        await pool.expire_connections()
+    try:
+        async with pool.acquire() as conn:
+            if not _search_path:
+                _search_path = await ensure_schema(conn)
+            async with conn.transaction(readonly=readonly):
+                await conn.execute(
+                    "SELECT set_config('search_path', $1, true), set_config('statement_timeout', $2, true)",
+                    _search_path, STATEMENT_TIMEOUT,
+                )
+                yield conn
+    finally:
+        _last_used = time.monotonic()
 
 
 def _retryable(exc: BaseException) -> bool:
-    """A connection that died while idle (Neon suspended its compute): worth one more try."""
-    if asyncpg is not None and isinstance(
-        exc,
-        (
-            asyncpg.exceptions.ConnectionDoesNotExistError,
-            asyncpg.exceptions.PostgresConnectionError,
-            asyncpg.exceptions.AdminShutdownError,
-            asyncpg.exceptions.CannotConnectNowError,
-        ),
-    ):
-        return True
+    """
+    A connection that died while idle (Neon suspended its compute, pg_terminate_backend): worth one
+    more try on a fresh connection. That includes asyncpg's InternalClientError - a connection whose
+    protocol state was broken by the server's unread goodbye (see IDLE_EXPIRE_SECONDS) - and an
+    InterfaceError that says the connection is closed; not other InterfaceErrors, which are mistakes
+    in the code (wrong arguments, an operation overlapping another) that a retry would only hide.
+    """
+    if asyncpg is not None:
+        errors = asyncpg.exceptions
+        if isinstance(
+            exc,
+            (
+                errors.ConnectionDoesNotExistError,
+                errors.PostgresConnectionError,
+                errors.AdminShutdownError,
+                errors.CannotConnectNowError,
+                errors.InternalClientError,
+            ),
+        ):
+            return True
+        if isinstance(exc, errors.InterfaceError) and "closed" in str(exc).lower():
+            return True
     return isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError))
 
 
@@ -684,7 +716,12 @@ async def _db(operation: Callable[[], Awaitable[Any]], doing: str) -> Any:
             raise
         except Exception as exc:  # noqa: BLE001 - every database failure is worded for the model
             if attempt == 1 and _retryable(exc):
-                _log(f"the database connection was lost ({type(exc).__name__}); trying once more")
+                _log(f"the database connection was lost ({type(exc).__name__}); trying once more on a fresh one")
+                # The pool's other idle connections went with it (a suspended compute closes them
+                # all): replace them, or the retry may be handed the next dead one.
+                if _pool is not None:
+                    with contextlib.suppress(Exception):
+                        await _pool.expire_connections()
                 continue
             if attempt == 1 and _schema_gone(exc) and _search_path:
                 _log(f"memory's tables are gone ({type(exc).__name__}); creating them again")
@@ -718,7 +755,7 @@ def _db_failure(exc: Exception, doing: str) -> ToolError:
     elif isinstance(exc, errors.QueryCanceledError):
         reason = "the database took too long"
     elif isinstance(exc, (OSError, asyncio.TimeoutError, errors.InterfaceError, errors.PostgresConnectionError,
-                          errors.OperatorInterventionError)):
+                          errors.OperatorInterventionError, errors.InternalClientError)):
         reason = "the database could not be reached (a Neon database can take a few seconds to wake up) - try again in a moment"
     elif isinstance(exc, errors.PostgresError):
         reason = f"the database answered {exc.sqlstate}: {(str(exc).splitlines() or [''])[0][:200]}"
@@ -1256,7 +1293,7 @@ async def _check() -> list[str]:
                 people = await conn.fetchval(f"SELECT count(DISTINCT scope) FROM {SCHEMA}.entities")
                 lines.append(f"  tables: {SCHEMA}.entities ({entities} rows), {SCHEMA}.relations ({relations} rows), {people} people")
             else:
-                lines.append(f"  tables: not created yet (the first remember/recall creates them, or --migrate)")
+                lines.append("  tables: not created yet (the first remember/recall creates them, or --migrate)")
             lines.append(
                 "  may create them: "
                 + ("yes" if await conn.fetchval("SELECT has_database_privilege(current_user, current_database(), 'CREATE')") else "NO")
