@@ -8,6 +8,8 @@
 # What the Jarvis brain needs to run
 !requirements.txt
 !*.py
+# mcp_memory.py creates its tables from this file
+!mcp_memory.sql
 !plugins/
 !agents/
 !utils/

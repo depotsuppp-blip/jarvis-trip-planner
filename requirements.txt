@@ -293,8 +293,11 @@ ddgs>=9.0.0
 # it the server still starts, reads PDFs and text, and says what to install for HTML.
 beautifulsoup4>=4.12
 
-# memory (mcp_memory.py) and data (mcp_data.py) need nothing beyond the
-# standard library: both are SQLite through Python's own sqlite3 module.
+# data (mcp_data.py) needs nothing beyond the standard library: SQLite through
+# Python's own sqlite3 module. memory (mcp_memory.py) is a knowledge graph in
+# PostgreSQL + pgvector: asyncpg (above) for the database and the openai
+# package (below) for the extraction (gpt-4o-mini) and the embeddings
+# (text-embedding-3-small). pgvector is a server extension - nothing to pip install.
 
 # --- Presentations (agents/publishing_agent.py) -------------------------
 # The Head of Publishing lays out the slides its writer model makes (GPT-4o

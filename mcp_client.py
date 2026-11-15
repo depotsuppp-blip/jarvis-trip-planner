@@ -23,13 +23,16 @@ the protocol subset used here is small enough to read in one sitting.
 
 BUNDLED SERVERS
 ---------------
-Five servers ship with Jarvis and start with it, with no configuration, no API
-key and no account:
+Five servers ship with Jarvis and start with it, with no configuration; all but
+memory need no API key and no account:
 
     local_fs     mcp_filesystem.py   read files and list folders in the project
     web_search   mcp_websearch.py    search the web (DuckDuckGo)
     fetch        mcp_fetch.py        read a web page or PDF from its URL
-    memory       mcp_memory.py       long-term memory: facts about the person
+    memory       mcp_memory.py       long-term memory: a knowledge graph of the person's
+                                     life in PostgreSQL + pgvector (needs OPENAI_API_KEY
+                                     and a database URL from .env; without them its tools
+                                     answer that memory is not set up)
     data         mcp_data.py         a SQLite workspace: load CSV/JSON, query it
 
 mcp_servers.json lists them too, so they can be seen and changed in one place,
@@ -54,7 +57,7 @@ the format Claude Desktop uses:
     {"mcpServers": {"mock": {"command": "python", "args": ["mock_mcp_server.py"]}}}
 
 Optional per server: "env" (extra variables; ${NAME} is expanded from this
-process), "cwd", "timeout" (seconds per tool call, default 30),
+process), "cwd", "timeout" (seconds per tool call, default 30; 60 for memory),
 "confirm" ("destructive" - the default - asks first unless the tool says it
 is read-only or only adds things, i.e. readOnlyHint or destructiveHint: false;
 "always"; "never"), "user_scoped" (see above; an entry that replaces a bundled
@@ -205,6 +208,7 @@ class _Bundled:
     # minimal (_SAFE_ENV), so a setting from .env reaches it only if named here.
     env: tuple[str, ...] = ()
     user_scoped: bool = False
+    timeout: float = DEFAULT_CALL_TIMEOUT  # seconds per tool call
 
 
 # The servers that ship with Jarvis, each a script next to this file. They run on
@@ -215,7 +219,19 @@ _BUNDLED = (
     _Bundled("local_fs", "mcp_filesystem.py"),
     _Bundled("web_search", "mcp_websearch.py"),
     _Bundled("fetch", "mcp_fetch.py", ("JARVIS_FETCH_ALLOW_PRIVATE", "JARVIS_FETCH_IGNORE_ROBOTS")),
-    _Bundled("memory", "mcp_memory.py", ("JARVIS_DATA_DIR",), user_scoped=True),
+    # memory: its database (the first URL set wins, see mcp_memory.py) and OpenAI for
+    # the extraction and the embeddings. A remember is two OpenAI calls plus the
+    # database - and on the first call, creating the tables - hence the longer wait.
+    _Bundled(
+        "memory",
+        "mcp_memory.py",
+        (
+            "JARVIS_MEMORY_DATABASE_URL", "DIRECT_URL", "DATABASE_URL",
+            "OPENAI_API_KEY", "OPENAI_BASE_URL", "JARVIS_MEMORY_MODEL", "JARVIS_MEMORY_EMBEDDING_MODEL",
+        ),
+        user_scoped=True,
+        timeout=60.0,
+    ),
     _Bundled("data", "mcp_data.py", ("JARVIS_DATA_DIR",), user_scoped=True),
 )
 _BUNDLED_BY_NAME = {b.name: b for b in _BUNDLED}
@@ -238,6 +254,7 @@ def bundled_servers() -> list[ServerConfig]:
             [os.path.join(here, bundled.script)],
             _passed_env(bundled),
             here,
+            timeout=bundled.timeout,
             user_scoped=bundled.user_scoped,
         )
         for bundled in _BUNDLED
@@ -330,8 +347,9 @@ def _read_config_file(path: str) -> tuple[list[ServerConfig], set[str]]:
         claimed.add(name)
 
         # An entry named like a bundled server starts from that server's settings:
-        # the variables it is given and whether it is user-scoped. Without that,
-        # listing "memory" here would quietly give every web user one shared memory.
+        # the variables it is given, whether it is user-scoped and how long a call may
+        # take. Without that, listing "memory" here would quietly give every web user
+        # one shared memory.
         bundled = _BUNDLED_BY_NAME.get(name)
         args = entry.get("args", [])
         args = [_expand(str(a)) for a in args] if isinstance(args, list) else []
@@ -342,10 +360,11 @@ def _read_config_file(path: str) -> tuple[list[ServerConfig], set[str]]:
         user_scoped = scoped if isinstance(scoped, bool) else bool(bundled and bundled.user_scoped)
         cwd = entry.get("cwd")
         cwd = os.path.normpath(os.path.join(base, _expand(str(cwd)))) if cwd else base
+        default_timeout = bundled.timeout if bundled else DEFAULT_CALL_TIMEOUT
         try:
-            timeout = float(entry.get("timeout", DEFAULT_CALL_TIMEOUT))
+            timeout = float(entry.get("timeout", default_timeout))
         except (TypeError, ValueError):
-            timeout = DEFAULT_CALL_TIMEOUT
+            timeout = default_timeout
         confirm = str(entry.get("confirm", "destructive")).lower()
         if confirm not in ("destructive", "always", "never"):
             _log(f"[MCP] {name}: unknown confirm mode {confirm!r}; using 'destructive'.")
