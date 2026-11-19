@@ -4307,6 +4307,38 @@ class LLMBrain:
         """The MCP tool servers and whether each is connected (McpManager.servers); [] when none are configured."""
         return self._mcp.servers() if self._mcp is not None else []
 
+    def capability_specs(self) -> list[ToolSpec]:
+        """
+        all_tool_names as ToolSpecs - the manager's tools and every working agent's, once each -
+        for the System Topology page (system_topology.py), which shows their descriptions.
+        Asked outside a request it includes the owner-only tools; the page decides who sees them.
+        """
+        specs = {tool.name: tool for tool in self._active_tools()}
+        for agent in self._working_agents():
+            for tool in agent.toolkit(self._mcp_tools):
+                specs.setdefault(tool.name, tool)
+        return list(specs.values())
+
+    def mcp_server_notes(self) -> dict[str, str]:
+        """What each connected tool server says it is for (its instructions' first sentence), by server name."""
+        return dict(self._mcp.server_notes()) if self._mcp is not None else {}
+
+    def head_models(self) -> dict[str, list[dict[str, str]]]:
+        """
+        The models behind the heads that call one, by head name (heads_status), each
+        {"provider", "model"} in the order tried: the Head of Creative's image models, the
+        Head of Publishing's slide writer. The other heads call no model.
+        """
+        models: dict[str, list[dict[str, str]]] = {}
+        if self._creative is not None:
+            models["creative"] = [{"provider": "openai", "model": str(m)} for m in getattr(self._creative, "models", [])]
+        writer = getattr(self._publishing, "writer", None) if self._publishing is not None else None
+        if writer is not None:
+            models["publishing"] = [
+                {"provider": str(route.provider.name), "model": str(route.model)} for route in getattr(writer, "routes", [])
+            ]
+        return models
+
     @property
     def all_tool_names(self) -> list[str]:
         """The manager's tools and every working agent's, once each (for /health)."""

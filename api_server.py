@@ -140,6 +140,15 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  401 no_user without the header; 503 not_configured / unavailable when the memory
                  database is not set up or cannot be reached.
 
+    GET    /system/topology -> { "generated_at", "viewer": { "owner", "hidden" }, "orchestrator",
+                                 "providers": [...], "telemetry": { "status": "optimal"|"degraded",
+                                 "active_providers", "total_providers", "total_capabilities" } }
+                 The System Topology page (TripPlanner_Web /jarvis/system): Jarvis, its agents, its
+                 tool servers and its own tools, each with its live status - online, auth_required
+                 (a Google sign-in lacks a scope, a key was refused) or offline - its tools and a few
+                 starter prompts (system_topology.py). Same X-Jarvis-User-Id header as /memory:
+                 401 no_user without it; the owner-only parts are left out for anyone but the owner.
+
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
 the brain remembered from the last one (LLMBrain.set_history). `history`
@@ -218,6 +227,7 @@ import reply_audio
 import request_context
 import rich_reply
 import stt
+import system_topology
 from agents.analytics_agent import XLSX_MIME
 from agents.creative_agent import ARTIFACTS_DIR, ARTIFACTS_URL_PATH
 from agents.publishing_agent import PPTX_MIME
@@ -711,6 +721,32 @@ async def memory_relation_update(relation_id: str, body: RelationUpdate, user_id
 @app.delete("/memory/relations/{relation_id}")
 async def memory_relation_delete(relation_id: str, user_id: MemoryUser = "") -> Any:
     return await _memory(lambda scope: memory_graph.delete_relation(scope, relation_id), user_id)
+
+
+# ---- The System Topology page (system_topology.py) ---------------------------
+
+
+@app.get("/system/topology")
+async def system_topology_view(user_id: MemoryUser = "") -> Any:
+    """
+    What Jarvis can do right now and who does it, for the person named by X-Jarvis-User-Id
+    (see system_topology.py for the shape). The owner sees everything; anyone else does not see
+    the owner-only parts. Read from the brain's live status - no model call, no network call.
+    401 no_user without the header; 503 unavailable when the brain cannot be built.
+    """
+    scope = mcp_client.web_scope(user_id)
+    if not scope:
+        return JSONResponse(status_code=401, content={"code": "no_user", "detail": "Say who is asking (X-Jarvis-User-Id)."})
+    try:
+        brain = await asyncio.to_thread(_get_brain)
+    except Exception as exc:  # noqa: BLE001 - reported as a code; the reason stays in this console
+        print(f"[API] Topology: the brain could not start: {type(exc).__name__}: {exc}")
+        return JSONResponse(status_code=503, content={"code": "unavailable", "detail": "Jarvis could not start."})
+    try:
+        return await asyncio.to_thread(system_topology.build, brain, scope == "owner")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[API] Topology failed: {type(exc).__name__}: {exc}")
+        return JSONResponse(status_code=500, content={"code": "server", "detail": "The topology could not be read."})
 
 
 # Speech-to-text runs OUTSIDE the brain's turn (on a worker thread), so a slow upload to the STT

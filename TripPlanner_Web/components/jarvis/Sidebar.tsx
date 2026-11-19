@@ -2,7 +2,7 @@
 
 import { memo, useEffect, useRef } from "react";
 import Link from "next/link";
-import { Network, PanelLeftClose, PanelLeftOpen, Plus, X } from "lucide-react";
+import { Network, PanelLeftClose, PanelLeftOpen, Plus, Waypoints, X } from "lucide-react";
 import { useChatActions, useShell, useShellActions } from "@/lib/jarvis/JarvisProvider";
 import { AccountRow } from "./AccountRow";
 import { AgentRail, AgentStatusList } from "./AgentStatusList";
@@ -124,6 +124,15 @@ export const Sidebar = memo(function Sidebar() {
               Memory
             </Link>
 
+            {/* What Jarvis can do and who does it, live: agents, tool servers, tools (app/jarvis/system). */}
+            <Link
+              href="/jarvis/system"
+              className={`flex min-h-10 w-full items-center gap-2 rounded-md px-3 text-sm font-medium text-slate-700 transition-colors duration-150 hover:bg-white/70 hover:text-slate-900 ${focusRing}`}
+            >
+              <Waypoints className="size-4" aria-hidden="true" />
+              System Topology
+            </Link>
+
             <div className="mt-6">
               <SessionList onPick={shell.closeDrawer} />
             </div>
@@ -165,6 +174,9 @@ export const Sidebar = memo(function Sidebar() {
             </button>
             <Link href="/jarvis/memory" aria-label="Memory" title="Memory" className={iconButton}>
               <Network className="size-5" aria-hidden="true" />
+            </Link>
+            <Link href="/jarvis/system" aria-label="System Topology" title="System Topology" className={iconButton}>
+              <Waypoints className="size-5" aria-hidden="true" />
             </Link>
             <AgentRail />
           </div>

@@ -201,6 +201,8 @@ class SpecialistAgent:
             "active": self.can_work(mcp_tools),
             "routes": [route.status(now) for route in self.routes],
             "tools": [tool.name for tool in self.toolkit(mcp_tools)],
+            # The tool servers it works through, connected or not (the System Topology page draws the link).
+            "servers": list(self.servers),
         }
 
     def actions_note(self) -> str:

@@ -56,7 +56,7 @@ const LABEL_HALO = "rgba(6, 7, 11, 0.86)";
 
 // ---- shared geometry and textures (made once, in the browser) ---------------------------------
 
-interface Shared {
+export interface Shared {
   sphere: SphereGeometry;
   hit: SphereGeometry;
   globe: BufferGeometry;
@@ -169,7 +169,8 @@ function checkTexture(): CanvasTexture {
   return texture(element);
 }
 
-function resources(): Shared {
+/** The shared geometry and textures (made once, in the browser); the System Topology scene draws with them too. */
+export function resources(): Shared {
   shared ??= {
     sphere: new SphereGeometry(1, 40, 28),
     hit: new SphereGeometry(1, 10, 8),
@@ -216,7 +217,7 @@ void main() {
 }
 `;
 
-function rimMaterial(additive: boolean): ShaderMaterial {
+export function rimMaterial(additive: boolean): ShaderMaterial {
   return new ShaderMaterial({
     uniforms: UniformsUtils.merge([
       UniformsLib.fog,
@@ -500,7 +501,7 @@ function family(): string {
 }
 
 /** A crisp text label at twice its CSS size, on a dark halo; `width`/`height` are its CSS size. */
-function labelTexture(text: string, color: string, weight: number, px: number) {
+export function labelTexture(text: string, color: string, weight: number, px: number) {
   const scale = 2 * Math.max(1, Math.min(2, window.devicePixelRatio || 1));
   const font = `${weight} ${px * scale}px ${family()}`;
   const [probe, measure] = canvas(4, 4);

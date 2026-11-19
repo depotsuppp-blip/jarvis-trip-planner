@@ -18,6 +18,9 @@ import { isFocalMode } from "@/lib/jarvis/types";
 import { AttachmentChip } from "./AttachmentChip";
 import { focusRing, thinScroll } from "./styles";
 
+// The longest prompt a ?prompt= link may put in the field (the brain takes up to 4000 characters).
+const PROMPT_PARAM_MAX = 2000;
+
 /**
  * The dock at the bottom centre: the message field, Send, Attach and Talk in ONE
  * ruled control - and every control of a turn in progress. Jarvis's face is the
@@ -176,24 +179,38 @@ export const Composer = memo(function Composer() {
 
   // Edit on a message: its words replace the draft, and the field takes the keyboard with the
   // caret at the end - at once, or (switched off while Jarvis answers) when the turn is over.
-  useEffect(
-    () =>
-      onDraftRequest((text) => {
-        setDraft(text);
-        setFileProblem(null);
-        window.requestAnimationFrame(() => {
-          const input = field.current;
-          if (!input || input.disabled) {
-            focusFieldWhenFree.current = true;
-            return;
-          }
-          input.focus();
-          input.setSelectionRange(input.value.length, input.value.length);
-          input.scrollTop = input.scrollHeight; // a long message: the caret's end in view
-        });
-      }),
-    [onDraftRequest]
-  );
+  const putInField = useCallback((text: string) => {
+    setDraft(text);
+    setFileProblem(null);
+    window.requestAnimationFrame(() => {
+      const input = field.current;
+      if (!input || input.disabled) {
+        focusFieldWhenFree.current = true;
+        return;
+      }
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      input.scrollTop = input.scrollHeight; // a long message: the caret's end in view
+    });
+  }, []);
+
+  useEffect(() => onDraftRequest(putInField), [onDraftRequest, putInField]);
+
+  // /jarvis?prompt=...: a Quick Action on the System Topology page opened the chat with words
+  // to send. They wait in the field like an Edit - never sent by themselves, since a link must
+  // not speak for the person - and the address loses the parameter, so a reload does not put
+  // them back.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const prompt = url.searchParams.get("prompt");
+    if (prompt === null) return;
+    url.searchParams.delete("prompt");
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+    const text = prompt.replace(/\r\n?/g, "\n").trim().slice(0, PROMPT_PARAM_MAX);
+    // Read once from the address on arrival, like the remembered sidebar choice.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (text) putInField(text);
+  }, [putInField]);
 
   // A turn is over and the control that held focus is gone or was switched off (Cancel, Stop
   // generating, or the field while it waited): put the keyboard back where the next turn starts - Talk after a
