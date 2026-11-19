@@ -1,7 +1,8 @@
 "use client";
 
 import { memo, useEffect, useRef } from "react";
-import { PanelLeftClose, PanelLeftOpen, Plus, X } from "lucide-react";
+import Link from "next/link";
+import { Network, PanelLeftClose, PanelLeftOpen, Plus, X } from "lucide-react";
 import { useChatActions, useShell, useShellActions } from "@/lib/jarvis/JarvisProvider";
 import { AccountRow } from "./AccountRow";
 import { AgentRail, AgentStatusList } from "./AgentStatusList";
@@ -114,6 +115,15 @@ export const Sidebar = memo(function Sidebar() {
               New session
             </button>
 
+            {/* What Jarvis remembers about the person: the memory graph (app/jarvis/memory). */}
+            <Link
+              href="/jarvis/memory"
+              className={`mt-1 flex min-h-10 w-full items-center gap-2 rounded-md px-3 text-sm font-medium text-slate-700 transition-colors duration-150 hover:bg-white/70 hover:text-slate-900 ${focusRing}`}
+            >
+              <Network className="size-4" aria-hidden="true" />
+              Memory
+            </Link>
+
             <div className="mt-6">
               <SessionList onPick={shell.closeDrawer} />
             </div>
@@ -153,6 +163,9 @@ export const Sidebar = memo(function Sidebar() {
             >
               <Plus className="size-5" aria-hidden="true" />
             </button>
+            <Link href="/jarvis/memory" aria-label="Memory" title="Memory" className={iconButton}>
+              <Network className="size-5" aria-hidden="true" />
+            </Link>
             <AgentRail />
           </div>
 

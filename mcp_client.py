@@ -277,7 +277,16 @@ def caller_scope() -> str:
     context = request_context.current()
     if context is None or not context.is_web:
         return "owner"
-    user = context.user_id.strip()
+    return web_scope(context.user_id)
+
+
+def web_scope(user_id: str) -> str:
+    """
+    The scope of a person signed in to the web app (their TripPlanner_Web User.id): "owner" for
+    JARVIS_OWNER_USER_ID, else "user:<id>"; "" for no id. caller_scope() uses it for the tools,
+    and api_server.py's /memory endpoints for the Memory page, so both see the same memory.
+    """
+    user = user_id.strip()
     if not user:
         return ""
     owner = os.environ.get("JARVIS_OWNER_USER_ID", "").strip()

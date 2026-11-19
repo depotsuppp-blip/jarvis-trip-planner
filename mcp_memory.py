@@ -41,6 +41,10 @@ ONE MEMORY PER PERSON. Every row belongs to a caller scope ("owner", or
 adds to each call - see mcp_stdio.py - and every query filters on it. One
 person's facts never show up in another person's recall.
 
+THE PERSON CAN SEE IT TOO. memory_graph.py reuses this file's connection pool, retries
+and wording inside api_server.py to serve the web hub's Memory page: the whole graph of
+one scope, and editing or deleting its entries and relations by hand.
+
 SAFETY. A text that looks like it holds a secret - a payment card or Thai ID
 number, an API key, a private key, "password: ..." - is refused before it is
 sent anywhere, and so is an extracted entity that does. One person's memory is
@@ -606,27 +610,54 @@ _last_used = 0.0
 IDLE_EXPIRE_SECONDS = 60.0
 
 
+_pool_lock: Optional[asyncio.Lock] = None
+
+
+class NoMemoryYet(ToolError):
+    """Memory's tables are not in the database yet, and the caller asked not to create them."""
+
+
 async def _get_pool() -> Any:
-    global _pool, _settings
+    # This server answers one call at a time, but api_server.py (memory_graph.py) shares this
+    # code and serves requests side by side: two first requests must not build two pools.
+    global _pool, _settings, _pool_lock
     if _pool is None:
-        _settings = db_settings()
-        _pool = await asyncpg.create_pool(
-            dsn=_settings.dsn,
-            ssl=_settings.ssl,
-            min_size=0,                            # no connection until the first call
-            max_size=2,
-            max_inactive_connection_lifetime=90,   # Neon suspends an idle compute and drops its connections
-            statement_cache_size=0,                # safe behind PgBouncer (Neon's "-pooler" host)
-            timeout=_settings.timeout,
-            command_timeout=30,
-            server_settings={"application_name": APPLICATION_NAME},
-        )
+        if _pool_lock is None:
+            _pool_lock = asyncio.Lock()
+        async with _pool_lock:
+            if _pool is None:
+                _settings = db_settings()
+                _pool = await asyncpg.create_pool(
+                    dsn=_settings.dsn,
+                    ssl=_settings.ssl,
+                    min_size=0,                            # no connection until the first call
+                    max_size=2,
+                    max_inactive_connection_lifetime=90,   # Neon suspends an idle compute and drops its connections
+                    statement_cache_size=0,                # safe behind PgBouncer (Neon's "-pooler" host)
+                    timeout=_settings.timeout,
+                    command_timeout=30,
+                    server_settings={"application_name": APPLICATION_NAME},
+                )
     return _pool
 
 
-async def ensure_schema(conn: Any, *, force: bool = False) -> str:
-    """Creates the schema and tables if missing (mcp_memory.sql); returns the search_path to use."""
+async def close_pool() -> None:
+    """Closes the connection pool (api_server.py at shutdown); the next call opens a new one."""
+    global _pool
+    pool, _pool = _pool, None
+    if pool is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(pool.close(), 5)
+
+
+async def ensure_schema(conn: Any, *, force: bool = False, create: bool = True) -> str:
+    """
+    Creates the schema and tables if missing (mcp_memory.sql); returns the search_path to use.
+    With create=False nothing is created: tables that are not there yet raise NoMemoryYet.
+    """
     state = await conn.fetchrow(_STATE_SQL)
+    if not create and (not state["ready"] or not state["vector_schema"]):
+        raise NoMemoryYet("Nothing has been remembered yet: memory's tables are not in the database.")
     if force or not state["ready"] or not state["vector_schema"]:
         try:
             with open(SQL_FILE, "r", encoding="utf-8") as handle:
@@ -647,11 +678,13 @@ async def ensure_schema(conn: Any, *, force: bool = False) -> str:
 
 
 @contextlib.asynccontextmanager
-async def _transaction(*, readonly: bool = False) -> Any:
+async def _transaction(*, readonly: bool = False, create: bool = True) -> Any:
     """
     One transaction on a connection of its own from the pool (never one shared by two operations),
     with the search path set. After IDLE_EXPIRE_SECONDS without a call, the pool's connections are
     replaced first: they may have been closed by the server while nobody was listening.
+    create=False: never create memory's tables - NoMemoryYet when they are not there (the web
+    hub's Memory page only looks at and edits what exists, see memory_graph.py).
     """
     global _search_path, _last_used
     pool = await _get_pool()
@@ -660,7 +693,7 @@ async def _transaction(*, readonly: bool = False) -> Any:
     try:
         async with pool.acquire() as conn:
             if not _search_path:
-                _search_path = await ensure_schema(conn)
+                _search_path = await ensure_schema(conn, create=create)
             async with conn.transaction(readonly=readonly):
                 await conn.execute(
                     "SELECT set_config('search_path', $1, true), set_config('statement_timeout', $2, true)",

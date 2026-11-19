@@ -23,6 +23,7 @@
     "pg": "^8.23.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "react-force-graph-2d": "^1.29.2",
     "thinking-orbs": "^0.3.2",
     "zod": "^4.5.4"
   },

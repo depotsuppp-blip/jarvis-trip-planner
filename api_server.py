@@ -105,6 +105,27 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  (TripPlanner_Web/app/artifacts/[name]/route.ts), for the signed-in person
                  whose chat it is in. 404 for a file that is not there.
 
+    The Memory page (TripPlanner_Web /jarvis/memory) - Jarvis's long-term memory of one
+    person, the knowledge graph mcp_memory.py keeps, to look at and correct (memory_graph.py).
+    Every request names the signed-in person in the header X-Jarvis-User-Id (TripPlanner_Web's
+    User.id; JARVIS_OWNER_USER_ID's is the owner, whose memory is also the voice's - see
+    mcp_client.web_scope) and only ever reaches that person's memory: someone else's entry or
+    relation is a 404, exactly like one that does not exist. Errors are { "code", "detail" }.
+    GET    /memory/graph -> { "nodes": [{ "id", "name", "type", "description" }],
+                              "links": [{ "id", "source", "target", "relation_type", "weight" }] }
+                 source and target are node ids. Empty when nothing has been remembered yet
+                 (the tables are never created from here).
+    PATCH  /memory/entities/{entity_id}  { "name"?, "type"?, "description"? }
+              -> { "node": {...}, "reembedded": true }   when the name, type or description
+                 changed, the entry is embedded again (text-embedding-3-small) so recall finds it
+                 by its new words; nothing is saved if that fails (503 embedding_failed). 409
+                 name_taken, 400 invalid / me_locked ("me" keeps its name) / reserved / refused (a
+                 secret).
+    DELETE /memory/entities/{entity_id} -> { "deleted": id, "links": [ids of its relations, deleted too] }
+    DELETE /memory/relations/{relation_id} -> { "deleted": id }   both entries stay.
+                 401 no_user without the header; 503 not_configured / unavailable when the memory
+                 database is not set up or cannot be reached.
+
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
 the brain remembered from the last one (LLMBrain.set_history). `history`
@@ -153,7 +174,11 @@ Things that differ from the voice assistant, deliberately:
   message the owner's own LINE (LINE_TARGET_USER_ID) and sending the daily
   briefing there is its job - and it is capped per task.
 * Bound to loopback with no authentication: anything on this machine can
-  call it, so do not expose the port.
+  call it, so do not expose the port. Like /chat's user_id, the /memory
+  endpoints' X-Jarvis-User-Id is taken as given - the web app sets it from the
+  session. A browser page cannot send it here: CORS allows only GET and POST
+  with Content-Type, so a page on another origin cannot add the header or
+  PATCH / DELETE at all.
 """
 
 from __future__ import annotations
@@ -165,14 +190,16 @@ import threading
 from contextlib import aclosing, asynccontextmanager
 from typing import Annotated, Any, AsyncIterator, Literal, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 import approvals
 import attachments
+import mcp_client
+import memory_graph
 import reply_audio
 import request_context
 import rich_reply
@@ -278,6 +305,7 @@ async def _lifespan(_app: FastAPI):
     # Same idea for the brain: its MCP tool servers take a few seconds to start.
     threading.Thread(target=_warm_brain, name="jarvis-brain-warmup", daemon=True).start()
     yield
+    await memory_graph.close()
 
 
 app = FastAPI(title="Jarvis brain", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -591,6 +619,65 @@ def decide_approval(approval_id: str, body: ApprovalDecision) -> dict:
     if outcome == approvals.FORBIDDEN:
         raise HTTPException(status_code=403, detail="That request was not sent to you.")
     return {"ok": True, "decision": body.decision}
+
+
+# ---- The Memory page (memory_graph.py) ---------------------------------------
+# Plain async endpoints on the server's own event loop, where memory_graph.py keeps its
+# connection pool; they never wait for the brain, so a long turn does not hold them up.
+
+
+class EntityUpdate(BaseModel):
+    """PATCH /memory/entities/{id}: only the fields sent change. memory_graph.py checks the real limits."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(default=None, max_length=400)
+    type: Optional[str] = Field(default=None, max_length=200)
+    description: Optional[str] = Field(default=None, max_length=1000)
+
+
+# The signed-in person, as the web app names them (see the top of this file).
+MemoryUser = Annotated[str, Header(alias="X-Jarvis-User-Id", max_length=128)]
+
+
+def _memory_failure(exc: memory_graph.GraphError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status, content={"code": exc.code, "detail": exc.message})
+
+
+async def _memory(call: Any, user_id: str) -> Any:
+    """Runs a memory_graph call for the person named by the header; its refusals as { code, detail }."""
+    scope = mcp_client.web_scope(user_id)
+    if not scope:
+        return JSONResponse(status_code=401, content={"code": "no_user", "detail": "Say whose memory this is (X-Jarvis-User-Id)."})
+    try:
+        return await call(scope)
+    except memory_graph.GraphError as exc:
+        return _memory_failure(exc)
+
+
+@app.get("/memory/graph")
+async def memory_graph_view(user_id: MemoryUser = "") -> Any:
+    return await _memory(memory_graph.graph, user_id)
+
+
+@app.patch("/memory/entities/{entity_id}")
+async def memory_entity_update(entity_id: str, body: EntityUpdate, user_id: MemoryUser = "") -> Any:
+    return await _memory(
+        lambda scope: memory_graph.update_entity(
+            scope, entity_id, name=body.name, type=body.type, description=body.description
+        ),
+        user_id,
+    )
+
+
+@app.delete("/memory/entities/{entity_id}")
+async def memory_entity_delete(entity_id: str, user_id: MemoryUser = "") -> Any:
+    return await _memory(lambda scope: memory_graph.delete_entity(scope, entity_id), user_id)
+
+
+@app.delete("/memory/relations/{relation_id}")
+async def memory_relation_delete(relation_id: str, user_id: MemoryUser = "") -> Any:
+    return await _memory(lambda scope: memory_graph.delete_relation(scope, relation_id), user_id)
 
 
 # Speech-to-text runs OUTSIDE the brain's turn (on a worker thread), so a slow upload to the STT
