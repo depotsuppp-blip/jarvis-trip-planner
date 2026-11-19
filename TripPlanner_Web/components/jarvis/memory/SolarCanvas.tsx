@@ -9,15 +9,17 @@ import {
   isMe,
   RELATION_DASH,
   relationLabel,
-  TYPE_GROUPS,
   type TypeGroupId,
 } from "@/lib/jarvis/memory";
 import {
-  endedEntries,
+  colorOf,
   endId,
+  ENTRY_STATUS_LABEL,
   orbitWord,
+  SUN_COLORS,
   type GraphLink,
   type GraphNode,
+  type Looks,
   type Orbits,
   type SolarGraph,
 } from "@/lib/jarvis/memoryOrbits";
@@ -28,20 +30,23 @@ import {
  * touches `window` as it loads).
  *
  *   space     deep #060913 with a still starfield (its own canvas, drawn once per size) and
- *             faint concentric rings, one per orbit; the outer orbit's ring is dotted
- *   the Sun   the person's own entry, pinned at the centre: a white-gold sphere in a corona,
+ *             crisp concentric rings, one per orbit (blue at 22%, 1.2px); the outer orbit's is dotted
+ *   the Sun   the person's own entry, pinned at the centre: a golden-amber sphere in a corona,
  *             with a slow breathing aura (a DOM layer animated on the compositor - the canvas
  *             itself stays still - and not at all under reduced motion)
- *   planets   entries one relation away, glowing spheres on the inner orbit
- *   moons     two relations away or more, smaller glowing orbs further out
- *   relations translucent lines with an arrow at their target; a fact that holds (active)
- *             carries a faint glow, one that ended is dimmer and dashed (completed) or dotted
- *             (archived), so time reads in the line itself
+ *   planets   entries one relation away, glowing spheres on the inner orbit, each in its own
+ *             signature colour; its moons share it, a little lighter (lib/jarvis/memoryOrbits.ts)
+ *   moons     two relations away or more, smaller and softer orbs further out
+ *   status    on the orb itself, from its main fact: Active glows at full strength; Done glows
+ *             calmer and wears an emerald check badge on its top-right edge and a faint emerald
+ *             ring; Archived is greyed, at 35%, inside a dashed ring
+ *   relations translucent lines with an arrow at their target; a fact that holds carries a faint
+ *             glow, one that ended is dimmer and dashed (completed) or dotted (archived)
  *
  * The layout is still: d3-force's forceRadial holds every entry on its orbit (by hops from the
- * centre - lib/jarvis/memoryOrbits.ts), and the simulation settles in warm-up ticks before the
- * first frame, so nothing turns, drifts or circles. Pointing at an entry (or opening it) lights
- * it, its relations and its neighbours and dims the rest.
+ * centre), and the simulation settles in warm-up ticks before the first frame, so nothing turns,
+ * drifts or circles. Pointing at an entry (or opening it) lights it, its relations and its
+ * neighbours and dims the rest.
  *
  * The library's own hover tooltip is switched off (`nodeLabel={() => ""}`): it writes its text
  * as HTML, and names come from what people said. This component's tooltip is plain text.
@@ -72,6 +77,8 @@ export interface SolarCanvasProps {
   graph: SolarGraph;
   /** computeOrbits(graph): each entry's orbit, the rings, the neighbours. */
   orbits: Orbits;
+  /** computeLooks(graph, orbits): each entry's colour family and status. */
+  looks: Looks;
   /** Bumped when an entry's words or a relation's status change in place, so the canvas repaints. */
   revision: number;
   selectedId: string | null;
@@ -89,9 +96,10 @@ export interface SolarCanvasProps {
 
 const SPACE = "#060913";
 const LABEL_HALO = "rgba(6, 9, 19, 0.9)";
-const RING = "rgba(148, 163, 184, 0.12)";
-const RING_DRIFT = "rgba(148, 163, 184, 0.09)";
-const TEXT_SUN = "#fff4dc";
+const RING = "rgba(120, 160, 255, 0.22)";
+const RING_DRIFT = "rgba(120, 160, 255, 0.16)";
+const RING_WIDTH = 1.2;
+const TEXT_SUN = "#fff3b0";
 const TEXT_PLANET = "#f1f5fb";
 const TEXT_MOON = "#c9d3e3";
 const TEXT_LINK = "#a3b0c6";
@@ -101,6 +109,14 @@ const LINK_LIT_ENDED = "rgba(203, 213, 225, 0.62)";
 const LINK_DARK = "rgba(148, 163, 184, 0.05)";
 const GLOW_NEAR = "rgba(150, 180, 255, 0.22)";
 const GLOW_FAR = "rgba(120, 150, 255, 0.075)";
+// Done: an emerald badge with a dark check (7.6:1 on the badge), an emerald ring round the orb.
+const DONE = "#10B981";
+const DONE_INK = "#022C22";
+const DONE_RING = "rgba(16, 185, 129, 0.6)";
+// Archived: greyed towards slate, inside a dashed ring.
+const ARCHIVED_GREY = "#64748B";
+const ARCHIVED_RING = "rgba(148, 163, 184, 0.9)";
+const ARCHIVED_ALPHA = 0.35;
 const FONT = "Geist, Arial, sans-serif";
 
 const SUN_RADIUS = 17;
@@ -137,11 +153,12 @@ function rgbOf(hex: string): [number, number, number] {
   return [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16)) as [number, number, number];
 }
 
-function mix(hex: string, other: string, amount: number): string {
-  const a = rgbOf(hex);
+/** `hex` moved `amount` (0-1) towards `other`, as hex. */
+function blend(hex: string, other: string, amount: number): string {
   const b = rgbOf(other);
-  const [r, g, bl] = a.map((value, index) => Math.round(value + (b[index] - value) * amount));
-  return `rgb(${r}, ${g}, ${bl})`;
+  return `#${rgbOf(hex)
+    .map((value, index) => Math.round(value + (b[index] - value) * amount).toString(16).padStart(2, "0"))
+    .join("")}`;
 }
 
 interface Tint {
@@ -151,22 +168,22 @@ interface Tint {
   rgba: (alpha: number) => string;
 }
 
-// Each type's sphere: a lit side (towards the upper left), its colour, and a side in shadow.
-const TINTS = new Map<TypeGroupId, Tint>(
-  TYPE_GROUPS.map((group) => {
-    const [r, g, b] = rgbOf(group.color);
-    return [
-      group.id,
-      {
-        base: group.color,
-        light: mix(group.color, "#ffffff", 0.6),
-        shade: mix(group.color, SPACE, 0.5),
-        rgba: (alpha: number) => `rgba(${r}, ${g}, ${b}, ${alpha})`,
-      },
-    ];
-  }),
-);
-const tintOf = (type: string): Tint => TINTS.get(groupOf(type)) ?? (TINTS.get("other") as Tint);
+// A sphere in one colour: a lit side (towards the upper left), the colour, a side in shadow.
+const TINTS = new Map<string, Tint>();
+function tintOf(color: string): Tint {
+  let tint = TINTS.get(color);
+  if (!tint) {
+    const [r, g, b] = rgbOf(color);
+    tint = {
+      base: color,
+      light: blend(color, "#ffffff", 0.6),
+      shade: blend(color, SPACE, 0.5),
+      rgba: (alpha: number) => `rgba(${r}, ${g}, ${b}, ${alpha})`,
+    };
+    TINTS.set(color, tint);
+  }
+  return tint;
+}
 
 /** An entry's radius in graph units: the Sun, then planets and moons by how many relations they have. */
 function nodeRadius(node: GraphNode, orbits: Orbits): number {
@@ -177,20 +194,23 @@ function nodeRadius(node: GraphNode, orbits: Orbits): number {
   return 3.8 + Math.min(2.6, links * 0.9);
 }
 
+const [SUN_R, SUN_G, SUN_B] = rgbOf(SUN_COLORS.body);
+const [RIM_R, RIM_G, RIM_B] = rgbOf(SUN_COLORS.rim);
+
+/** The Sun: a golden-amber sphere (#FFF3B0 core, #FFB703, an #E85D04 limb) in an amber corona. */
 function drawSun(ctx: CanvasRenderingContext2D, x: number, y: number, r: number) {
   const corona = ctx.createRadialGradient(x, y, r * 0.6, x, y, r * 3.4);
-  corona.addColorStop(0, "rgba(255, 214, 140, 0.42)");
-  corona.addColorStop(0.35, "rgba(255, 170, 80, 0.16)");
-  corona.addColorStop(1, "rgba(255, 140, 60, 0)");
+  corona.addColorStop(0, `rgba(${SUN_R}, ${SUN_G}, ${SUN_B}, 0.42)`);
+  corona.addColorStop(0.35, `rgba(${RIM_R}, ${RIM_G}, ${RIM_B}, 0.16)`);
+  corona.addColorStop(1, `rgba(${RIM_R}, ${RIM_G}, ${RIM_B}, 0)`);
   ctx.fillStyle = corona;
   ctx.beginPath();
   ctx.arc(x, y, r * 3.4, 0, 2 * Math.PI);
   ctx.fill();
   const body = ctx.createRadialGradient(x - r * 0.28, y - r * 0.32, r * 0.1, x, y, r);
-  body.addColorStop(0, "#fffdf4");
-  body.addColorStop(0.4, "#ffe6a3");
-  body.addColorStop(0.82, "#ffb547");
-  body.addColorStop(1, "#ff8f3a");
+  body.addColorStop(0, SUN_COLORS.core);
+  body.addColorStop(0.62, SUN_COLORS.body);
+  body.addColorStop(1, SUN_COLORS.rim);
   ctx.fillStyle = body;
   ctx.beginPath();
   ctx.arc(x, y, r, 0, 2 * Math.PI);
@@ -222,6 +242,47 @@ function drawOrb(ctx: CanvasRenderingContext2D, x: number, y: number, r: number,
   ctx.beginPath();
   ctx.arc(x, y, r, 0, 2 * Math.PI);
   ctx.fill();
+}
+
+/** Done: a faint emerald ring round the orb and a check badge on its top-right edge. */
+function drawDone(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, scale: number) {
+  ctx.beginPath();
+  ctx.arc(x, y, r + 2.4 / scale, 0, 2 * Math.PI);
+  ctx.lineWidth = 1.1 / scale;
+  ctx.strokeStyle = DONE_RING;
+  ctx.stroke();
+  // At least 4.5px across on screen, never larger than most of the orb.
+  const b = Math.min(Math.max(r * 0.5, 4.5 / scale), r * 0.8);
+  const bx = x + r * 0.72;
+  const by = y - r * 0.72;
+  ctx.fillStyle = SPACE;
+  ctx.beginPath();
+  ctx.arc(bx, by, b + 1 / scale, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.fillStyle = DONE;
+  ctx.beginPath();
+  ctx.arc(bx, by, b, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(bx - b * 0.45, by + b * 0.02);
+  ctx.lineTo(bx - b * 0.12, by + b * 0.36);
+  ctx.lineTo(bx + b * 0.48, by - b * 0.34);
+  ctx.lineWidth = Math.max(b * 0.28, 0.9 / scale);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = DONE_INK;
+  ctx.stroke();
+}
+
+/** Archived: a muted dashed ring round the (already greyed and faded) orb. */
+function drawArchived(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, scale: number) {
+  ctx.beginPath();
+  ctx.arc(x, y, r + 3 / scale, 0, 2 * Math.PI);
+  ctx.setLineDash([2.5 / scale, 2.5 / scale]);
+  ctx.lineWidth = 1 / scale;
+  ctx.strokeStyle = ARCHIVED_RING;
+  ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 /**
@@ -351,6 +412,7 @@ function paintSky(canvas: HTMLCanvasElement, width: number, height: number) {
 export default function SolarCanvas({
   graph,
   orbits,
+  looks,
   revision,
   selectedId,
   matchIds,
@@ -469,10 +531,6 @@ export default function SolarCanvas({
     return bends;
   }, [graph]);
 
-  // Entries whose every relation ended: dimmer, without their glow. revision: a status changed in place.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const ended = useMemo(() => endedEntries(graph.links), [graph, revision]);
-
   const radiusOf = useCallback((node: GraphNode) => nodeRadius(node, orbits), [orbits]);
   const visible = useCallback(
     (node: GraphNode) => node.id === orbits.centerId || group === "all" || groupOf(node.type) === group,
@@ -501,15 +559,20 @@ export default function SolarCanvas({
     (link: GraphLink) => matchIds !== null && (!matchIds.has(endId(link.source)) || !matchIds.has(endId(link.target))),
     [matchIds],
   );
-  /** How strongly an entry is drawn: dimmed outside the focus or the search, softer once its facts ended. */
+  /** Dimmed: outside the lit-up entry's neighbourhood, or not matched by the search. */
+  const dimmed = useCallback(
+    (id: string) => (lit !== null && !lit.has(id)) || (matchIds !== null && !matchIds.has(id)),
+    [lit, matchIds],
+  );
+  /** How strongly an entry is drawn: dimmed outside the focus or the search; an archived one recedes to 35%. */
   const alphaOf = useCallback(
     (id: string) => {
-      if (lit !== null && !lit.has(id)) return 0.12;
-      if (matchIds !== null && !matchIds.has(id)) return 0.18;
-      if (ended.has(id) && lit === null && id !== orbits.centerId) return 0.5;
+      if (lit !== null && !lit.has(id)) return 0.1;
+      if (matchIds !== null && !matchIds.has(id)) return 0.16;
+      if (id !== orbits.centerId && looks.status.get(id) === "archived") return lit !== null ? 0.6 : ARCHIVED_ALPHA;
       return 1;
     },
-    [lit, matchIds, ended, orbits.centerId],
+    [lit, matchIds, looks, orbits.centerId],
   );
 
   // ---- the canvas API the page drives --------------------------------------------------------
@@ -592,12 +655,22 @@ export default function SolarCanvas({
       const inFocus = lit !== null && lit.has(node.id);
       ctx.globalAlpha = alpha;
 
-      if (kind === "sun" && isMe(node)) {
+      if (kind === "sun") {
+        // The person's own Sun; with no "me", the most connected entry holds the centre, smaller.
         drawSun(ctx, node.x, node.y, r);
       } else {
-        // A fact that holds glows; an entry whose facts all ended, or one dimmed, does not.
-        const glow = ended.has(node.id) || alpha < 1 ? 0 : selected || hover || inFocus ? 0.58 : kind === "moon" ? 0.26 : 0.36;
-        drawOrb(ctx, node.x, node.y, r, tintOf(node.type), glow, scale);
+        // Status on the orb itself: Active glows in full, Done calmer with its badge, Archived
+        // greyed without a glow inside a dashed ring. Nothing dimmed glows.
+        const state = looks.status.get(node.id) ?? "active";
+        const color = colorOf(node.id, orbits, looks);
+        const strong = selected || hover || inFocus;
+        const glow =
+          state === "archived" || dimmed(node.id)
+            ? 0
+            : (strong ? 0.58 : kind === "moon" ? 0.24 : 0.36) * (state === "completed" ? 0.45 : 1);
+        drawOrb(ctx, node.x, node.y, r, tintOf(state === "archived" ? blend(color, ARCHIVED_GREY, 0.62) : color), glow, scale);
+        if (state === "completed") drawDone(ctx, node.x, node.y, r, scale);
+        else if (state === "archived") drawArchived(ctx, node.x, node.y, r, scale);
       }
       if (selected || hover) {
         ctx.beginPath();
@@ -652,7 +725,7 @@ export default function SolarCanvas({
     },
     // revision: an entry's words changed in place.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [orbits, radiusOf, selectedId, hovered, alphaOf, lit, ended, matchIds, labels, revision],
+    [orbits, looks, radiusOf, selectedId, hovered, alphaOf, dimmed, lit, matchIds, labels, revision],
   );
 
   const paintPointerArea = useCallback(
@@ -707,7 +780,7 @@ export default function SolarCanvas({
       labelBoxes.current = [];
       nameBoxes.current = [];
       ctx.save();
-      ctx.lineWidth = 1 / scale;
+      ctx.lineWidth = RING_WIDTH / scale;
       orbits.radii.forEach((radius, ring) => {
         if (ring === 0) return;
         const drifting = ring === orbits.driftRing;
@@ -827,6 +900,10 @@ export default function SolarCanvas({
 
   const hoveredInfo = hovered ? orbits.byId.get(hovered.id) : undefined;
   const hoveredCount = hovered ? (orbits.degree.get(hovered.id) ?? 0) : 0;
+  const hoveredStatus = hovered && hoveredInfo?.kind !== "sun" ? (looks.status.get(hovered.id) ?? "active") : "active";
+  // A moon names the planet whose family it is in.
+  const hoveredFamily =
+    hovered && hoveredInfo?.kind === "moon" ? (nodeById.get(looks.family.get(hovered.id) ?? "") ?? null) : null;
 
   return (
     <div ref={box} className="absolute inset-0 overflow-hidden" onPointerMove={onPointerMove} onPointerLeave={() => setHovered(null)}>
@@ -842,7 +919,7 @@ export default function SolarCanvas({
           className="size-full rounded-full"
           style={{
             background:
-              "radial-gradient(circle, rgba(255, 210, 130, 0.34) 0%, rgba(255, 160, 75, 0.15) 30%, rgba(255, 130, 60, 0.05) 52%, rgba(255, 130, 60, 0) 70%)",
+              "radial-gradient(circle, rgba(255, 183, 3, 0.36) 0%, rgba(232, 93, 4, 0.16) 30%, rgba(232, 93, 4, 0.05) 52%, rgba(232, 93, 4, 0) 70%)",
           }}
         />
       </div>
@@ -900,7 +977,7 @@ export default function SolarCanvas({
           <>
             <span className="block truncate text-sm font-semibold text-[#f1f5fb]">{displayName(hovered)}</span>
             <span className="mt-0.5 flex items-center gap-1.5 text-xs text-[#c9d3e3]">
-              <span aria-hidden="true" className="block size-2 shrink-0 rounded-full" style={{ background: tintOf(hovered.type).base }} />
+              <span aria-hidden="true" className="block size-2 shrink-0 rounded-full" style={{ background: colorOf(hovered.id, orbits, looks) }} />
               <span className="truncate">{hovered.type || "no type"}</span>
               <span aria-hidden="true">·</span>
               <span className="shrink-0">{orbitWord(hoveredInfo, orbits.centerIsMe)}</span>
@@ -909,6 +986,14 @@ export default function SolarCanvas({
                 {hoveredCount} relation{hoveredCount === 1 ? "" : "s"}
               </span>
             </span>
+            {(hoveredStatus !== "active" || hoveredFamily) && (
+              <span className="mt-0.5 flex items-center gap-1.5 text-xs">
+                {hoveredStatus === "completed" && <span className="font-semibold text-[#34d399]">✓ {ENTRY_STATUS_LABEL.completed}</span>}
+                {hoveredStatus === "archived" && <span className="font-semibold text-[#a3b0c6]">{ENTRY_STATUS_LABEL.archived}</span>}
+                {hoveredStatus !== "active" && hoveredFamily && <span aria-hidden="true" className="text-[#c9d3e3]">·</span>}
+                {hoveredFamily && <span className="truncate text-[#c9d3e3]">Orbits {displayName(hoveredFamily)}</span>}
+              </span>
+            )}
             {hovered.description && (
               <span className="mt-1 line-clamp-2 text-xs leading-5 text-[#a3b0c6]">{hovered.description}</span>
             )}

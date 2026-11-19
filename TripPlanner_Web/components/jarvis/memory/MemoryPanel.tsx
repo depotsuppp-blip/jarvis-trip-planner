@@ -12,13 +12,22 @@ import {
   RELATION_STATUS_LABEL,
   RELATION_STATUSES,
   relationLabel,
-  TYPE_GROUPS,
   type MemoryEntityChanges,
   type MemoryNode,
   type RelationStatus,
   type TypeGroupId,
 } from "@/lib/jarvis/memory";
-import { orbitLabel, orbitWord, type OrbitKind, type Orbits } from "@/lib/jarvis/memoryOrbits";
+import {
+  colorOf,
+  ENTRY_STATUS_LABEL,
+  orbitLabel,
+  orbitWord,
+  STRAY_COLOR,
+  SUN_COLORS,
+  type Looks,
+  type OrbitKind,
+  type Orbits,
+} from "@/lib/jarvis/memoryOrbits";
 import { focusRing, focusRingInset } from "../styles";
 import { caption, darkScroll, flareButton, flareGhost, glass, glassButton, glassField, glassIcon, starButton } from "./solarStyles";
 
@@ -39,6 +48,8 @@ export type ActionOutcome = { ok: true } | { ok: false; message: string };
 interface MemoryPanelProps {
   nodes: MemoryNode[];
   orbits: Orbits;
+  /** Each entry's colour family and status. */
+  looks: Looks;
   stats: { links: number; active: number; ended: number };
   /** Bumped when words change in place, so the lists re-sort and re-read them. */
   revision: number;
@@ -68,20 +79,71 @@ const CONFIRM_MS = 4000;
 const SAVED_MS = 2000;
 const DATE = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric" });
 
-/** A small glowing orb in an entry's colour, sized by its orbit (the list, the legend, the details). */
-export function OrbDot({ type, kind, sun = false }: { type: string; kind: OrbitKind; sun?: boolean }) {
-  const color = groupInfo(groupOf(type)).color;
+/**
+ * A small orb as the canvas draws it (the list, the legend, the details): the Sun's amber, or a
+ * family's colour, sized by its orbit. With `state`, it also wears its status the canvas's way -
+ * Done its emerald check badge, Archived greyed and faded inside a dashed ring.
+ */
+export function OrbDot({
+  color,
+  kind,
+  sun = false,
+  state = "active",
+}: {
+  color: string;
+  kind: OrbitKind;
+  sun?: boolean;
+  state?: RelationStatus;
+}) {
   const size = kind === "sun" ? 14 : kind === "planet" ? 11 : 8;
+  const archived = state === "archived";
+  const tone = archived ? `color-mix(in srgb, ${color} 38%, #64748b)` : color;
   const background = sun
-    ? "radial-gradient(circle at 35% 32%, #fffdf4 0%, #ffe6a3 40%, #ffb547 80%, #ff8f3a 100%)"
-    : `radial-gradient(circle at 35% 32%, color-mix(in srgb, ${color} 40%, white) 0%, ${color} 55%, color-mix(in srgb, ${color} 50%, #060913) 100%)`;
-  const glow = sun ? "rgba(255, 190, 110, 0.55)" : `color-mix(in srgb, ${color} 55%, transparent)`;
+    ? `radial-gradient(circle at 35% 32%, ${SUN_COLORS.core} 0%, ${SUN_COLORS.body} 60%, ${SUN_COLORS.rim} 100%)`
+    : `radial-gradient(circle at 35% 32%, color-mix(in srgb, ${tone} 40%, white) 0%, ${tone} 55%, color-mix(in srgb, ${tone} 50%, #060913) 100%)`;
+  const glow = sun ? "rgba(255, 183, 3, 0.55)" : `color-mix(in srgb, ${color} ${state === "completed" ? 30 : 55}%, transparent)`;
   return (
-    <span
-      aria-hidden="true"
-      className="block shrink-0 rounded-full"
-      style={{ width: size, height: size, background, boxShadow: `0 0 ${kind === "moon" ? 6 : 9}px ${glow}` }}
-    />
+    <span aria-hidden="true" className="relative block shrink-0" style={{ width: size, height: size }}>
+      <span
+        className="block size-full rounded-full"
+        style={{ background, opacity: archived ? 0.45 : 1, boxShadow: archived ? undefined : `0 0 ${kind === "moon" ? 6 : 9}px ${glow}` }}
+      />
+      {archived && <span className="absolute -inset-[3px] rounded-full border border-dashed border-[#94a3b8]/80" />}
+      {state === "completed" && (
+        <span className="absolute -right-1.5 -top-1.5 grid size-[9px] place-items-center rounded-full bg-[#10b981] ring-1 ring-[#060913]">
+          <svg viewBox="0 0 10 10" className="size-[7px]">
+            <path d="M2.2 5.1 4.2 7l3.6-4" fill="none" stroke="#022c22" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** An entry's status as a compact badge: Active, ✓ Done or Archived. */
+export function StatusBadge({ state }: { state: RelationStatus }) {
+  const look =
+    state === "completed"
+      ? "border-[#10b981]/40 bg-[#10b981]/12 text-[#34d399]"
+      : state === "archived"
+        ? "border-dashed border-white/25 text-[#a3b0c6]"
+        : "border-[#a0baff]/30 bg-[#a0baff]/10 text-[#c7d5ff]";
+  return (
+    <span className={`inline-flex h-5 shrink-0 items-center gap-1 rounded-full border px-1.5 text-[11px] font-semibold leading-none ${look}`}>
+      {state === "completed" && <Check className="size-3" aria-hidden="true" />}
+      {ENTRY_STATUS_LABEL[state]}
+    </span>
+  );
+}
+
+/** An entry's type as a quiet tag: its group, and its own word when that differs ("Other · pet"). */
+export function TypeTag({ type }: { type: string }) {
+  const group = groupInfo(groupOf(type));
+  return (
+    <span className="inline-flex h-5 max-w-full shrink-0 items-center truncate rounded-md border border-white/[0.14] px-1.5 text-[11px] font-medium leading-none text-[#c9d3e3]">
+      {group.label}
+      {type && type !== group.id ? ` · ${type}` : ""}
+    </span>
   );
 }
 
@@ -90,9 +152,11 @@ export function OrbDot({ type, kind, sun = false }: { type: string; kind: OrbitK
  * handle until it is opened, or until an entry is). Two views:
  *
  *   overview  Graph analytics - total nodes, total connections, the orbits and how many facts
- *             hold - then every entry, the Sun first and the rest grouped by type (planets
- *             before moons), or the search's matches; one press flies the canvas to an entry
- *   details   the open entry: its type and orbit, name and description, Edit (name, type,
+ *             hold - then every entry, the Sun first and the rest by family (each planet, then
+ *             its moons, under the planet's colour), each with its type tag and status badge, or
+ *             the search's matches; one press flies the canvas to an entry
+ *   details   the open entry: its type tag, status and orbit (a moon names its planet), name
+ *             and description, Edit (name, type,
  *             description - Save sends only what changed; "me" keeps its name) and Delete (asks
  *             first, saying how many relations go with it); then its relations as sentences,
  *             each with its status - Active, Completed, Archived, saved the moment it changes -
@@ -147,23 +211,35 @@ function Stat({ label, value }: { label: string; value: number }) {
   );
 }
 
-function Overview({ nodes, orbits, stats, revision, query, matches, group, onOpen, onClearSearch }: MemoryPanelProps) {
+const OUTER = "outer";
+
+function Overview({ nodes, orbits, looks, stats, revision, query, matches, group, onOpen, onClearSearch }: MemoryPanelProps) {
   const id = useId();
   const center = orbits.centerId ? (nodes.find((node) => node.id === orbits.centerId) ?? null) : null;
 
-  // The Sun first, then each type's entries - planets before moons, then by name.
+  // The Sun first, then each planet's family in its order round the orbit - the planet, then its
+  // moons nearest first - then whatever is not linked to you. The type filter keeps its type only.
   const sections = useMemo(() => {
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const members = new Map<string, MemoryNode[]>();
+    for (const node of nodes) {
+      if (node.id === orbits.centerId || (group !== "all" && groupOf(node.type) !== group)) continue;
+      const key = looks.family.get(node.id) ?? OUTER;
+      members.set(key, [...(members.get(key) ?? []), node]);
+    }
     const byRing = (a: MemoryNode, b: MemoryNode) =>
       (orbits.byId.get(a.id)?.ring ?? 9) - (orbits.byId.get(b.id)?.ring ?? 9) || a.name.localeCompare(b.name);
-    return TYPE_GROUPS.filter((item) => group === "all" || item.id === group)
-      .map((item) => ({
-        ...item,
-        nodes: nodes.filter((node) => node.id !== orbits.centerId && groupOf(node.type) === item.id).sort(byRing),
-      }))
-      .filter((section) => section.nodes.length > 0);
+    return [...orbits.planetOrder, OUTER]
+      .filter((key) => members.has(key))
+      .map((key) => ({
+        id: key,
+        label: key === OUTER ? "Not linked to you" : displayName(byId.get(key) ?? { name: "" }),
+        color: key === OUTER ? STRAY_COLOR : (looks.planetColor.get(key) ?? STRAY_COLOR),
+        nodes: (members.get(key) ?? []).sort(byRing),
+      }));
     // revision: names and types change in place.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes, orbits, group, revision]);
+  }, [nodes, orbits, looks, group, revision]);
 
   const listed = matches ? matches.length : sections.reduce((sum, section) => sum + section.nodes.length, center ? 1 : 0);
 
@@ -224,7 +300,7 @@ function Overview({ nodes, orbits, stats, revision, query, matches, group, onOpe
           ) : (
             <ul className="-mx-2 mt-2">
               {matches.map((node) => (
-                <EntryRow key={node.id} node={node} orbits={orbits} onOpen={onOpen} />
+                <EntryRow key={node.id} node={node} orbits={orbits} looks={looks} onOpen={onOpen} />
               ))}
             </ul>
           )
@@ -232,19 +308,19 @@ function Overview({ nodes, orbits, stats, revision, query, matches, group, onOpe
           <>
             {center && (
               <ul className="-mx-2 mt-2" aria-label={orbits.centerIsMe ? "The Sun" : "Centre"}>
-                <EntryRow node={center} orbits={orbits} onOpen={onOpen} />
+                <EntryRow node={center} orbits={orbits} looks={looks} onOpen={onOpen} />
               </ul>
             )}
             {sections.map((section) => (
               <div key={section.id} className="mt-3">
-                <h3 className="flex items-center gap-2 px-0.5 text-xs font-semibold text-[#c9d3e3]">
-                  <span aria-hidden="true" className="block size-2 rounded-full" style={{ background: section.color }} />
-                  {section.label}
+                <h3 className="flex min-w-0 items-center gap-2 px-0.5 text-xs font-semibold text-[#c9d3e3]">
+                  <span aria-hidden="true" className="block h-3 w-1 shrink-0 rounded-full" style={{ background: section.color }} />
+                  <span className="truncate">{section.id === OUTER ? section.label : `${section.label}'s family`}</span>
                   <span className="font-normal tabular-nums text-[#a3b0c6]">{section.nodes.length}</span>
                 </h3>
                 <ul className="-mx-2 mt-1">
                   {section.nodes.map((node) => (
-                    <EntryRow key={node.id} node={node} orbits={orbits} onOpen={onOpen} />
+                    <EntryRow key={node.id} node={node} orbits={orbits} looks={looks} onOpen={onOpen} />
                   ))}
                 </ul>
               </div>
@@ -256,25 +332,35 @@ function Overview({ nodes, orbits, stats, revision, query, matches, group, onOpe
   );
 }
 
-function EntryRow({ node, orbits, onOpen }: { node: MemoryNode; orbits: Orbits; onOpen: (id: string) => void }) {
+function EntryRow({ node, orbits, looks, onOpen }: { node: MemoryNode; orbits: Orbits; looks: Looks; onOpen: (id: string) => void }) {
   const info = orbits.byId.get(node.id);
   const count = orbits.degree.get(node.id) ?? 0;
+  const sun = info?.kind === "sun";
+  const state = looks.status.get(node.id) ?? "active";
   return (
     <li>
       <button
         type="button"
         onClick={() => onOpen(node.id)}
-        className={`flex min-h-11 w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left transition-colors duration-150 hover:bg-white/[0.06] ${focusRingInset}`}
+        className={`flex min-h-12 w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left transition-colors duration-150 hover:bg-white/[0.06] ${
+          info?.kind === "moon" ? "pl-5" : ""
+        } ${focusRingInset}`}
       >
         <span className="grid size-4 shrink-0 place-items-center">
-          <OrbDot type={node.type} kind={info?.kind ?? "moon"} sun={info?.kind === "sun" && isMe(node)} />
+          <OrbDot color={colorOf(node.id, orbits, looks)} kind={info?.kind ?? "moon"} sun={sun && isMe(node)} />
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-sm font-medium text-[#f1f5fb]">{displayName(node)}</span>
-          <span className="block truncate text-xs text-[#a3b0c6]">
-            {orbitWord(info, orbits.centerIsMe)} · {count} relation{count === 1 ? "" : "s"}
+          <span className={`block truncate text-sm font-medium ${state === "archived" ? "text-[#c9d3e3]" : "text-[#f1f5fb]"}`}>
+            {displayName(node)}
+          </span>
+          <span className="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-[#a3b0c6]">
+            <TypeTag type={node.type} />
+            <span className="truncate">
+              {orbitWord(info, orbits.centerIsMe)} · {count} relation{count === 1 ? "" : "s"}
+            </span>
           </span>
         </span>
+        {!sun && <StatusBadge state={state} />}
       </button>
     </li>
   );
@@ -282,7 +368,9 @@ function EntryRow({ node, orbits, onOpen }: { node: MemoryNode; orbits: Orbits; 
 
 function Details({
   node,
+  nodes,
   orbits,
+  looks,
   relations,
   onSave,
   onDelete,
@@ -299,7 +387,10 @@ function Details({
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const info = orbits.byId.get(node.id);
-  const group = groupInfo(groupOf(node.type));
+  const state = looks.status.get(node.id) ?? "active";
+  // A moon's planet: the family it is drawn in.
+  const familyId = info?.kind === "moon" ? looks.family.get(node.id) : null;
+  const planet = familyId ? (nodes.find((other) => other.id === familyId) ?? null) : null;
 
   // Opened (the panel mounts one per entry - key={id} - so another entry starts afresh):
   // the screen reader hears its name.
@@ -357,13 +448,13 @@ function Details({
       </div>
 
       <div className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-6 pt-4 ${darkScroll}`}>
-        <p className="flex min-w-0 items-center gap-2 text-xs font-medium text-[#c9d3e3]">
-          <OrbDot type={node.type} kind={info?.kind ?? "moon"} sun={info?.kind === "sun" && isMe(node)} />
-          <span className="truncate">
-            {group.label}
-            {node.type && node.type !== group.id ? ` · ${node.type}` : ""}
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <span className="mr-0.5 grid size-4 shrink-0 place-items-center">
+            <OrbDot color={colorOf(node.id, orbits, looks)} kind={info?.kind ?? "moon"} sun={info?.kind === "sun" && isMe(node)} state={state} />
           </span>
-        </p>
+          <TypeTag type={node.type} />
+          {info?.kind !== "sun" && <StatusBadge state={state} />}
+        </div>
         <h2
           id={titleId}
           ref={title}
@@ -372,7 +463,21 @@ function Details({
         >
           {displayName(node)}
         </h2>
-        <p className="mt-0.5 text-[13px] text-[#a3b0c6]">{orbitLabel(info, orbits.centerIsMe)}</p>
+        <p className="mt-0.5 text-[13px] text-[#a3b0c6]">
+          {orbitLabel(info, orbits.centerIsMe)}
+          {planet && (
+            <>
+              {" · orbits "}
+              <button
+                type="button"
+                onClick={() => onOpen(planet.id)}
+                className={`rounded-sm font-semibold text-[#f1f5fb] underline decoration-white/30 underline-offset-2 hover:decoration-white ${focusRing}`}
+              >
+                {displayName(planet)}
+              </button>
+            </>
+          )}
+        </p>
 
         {mode === "edit" ? (
           <EditForm

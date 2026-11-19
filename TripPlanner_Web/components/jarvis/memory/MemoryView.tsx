@@ -23,7 +23,20 @@ import {
   type RelationStatus,
   type TypeGroupId,
 } from "@/lib/jarvis/memory";
-import { computeOrbits, endId, seedOrbits, settle, type GraphNode, type SolarGraph } from "@/lib/jarvis/memoryOrbits";
+import {
+  computeLooks,
+  computeOrbits,
+  endId,
+  lighten,
+  MOON_LIGHTEN,
+  PLANET_COLORS,
+  seedOrbits,
+  settle,
+  STRAY_COLOR,
+  SUN_COLORS,
+  type GraphNode,
+  type SolarGraph,
+} from "@/lib/jarvis/memoryOrbits";
 // Types only: a value imported from the canvas module would pull the graph library into server rendering.
 import type { Insets, SolarCanvasApi } from "./SolarCanvas";
 import { MemoryPanel, OrbDot, type ActionOutcome, type PanelRelation } from "./MemoryPanel";
@@ -44,6 +57,8 @@ type Status =
 
 const NOTICE_MS = 4000;
 const DESKTOP = "(min-width: 768px)";
+// The legend draws its sample orbs in one family's colour (Cyber Blue).
+const LEGEND_PLANET = PLANET_COLORS[3];
 
 /** The page's working copy: the canvas library writes positions into these objects. */
 function toGraph(data: MemoryGraph): SolarGraph {
@@ -136,6 +151,14 @@ export function MemoryView() {
   }, [notice]);
 
   const orbits = useMemo(() => computeOrbits(graph.nodes, graph.links), [graph]);
+  // revision: a relation's status changes in place, and with it an entry's status (and a moon's family).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const looks = useMemo(() => computeLooks(graph.nodes, graph.links, orbits), [graph, orbits, revision]);
+  // The legend's family swatch: the colours on the canvas, in their order round the orbit.
+  const familyColors = useMemo(
+    () => [...new Set(orbits.planetOrder.map((id) => looks.planetColor.get(id) ?? STRAY_COLOR))],
+    [orbits, looks],
+  );
   const nodeById = useMemo(() => new Map(graph.nodes.map((node) => [node.id, node])), [graph]);
   // revision: names change in place, and the search must see them.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -331,6 +354,7 @@ export function MemoryView() {
           <SolarCanvas
             graph={graph}
             orbits={orbits}
+            looks={looks}
             revision={revision}
             selectedId={selectedId}
             matchIds={matchIds}
@@ -449,6 +473,7 @@ export function MemoryView() {
           <MemoryPanel
             nodes={graph.nodes}
             orbits={orbits}
+            looks={looks}
             stats={stats}
             revision={revision}
             query={query}
@@ -479,7 +504,7 @@ export function MemoryView() {
             role="group"
             aria-labelledby={legendId}
             className={`absolute bottom-16 right-2 z-20 max-w-[calc(100%-1rem)] rounded-xl ${glass} md:bottom-3 md:right-[23.5rem] ${
-              legendOpen === null ? "w-32 md:w-60" : legendOpen ? "w-60" : "w-32"
+              legendOpen === null ? "w-32 md:w-64" : legendOpen ? "w-64" : "w-32"
             } ${sheetOpen ? "hidden md:block" : ""}`}
           >
             <button
@@ -496,41 +521,47 @@ export function MemoryView() {
               />
             </button>
             <div className={`px-3 pb-3 ${legendOpen === null ? "hidden md:block" : legendOpen ? "block" : "hidden"}`}>
-              <ul aria-label="Entry types" className="grid grid-cols-2 gap-x-3 gap-y-1">
-                {presentGroups.map((item) => (
-                  <li
-                    key={item.id}
-                    className={`flex min-w-0 items-center gap-1.5 text-xs font-medium ${
-                      group === "all" || group === item.id ? "text-[#e6ebf5]" : "text-[#8b98ae]"
-                    }`}
-                  >
-                    <OrbDot type={item.id} kind="moon" />
-                    <span className="truncate">{item.label}</span>
-                    <span className="tabular-nums text-[#a3b0c6]">{groupCounts.get(item.id)}</span>
-                  </li>
-                ))}
-              </ul>
-              <ul aria-label="Orbits" className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-white/10 pt-2">
+              <ul aria-label="Orbits" className="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <li className="flex items-center gap-1.5 text-xs font-medium text-[#e6ebf5]">
-                  <OrbDot type="person" kind="sun" sun />
+                  <OrbDot color={SUN_COLORS.body} kind="sun" sun />
                   You
                 </li>
                 <li className="flex items-center gap-1.5 text-xs font-medium text-[#e6ebf5]">
-                  <OrbDot type="person" kind="planet" />
-                  1 hop
+                  <OrbDot color={LEGEND_PLANET} kind="planet" />
+                  Planet · 1 hop
                 </li>
                 <li className="flex items-center gap-1.5 text-xs font-medium text-[#e6ebf5]">
-                  <OrbDot type="person" kind="moon" />
-                  2+ hops
+                  <OrbDot color={lighten(LEGEND_PLANET, MOON_LIGHTEN)} kind="moon" />
+                  Moon · 2+
                 </li>
               </ul>
-              <ul aria-label="Relations" className="mt-2 grid grid-cols-1 gap-1 border-t border-white/10 pt-2">
-                {RELATION_STATUSES.map((relationStatus) => (
-                  <li key={relationStatus} className="flex items-center gap-2 text-xs font-medium text-[#e6ebf5]">
-                    <LineSample status={relationStatus} />
-                    {RELATION_STATUS_LABEL[relationStatus]}
+              <div className="mt-2 border-t border-white/10 pt-2">
+                <p className="flex items-center gap-2 text-xs font-medium text-[#e6ebf5]">
+                  <span aria-hidden="true" className="flex items-center gap-1">
+                    {familyColors.map((color) => (
+                      <span key={color} className="block size-2 rounded-full" style={{ background: color }} />
+                    ))}
+                  </span>
+                  Planet families
+                </p>
+                <p className="mt-0.5 text-[11px] leading-4 text-[#a3b0c6]">Each planet and its moons share a colour.</p>
+                {orbits.counts.drifting > 0 && (
+                  <p className="mt-1 flex items-center gap-2 text-xs font-medium text-[#e6ebf5]">
+                    <span aria-hidden="true" className="block size-2 rounded-full" style={{ background: STRAY_COLOR }} />
+                    Not linked to you
+                  </p>
+                )}
+              </div>
+              <ul aria-label="Status" className="mt-2 grid grid-cols-1 gap-1.5 border-t border-white/10 pt-2">
+                {RELATION_STATUSES.map((state) => (
+                  <li key={state} className="flex items-center gap-2 text-xs font-medium text-[#e6ebf5]">
+                    <span className="grid size-4 shrink-0 place-items-center">
+                      <OrbDot color={LEGEND_PLANET} kind="planet" state={state} />
+                    </span>
+                    <LineSample status={state} />
+                    {state === "completed" ? "Completed ✓" : RELATION_STATUS_LABEL[state]}
                     <span className="font-normal text-[#a3b0c6]">
-                      {relationStatus === "active" ? "holds now" : relationStatus === "completed" ? "done" : "no longer true"}
+                      {state === "active" ? "holds now" : state === "completed" ? "done" : "no longer true"}
                     </span>
                   </li>
                 ))}

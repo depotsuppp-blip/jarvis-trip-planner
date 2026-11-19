@@ -71,22 +71,16 @@ export const MEMORY_LIMITS = { name: 120, type: 40, description: 300 } as const;
 // ---- the colour groups ---------------------------------------------------------------
 
 /**
- * The legend: every entry's type falls in one of six groups, and the group gives its colour -
- * six neon hues for the Memory page's deep-space canvas (#060913). Checked as a set with the
- * dataviz validator, all pairs (any two planets can sit side by side): worst colour-blind
- * distance 9.2 (deutan, violet/sky), worst normal-vision 15.8 (pink/violet), every one at least
- * 3:1 on the canvas. They sit above the validator's dark lightness band (OKLCH L 0.70-0.82, not
- * 0.48-0.67) on purpose: that band is set for a #1a1a19 chart, and here they are lights in the
- * dark. Every node also carries its name (and the panel its type): colour is never the only sign.
- * Fixed per group, never by rank or count, so filtering never repaints anyone.
+ * The six groups every entry's type falls in: the type filter and the type tag. They carry no
+ * colour - on the Memory page colour belongs to a planet's family (lib/jarvis/memoryOrbits.ts).
  */
 export const TYPE_GROUPS = [
-  { id: "person", label: "Person", color: "#34c8fd" },
-  { id: "project", label: "Project", color: "#cb6cff" },
-  { id: "technology", label: "Technology", color: "#ff53a8" },
-  { id: "organization", label: "Organization", color: "#f87f02" },
-  { id: "place", label: "Place", color: "#3fe691" },
-  { id: "other", label: "Other", color: "#e3c327" },
+  { id: "person", label: "Person" },
+  { id: "project", label: "Project" },
+  { id: "technology", label: "Technology" },
+  { id: "organization", label: "Organization" },
+  { id: "place", label: "Place" },
+  { id: "other", label: "Other" },
 ] as const;
 
 export type TypeGroupId = (typeof TYPE_GROUPS)[number]["id"];
@@ -105,7 +99,7 @@ const GROUP_OF_WORD = new Map<string, TypeGroupId>(
   (Object.entries(GROUP_WORDS) as [TypeGroupId, string[]][]).flatMap(([group, words]) => words.map((word) => [word, group])),
 );
 
-/** The colour group a type belongs to ("City" -> place, "pet" -> other). */
+/** The group a type belongs to ("City" -> place, "pet" -> other). */
 export function groupOf(type: string): TypeGroupId {
   const word = type.trim().toLowerCase().replace(/[\s-]+/g, "_");
   return GROUP_OF_WORD.get(word) ?? "other";

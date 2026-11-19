@@ -12,9 +12,14 @@
  *
  * A relation counts whatever its status: a fact that ended is still history about you.
  * The rings grow with what is on them, so a crowded orbit never stacks its names.
+ *
+ * Colour follows the family, not the type (computeLooks): each planet gets a signature colour
+ * round the inner orbit, and its moons inherit it, so a planet and everything hanging off it
+ * read as one group. Each entry also gets a status from its main fact - Active, Done or
+ * Archived - drawn on the orb itself.
  */
 
-import { isMe, type MemoryLink, type MemoryNode } from "./memory";
+import { isMe, type MemoryLink, type MemoryNode, type RelationStatus } from "./memory";
 
 export type OrbitKind = "sun" | "planet" | "moon";
 
@@ -40,6 +45,8 @@ export interface Orbits {
   degree: Map<string, number>;
   /** Each entry's neighbours (either direction). */
   neighbours: Map<string, Set<string>>;
+  /** The planets in their order round the inner orbit (by type, then name): it sets their colours. */
+  planetOrder: string[];
   counts: { planets: number; moons: number; drifting: number };
 }
 
@@ -48,6 +55,12 @@ type End = string | { id: string };
 interface LinkEnds {
   source: End;
   target: End;
+}
+
+/** A relation as far as colours and statuses care. */
+interface LinkFacts extends LinkEnds {
+  status: RelationStatus;
+  weight: number;
 }
 
 export const endId = (end: End | undefined | null): string =>
@@ -131,6 +144,11 @@ export function computeOrbits(nodes: readonly MemoryNode[], links: readonly Link
     radii.push(Math.max(floor, ((perRing[ring] ?? 0) * arc) / (2 * Math.PI)));
   }
 
+  const planetOrder = nodes
+    .filter((node) => byId.get(node.id)?.kind === "planet")
+    .sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
+    .map((node) => node.id);
+
   return {
     centerId: center?.id ?? null,
     centerIsMe: !!me,
@@ -139,6 +157,7 @@ export function computeOrbits(nodes: readonly MemoryNode[], links: readonly Link
     driftRing,
     degree,
     neighbours,
+    planetOrder,
     counts,
   };
 }
@@ -164,7 +183,7 @@ export interface SolarGraph {
 
 /**
  * Puts every entry that has no place yet on its ring, before the first layout: planets evenly
- * round the inner orbit (grouped by type, so a constellation of one colour reads as one), each
+ * round the inner orbit in `planetOrder` (the order their colours are dealt in), each
  * moon at the angle of the planet it hangs off, nudged along its ring so none start on top of
  * another. The centre is pinned at (0, 0). Starting this close to the answer is what lets the
  * layout settle before the first frame - the orbits are still from the moment they appear.
@@ -207,7 +226,10 @@ export function seedOrbits(nodes: GraphNode[], orbits: Orbits): void {
     const even = (list: typeof wanted) =>
       list.forEach((entry, index) => angle.set(entry.node.id, -Math.PI / 2 + (index * 2 * Math.PI) / list.length));
 
-    if (ring === 1 || drifting) {
+    if (ring === 1 && !drifting) {
+      const place = new Map(orbits.planetOrder.map((id, index) => [id, index]));
+      even([...wanted].sort((a, b) => (place.get(a.node.id) ?? 0) - (place.get(b.node.id) ?? 0)));
+    } else if (drifting) {
       even([...wanted].sort((a, b) => a.node.type.localeCompare(b.node.type) || a.node.name.localeCompare(b.node.name)));
     } else {
       const sorted = [...wanted].sort((a, b) => (a.at || 0) - (b.at || 0) || a.node.name.localeCompare(b.node.name));
@@ -253,19 +275,135 @@ export function settle(nodes: GraphNode[], links: GraphLink[]): SolarGraph {
   return { nodes, links };
 }
 
-/** Entries whose every relation has ended (completed or archived): drawn dimmer, as history. */
-export function endedEntries(
-  links: readonly (LinkEnds & { status: string })[],
-): Set<string> {
-  const active = new Set<string>();
-  const touched = new Set<string>();
+// ---- colour families and statuses -----------------------------------------------------------
+
+/** The Sun: a warm golden-amber glow - its core, its body, the rim of its aura. */
+export const SUN_COLORS = { core: "#FFF3B0", body: "#FFB703", rim: "#E85D04" } as const;
+
+/**
+ * The planets' signature colours, dealt round the inner orbit in this order: Neon Crimson,
+ * Electric Violet, Emerald, Cyber Blue, Neon Magenta, Indigo, Warm Coral, Cyan. The order is
+ * the one (of all 5040) that keeps every two neighbours easiest to tell apart, measured like the
+ * dataviz validator: worst neighbouring pair 14.7 for colour-blind vision, 26.5 for normal
+ * (in the order Crimson, Violet, Blue, Magenta... it was 1.3 - Violet and Indigo are one colour
+ * to a colour-blind eye, so they are never dealt side by side). Every one is over 3:1 on the
+ * canvas. Colour never works alone: every planet carries its name, and the panel lists each
+ * family under its planet.
+ */
+export const PLANET_COLORS = ["#FF3B6B", "#8B5CF6", "#10B981", "#3B82F6", "#EC4899", "#6366F1", "#FB923C", "#06B6D4"] as const;
+// With one planet over a whole round (9, 17...), the last sits between the last colour and the
+// first: Violet is the one furthest from both.
+const WRAP_COLOR = 1;
+
+/** Entries no chain of relations links to you belong to no family: a quiet slate. */
+export const STRAY_COLOR = "#94A3B8";
+
+/** How much lighter a moon is than its planet (towards white). */
+export const MOON_LIGHTEN = 0.32;
+
+/** An entry's status as a badge reads: from its main fact. */
+export const ENTRY_STATUS_LABEL: Record<RelationStatus, string> = { active: "Active", completed: "Done", archived: "Archived" };
+
+export interface Looks {
+  /** The planet each entry belongs to (a planet is its own); null for the centre and the outer orbit. */
+  family: Map<string, string | null>;
+  /** Each planet's signature colour. */
+  planetColor: Map<string, string>;
+  /**
+   * Each entry's status: for a planet, its relation to the centre ("me built TripPlanner" -
+   * completed = Done); for any other entry, its best relation (one that holds wins). The centre,
+   * and an entry with no relations, are active.
+   */
+  status: Map<string, RelationStatus>;
+}
+
+const RANK: Record<RelationStatus, number> = { active: 0, completed: 1, archived: 2 };
+
+/**
+ * Colours and statuses for the orbits. Depends on the relations' statuses (which change in
+ * place), so it is worked out apart from computeOrbits (which depends on the graph's shape only).
+ */
+export function computeLooks(nodes: readonly MemoryNode[], links: readonly LinkFacts[], orbits: Orbits): Looks {
+  const planetColor = new Map<string, string>();
+  const total = orbits.planetOrder.length;
+  orbits.planetOrder.forEach((id, index) => {
+    let slot = index % PLANET_COLORS.length;
+    // The last planet meets the first round the circle: never the same colour as it.
+    if (total > 1 && index === total - 1 && slot === 0) slot = WRAP_COLOR;
+    planetColor.set(id, PLANET_COLORS[slot]);
+  });
+
+  // Per entry, its relations (the other end and the status); per pair, whether a fact holds and how often it was told.
+  const facts = new Map<string, { other: string; status: RelationStatus }[]>();
+  const pairs = new Map<string, { holds: boolean; weight: number }>();
   for (const link of links) {
-    for (const id of [endId(link.source), endId(link.target)]) {
-      touched.add(id);
-      if (link.status === "active") active.add(id);
-    }
+    const s = endId(link.source);
+    const t = endId(link.target);
+    facts.set(s, [...(facts.get(s) ?? []), { other: t, status: link.status }]);
+    facts.set(t, [...(facts.get(t) ?? []), { other: s, status: link.status }]);
+    const key = s < t ? `${s}|${t}` : `${t}|${s}`;
+    const pair = pairs.get(key) ?? { holds: false, weight: 0 };
+    pairs.set(key, { holds: pair.holds || link.status === "active", weight: pair.weight + (link.weight || 1) });
   }
-  return new Set([...touched].filter((id) => !active.has(id)));
+  const pairOf = (a: string, b: string) => pairs.get(a < b ? `${a}|${b}` : `${b}|${a}`) ?? { holds: false, weight: 0 };
+
+  const status = new Map<string, RelationStatus>();
+  for (const node of nodes) {
+    const info = orbits.byId.get(node.id);
+    let own = facts.get(node.id) ?? [];
+    if (info?.kind === "sun") own = [];
+    else if (info?.kind === "planet") own = own.filter((fact) => fact.other === orbits.centerId);
+    const best = own.reduce<RelationStatus | null>((found, fact) => (found === null || RANK[fact.status] < RANK[found] ? fact.status : found), null);
+    status.set(node.id, best ?? "active");
+  }
+
+  // A moon joins the family of the entry it hangs off, one hop nearer the centre; with a choice,
+  // the one whose fact with it holds, then an active one, then the most told, then the first planet.
+  const family = new Map<string, string | null>();
+  const place = new Map(orbits.planetOrder.map((id, index) => [id, index]));
+  const byHops = [...nodes].sort((a, b) => (orbits.byId.get(a.id)?.hops ?? Infinity) - (orbits.byId.get(b.id)?.hops ?? Infinity));
+  for (const node of byHops) {
+    const info = orbits.byId.get(node.id);
+    if (!info || info.hops === null || info.kind === "sun") {
+      family.set(node.id, null);
+      continue;
+    }
+    if (info.kind === "planet") {
+      family.set(node.id, node.id);
+      continue;
+    }
+    const hops = info.hops;
+    const parents = [...(orbits.neighbours.get(node.id) ?? [])].filter((id) => orbits.byId.get(id)?.hops === hops - 1);
+    const score = (id: string) => {
+      const pair = pairOf(id, node.id);
+      return [pair.holds ? 0 : 1, status.get(id) === "active" ? 0 : 1, -pair.weight, place.get(family.get(id) ?? "") ?? Infinity];
+    };
+    const parent = parents.sort((a, b) => {
+      const [x, y] = [score(a), score(b)];
+      return x[0] - y[0] || x[1] - y[1] || x[2] - y[2] || x[3] - y[3] || a.localeCompare(b);
+    })[0];
+    family.set(node.id, parent ? (family.get(parent) ?? null) : null);
+  }
+
+  return { family, planetColor, status };
+}
+
+/** An entry's colour: the Sun's amber, its planet's colour (a moon's own is lightened from it), or slate. */
+export function colorOf(id: string, orbits: Orbits, looks: Looks): string {
+  const info = orbits.byId.get(id);
+  if (info?.kind === "sun") return SUN_COLORS.body;
+  const family = looks.family.get(id);
+  const color = family ? looks.planetColor.get(family) : undefined;
+  if (!color) return STRAY_COLOR;
+  return info?.kind === "moon" ? lighten(color, MOON_LIGHTEN) : color;
+}
+
+/** A hex colour moved `amount` (0-1) towards white, as hex. */
+export function lighten(hex: string, amount: number): string {
+  return `#${[1, 3, 5]
+    .map((at) => parseInt(hex.slice(at, at + 2), 16))
+    .map((value) => Math.round(value + (255 - value) * amount).toString(16).padStart(2, "0"))
+    .join("")}`;
 }
 
 /** How an entry's place reads in words: "Planet · 1 hop from you". */
