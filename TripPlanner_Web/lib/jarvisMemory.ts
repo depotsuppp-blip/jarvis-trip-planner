@@ -1,6 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import type { MemoryEntityChanges, MemoryGraph, MemoryNode } from "@/lib/jarvis/memory";
+import {
+  RELATION_STATUSES,
+  type MemoryEntityChanges,
+  type MemoryGraph,
+  type MemoryLink,
+  type MemoryNode,
+  type RelationStatus,
+} from "@/lib/jarvis/memory";
 import { checkRateLimit } from "@/lib/rateLimit";
 
 /**
@@ -14,6 +21,8 @@ import { checkRateLimit } from "@/lib/rateLimit";
  *   PATCH  {JARVIS_MEMORY_URL}/entities/<id>  { name?, type?, description? }
  *                                                     -> { node, reembedded }
  *   DELETE {JARVIS_MEMORY_URL}/entities/<id>         -> { deleted, links: [ids] }   its relations go with it
+ *   PATCH  {JARVIS_MEMORY_URL}/relations/<id>  { status: "active" | "completed" | "archived" }
+ *                                                     -> { link }
  *   DELETE {JARVIS_MEMORY_URL}/relations/<id>        -> { deleted }
  *   errors: { code, detail }   401 no_user, 404 not_found, 409 name_taken, 400 invalid | me_locked |
  *           reserved | refused, 503 not_configured | unavailable | embedding_failed
@@ -51,7 +60,7 @@ export type MemoryFailureCode =
 export const MEMORY_MESSAGES: Record<MemoryFailureCode, string> = {
   not_found: "That's no longer in Jarvis's memory - it may have been deleted already.",
   name_taken: "Another memory entry already has that name.",
-  invalid: "That change wasn't accepted. Check the name, type and description.",
+  invalid: "That change wasn't accepted. Check the name, type, description or status.",
   me_locked: "This entry is you, so its name stays “me”.",
   reserved: "“me” is the name Jarvis keeps for you. Pick another name.",
   refused: "That looks like a password, card or ID number, so it wasn't saved.",
@@ -98,6 +107,9 @@ const LinkSchema = z.object({
   target: Id,
   relation_type: z.string().max(80),
   weight: z.number().finite(),
+  // A brain from before relation statuses sends neither: every fact is then active, undated.
+  status: z.enum(RELATION_STATUSES).catch("active").default("active"),
+  updated_at: z.string().max(40).nullable().catch(null).default(null),
 });
 const GraphSchema = z.object({
   nodes: z.array(NodeSchema).max(5000),
@@ -106,6 +118,7 @@ const GraphSchema = z.object({
 const UpdatedSchema = z.object({ node: NodeSchema, reembedded: z.boolean() });
 const DeletedEntitySchema = z.object({ deleted: Id, links: z.array(Id).max(20000) });
 const DeletedRelationSchema = z.object({ deleted: Id });
+const UpdatedRelationSchema = z.object({ link: LinkSchema });
 const FailureSchema = z.object({ code: z.string() });
 
 const KNOWN = new Set<string>(Object.keys(MEMORY_MESSAGES));
@@ -175,6 +188,15 @@ export function updateMemoryEntity(
 /** Deletes an entry and every relation it is in; answers the ids of those relations too. */
 export function deleteMemoryEntity(userId: string, id: string): Promise<{ deleted: string; links: string[] }> {
   return call(`/entities/${segment(id)}`, userId, DeletedEntitySchema, { method: "DELETE", timeoutMs: READ_TIMEOUT_MS });
+}
+
+/** Marks one relation active, completed or archived; its date moves to now. */
+export function updateMemoryRelation(userId: string, id: string, status: RelationStatus): Promise<{ link: MemoryLink }> {
+  return call(`/relations/${segment(id)}`, userId, UpdatedRelationSchema, {
+    method: "PATCH",
+    body: { status },
+    timeoutMs: READ_TIMEOUT_MS,
+  });
 }
 
 /** Deletes one relation; both of its entries stay. */

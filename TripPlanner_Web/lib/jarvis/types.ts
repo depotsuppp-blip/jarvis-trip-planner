@@ -5,6 +5,8 @@
  * (`messageContent.ts`) and the components all speak the same types.
  */
 
+import type { MemoryNote } from "./memoryNote";
+
 /** What the orb (and so the whole hub) is doing right now. */
 export type OrbMode = "idle" | "listening" | "thinking" | "speaking";
 
@@ -56,6 +58,11 @@ export interface ChatMessage {
   origin: MessageOrigin;
   /** "error" draws the text as a problem (the brain failed, you are signed out). */
   tone?: "error";
+  /**
+   * What Jarvis's memory really wrote while answering - the pill under the reply (memoryNote.ts).
+   * Only on a reply that just arrived: it is not stored, so a session loaded later has none.
+   */
+  memory?: MemoryNote;
 }
 
 export interface SessionSummary {

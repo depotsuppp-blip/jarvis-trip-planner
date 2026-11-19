@@ -20,6 +20,7 @@ import {
   type ChatTurn,
 } from "@/lib/jarvisBrain";
 import { MAX_DOCUMENT_BYTES, storedUserMessage, type Attachment } from "@/lib/jarvis/attachments";
+import type { MemoryNote } from "@/lib/jarvis/memoryNote";
 import { speakableAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 import { prisma } from "@/lib/prisma";
 import { checkRateLimit } from "@/lib/rateLimit";
@@ -148,7 +149,12 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  * (lib/jarvis/replyAudio.ts). The reply itself is never read aloud. The audio is for this response only:
  * it is not saved with the message, and a reply without it is just text.
  *
- * Responses: 200 { conversationId, userMessage, reply, audio? }, 400 bad body, 401
+ * `memory` says what Jarvis's long-term memory really wrote during the turn - "saved" (with how
+ * many entries and facts), "confirmed" (all already known) or "failed" - when its memory tool was
+ * used at all (lib/jarvis/memoryNote.ts). The hub draws it under the reply. It is the tool's own
+ * record, not the model's words, and is not stored either.
+ *
+ * Responses: 200 { conversationId, userMessage, reply, audio?, memory? }, 400 bad body, 401
  * signed out, 404 unknown conversation, 413 / 415 / 503 the file (above), 429
  * rate-limited, 502 brain failed, 500 database (or disk) failed, 499 stopped by the person
  * (the reply is not saved). With a file,
@@ -317,6 +323,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
   let replyText: string;
   let audio: ReplyAudio | null = null;
   let spokenAudioText: string | null = null;
+  let memory: MemoryNote | null = null;
   try {
     const answer = await askJarvis(turn.message, turn.history, {
       userId: turn.userId,
@@ -330,6 +337,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
     if (!replyText) throw new Error("The brain returned an empty reply.");
     audio = speakableAudio(replyText, answer.audio, answer.spokenText);
     spokenAudioText = audio ? answer.spokenText : null;
+    memory = answer.memory;
   } catch (error) {
     if (error instanceof JarvisBrainCancelled || signal.aborted) return { kind: "stopped" };
     console.error(`POST /api/chat: the brain failed for conversation ${conversationId}:`, error);
@@ -347,7 +355,14 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
     const reply = await saveReply(conversationId, replyText);
     return {
       kind: "answered",
-      body: { conversationId, userMessage, reply, ...(audio ? { audio, ...(spokenAudioText ? { spokenAudioText } : {}) } : {}) },
+      body: {
+        conversationId,
+        userMessage,
+        reply,
+        ...(audio ? { audio, ...(spokenAudioText ? { spokenAudioText } : {}) } : {}),
+        // What Jarvis's memory really wrote this turn (lib/jarvis/memoryNote.ts); not stored, like the audio.
+        ...(memory ? { memory } : {}),
+      },
     };
   } catch (error) {
     console.error("POST /api/chat failed saving the reply:", error);

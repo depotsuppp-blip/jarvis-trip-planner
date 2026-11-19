@@ -6,6 +6,7 @@
  *   GET    /api/memory/graph            { nodes, links }
  *   PATCH  /api/memory/entities/<id>    { name?, type?, description? } -> { node, reembedded }
  *   DELETE /api/memory/entities/<id>    -> { deleted, links }   (its relations go with it)
+ *   PATCH  /api/memory/relations/<id>   { status } -> { link }
  *   DELETE /api/memory/relations/<id>   -> { deleted }
  *
  * Every call answers `{ ok: true, data }` or `{ ok: false, status, message }` and never
@@ -28,7 +29,30 @@ export interface MemoryLink {
   relation_type: string;
   /** How many times the same fact was told (1 and up). */
   weight: number;
+  /** active: holds now. completed: done (a finished project). archived: no longer true. */
+  status: RelationStatus;
+  /** When it was last told or changed (ISO 8601), or null from a brain that does not say. */
+  updated_at: string | null;
 }
+
+export const RELATION_STATUSES = ["active", "completed", "archived"] as const;
+export type RelationStatus = (typeof RELATION_STATUSES)[number];
+
+/**
+ * How the Memory graph draws a fact of each status (canvas line dash, in graph units - it scales
+ * with the zoom like the line itself): a fact that ended stays drawn, as history.
+ */
+export const RELATION_DASH: Record<RelationStatus, number[] | null> = { active: null, completed: [4, 3], archived: [1.5, 2.5] };
+
+export const RELATION_STATUS_LABEL: Record<RelationStatus, string> = {
+  active: "Active",
+  completed: "Completed",
+  archived: "Archived",
+};
+
+/** The six types every entry has (the brain holds its extractor to them; the colours follow them). */
+export const ENTITY_TYPES = ["person", "project", "technology", "organization", "place", "other"] as const;
+export type EntityType = (typeof ENTITY_TYPES)[number];
 
 export interface MemoryGraph {
   nodes: MemoryNode[];
@@ -171,6 +195,14 @@ export function saveMemoryEntity(id: string, changes: MemoryEntityChanges) {
 export function removeMemoryEntity(id: string) {
   return request<{ deleted: string; links: string[] }>(`/api/memory/entities/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+}
+
+export function saveMemoryRelationStatus(id: string, status: RelationStatus) {
+  return request<{ link: MemoryLink }>(`/api/memory/relations/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
   });
 }
 

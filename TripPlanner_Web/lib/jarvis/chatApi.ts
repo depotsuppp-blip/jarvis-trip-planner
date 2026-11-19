@@ -64,6 +64,8 @@ export interface TurnData {
   audio?: ReplyAudio | null;
   /** The English words that audio says (the reply itself may be Thai and is never played). */
   spokenAudioText?: string | null;
+  /** What Jarvis's memory really wrote during the turn (memoryNote.ts). Not stored: for this response only. */
+  memory?: unknown;
 }
 
 /** A spoken turn: the same answer as a typed one, plus the words that were heard. */

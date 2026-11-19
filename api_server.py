@@ -15,7 +15,10 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                              specialist agent reports ("Head of Research: Searching the web...")
                    final     {"type": "final", "node": "Final_Response", "status": "Done",
                               "message": "...", "chat_text": "...",
-                              "spoken_audio_text": "..." | null, "audio": null}   once, last
+                              "spoken_audio_text": "..." | null, "audio": null,
+                              "memory_events": [{"action": "saved"|"confirmed"|"failed",
+                                                 "entries": 2, "facts": 3, "merged": 0,
+                                                 "summary": "Nok sister of me; ..."}]}   once, last
                    error     {"type": "error", "status": "Failed", "message": "...",
                               "code": 502}                    instead of final, last
                    action_required  {"type": "action_required", "approval_id": "...",
@@ -27,6 +30,11 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                               "decision": "allow"|"deny"|"timeout"}   the card is closed
                  plus a ": keep-alive" comment line after 10 s without an event.
 
+                 memory_events is what the memory tool REALLY wrote during the turn, one per
+                 remember call (mcp_client.py records them; the model's words count for nothing):
+                 saved (entries = new or updated entries, facts = new or changed facts), confirmed
+                 (all already known) or failed. Empty when nothing was remembered. The page shows
+                 it under the reply, so a "got it" without a save is visible as such.
                  message (= chat_text) is what the chat shows, in any language: a plain
                  sentence, or - when a tool showed the person a widget - a JSON string, see
                  rich_reply.py; a picture or a file Jarvis made is in it as its Markdown line
@@ -112,7 +120,11 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
     mcp_client.web_scope) and only ever reaches that person's memory: someone else's entry or
     relation is a 404, exactly like one that does not exist. Errors are { "code", "detail" }.
     GET    /memory/graph -> { "nodes": [{ "id", "name", "type", "description" }],
-                              "links": [{ "id", "source", "target", "relation_type", "weight" }] }
+                              "links": [{ "id", "source", "target", "relation_type", "weight",
+                                          "status", "updated_at" }] }
+                 type is one of person, project, technology, organization, place, other (older
+                 entries may still carry a type from before that set); status is active, completed
+                 or archived; updated_at is an ISO 8601 timestamp.
                  source and target are node ids. Empty when nothing has been remembered yet
                  (the tables are never created from here).
     PATCH  /memory/entities/{entity_id}  { "name"?, "type"?, "description"? }
@@ -122,6 +134,8 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  name_taken, 400 invalid / me_locked ("me" keeps its name) / reserved / refused (a
                  secret).
     DELETE /memory/entities/{entity_id} -> { "deleted": id, "links": [ids of its relations, deleted too] }
+    PATCH  /memory/relations/{relation_id}  { "status": "active"|"completed"|"archived" }
+              -> { "link": {...} }   the fact is marked done or no longer true by hand (its date moves).
     DELETE /memory/relations/{relation_id} -> { "deleted": id }   both entries stay.
                  401 no_user without the header; 503 not_configured / unavailable when the memory
                  database is not set up or cannot be reached.
@@ -275,6 +289,8 @@ class VoiceResponse(BaseModel):
     # What the voice says, in English, and its audio: see POST /chat's final event.
     spoken_audio_text: Optional[str] = None
     audio: Optional[ReplyAudio] = None
+    # What the memory tool really wrote during this turn: see POST /chat's final event.
+    memory_events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _history_turns = TypeAdapter(Annotated[list[HistoryTurn], Field(max_length=MAX_HISTORY_TURNS)])
@@ -473,6 +489,9 @@ async def _turn(
                             # The English spoken version is made only when it will be voiced.
                             speak=caller.voice_reply,
                         ):
+                            if event.get("type") == "final":
+                                # What the memory tool really wrote this turn (mcp_client.py), not what the model says.
+                                event = {**event, "memory_events": list(caller.memory_events)}
                             push(event)
                 finally:
                     # Nothing is carried to the next request; the caller owns the transcript.
@@ -594,6 +613,7 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
                     "chat_text": reply,
                     "spoken_audio_text": spoken or None,
                     "audio": audio.model_dump() if audio else None,
+                    "memory_events": event.get("memory_events") or [],
                 })
                 return
 
@@ -624,6 +644,14 @@ def decide_approval(approval_id: str, body: ApprovalDecision) -> dict:
 # ---- The Memory page (memory_graph.py) ---------------------------------------
 # Plain async endpoints on the server's own event loop, where memory_graph.py keeps its
 # connection pool; they never wait for the brain, so a long turn does not hold them up.
+
+
+class RelationUpdate(BaseModel):
+    """PATCH /memory/relations/{id}: the fact's status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["active", "completed", "archived"]
 
 
 class EntityUpdate(BaseModel):
@@ -675,6 +703,11 @@ async def memory_entity_delete(entity_id: str, user_id: MemoryUser = "") -> Any:
     return await _memory(lambda scope: memory_graph.delete_entity(scope, entity_id), user_id)
 
 
+@app.patch("/memory/relations/{relation_id}")
+async def memory_relation_update(relation_id: str, body: RelationUpdate, user_id: MemoryUser = "") -> Any:
+    return await _memory(lambda scope: memory_graph.update_relation(scope, relation_id, status=body.status), user_id)
+
+
 @app.delete("/memory/relations/{relation_id}")
 async def memory_relation_delete(relation_id: str, user_id: MemoryUser = "") -> Any:
     return await _memory(lambda scope: memory_graph.delete_relation(scope, relation_id), user_id)
@@ -718,11 +751,13 @@ async def voice(
         raise HTTPException(status_code=422, detail="I couldn't hear anything in that recording.")
 
     reply = spoken_text = ""
+    memory_events: list[dict[str, Any]] = []
     async with aclosing(_turn(request, brain, transcript, turns, user_id, app_url, speak)) as events:
         async for event in events:
             if event.get("type") == "final":
                 reply = str(event.get("message") or "").strip()
                 spoken_text = str(event.get("spoken") or "").strip() if speak else ""
+                memory_events = list(event.get("memory_events") or [])
                 break
             if event.get("type") in ("cancelled", "error"):
                 break
@@ -737,7 +772,12 @@ async def voice(
         )
     voiced = await asyncio.to_thread(_audio_for, spoken_text, speak)
     return VoiceResponse(
-        transcript=transcript, reply=reply, engine=heard.engine, spoken_audio_text=spoken_text or None, audio=voiced
+        transcript=transcript,
+        reply=reply,
+        engine=heard.engine,
+        spoken_audio_text=spoken_text or None,
+        audio=voiced,
+        memory_events=memory_events,
     )
 
 

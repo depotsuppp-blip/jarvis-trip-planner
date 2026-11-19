@@ -9,16 +9,23 @@ import {
   groupInfo,
   groupOf,
   loadMemoryGraph,
+  RELATION_DASH,
+  RELATION_STATUS_LABEL,
+  RELATION_STATUSES,
+  relationLabel,
   removeMemoryEntity,
   removeMemoryRelation,
   saveMemoryEntity,
+  saveMemoryRelationStatus,
   searchNodes,
   TYPE_GROUPS,
   type MemoryEntityChanges,
   type MemoryGraph,
   type MemoryNode,
+  type RelationStatus,
   type TypeGroupId,
 } from "@/lib/jarvis/memory";
+// Types only: a value imported from the canvas module would pull the graph library into server rendering.
 import type { GraphCanvasApi, GraphLink, GraphNode } from "./MemoryGraphCanvas";
 import { MemoryInspector, type ActionOutcome, type InspectorRelation } from "./MemoryInspector";
 import { focusRing, focusRingInset, iconButton, thinScroll } from "../styles";
@@ -105,11 +112,6 @@ export function MemoryView() {
     return counts;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graph, revision]);
-  const knownTypes = useMemo(
-    () => [...new Set(graph.nodes.map((node) => node.type).filter(Boolean))].sort(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [graph, revision],
-  );
 
   const selected = selectedId ? (nodeById.get(selectedId) ?? null) : null;
   const relations: InspectorRelation[] = useMemo(() => {
@@ -120,9 +122,23 @@ export function MemoryView() {
         const source = nodeById.get(endId(link.source));
         const target = nodeById.get(endId(link.target));
         return source && target
-          ? [{ id: link.id, source, target, relationType: link.relation_type, weight: link.weight }]
+          ? [{
+              id: link.id,
+              source,
+              target,
+              relationType: link.relation_type,
+              weight: link.weight,
+              status: link.status ?? "active",
+              updatedAt: link.updated_at ?? null,
+            }]
           : [];
-      });
+      })
+      // What holds now first, then what ended; the latest first within each.
+      .sort(
+        (a, b) =>
+          RELATION_STATUSES.indexOf(a.status) - RELATION_STATUSES.indexOf(b.status) ||
+          (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
+      );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graph, nodeById, selectedId, revision]);
 
@@ -204,6 +220,34 @@ export function MemoryView() {
       return { ok: true };
     },
     [forget],
+  );
+
+  const setRelationStatus = useCallback(
+    async (id: string, status: RelationStatus): Promise<ActionOutcome> => {
+      const link = graph.links.find((item) => item.id === id);
+      const result = await saveMemoryRelationStatus(id, status);
+      if (!result.ok) {
+        if (result.status === 404) {
+          setGraph((current) => ({ nodes: current.nodes, links: current.links.filter((item) => item.id !== id) }));
+        }
+        return { ok: false, message: result.message };
+      }
+      if (link) {
+        // In place, like an entry's words: the line redraws in its new style, the layout stays.
+        link.status = result.data.link.status;
+        link.updated_at = result.data.link.updated_at;
+        setRevision((value) => value + 1);
+        const source = nodeById.get(endId(link.source));
+        const target = nodeById.get(endId(link.target));
+        if (source && target) {
+          setNotice(
+            `Marked \u201c${displayName(source)} ${relationLabel(link.relation_type)} ${displayName(target)}\u201d ${RELATION_STATUS_LABEL[status].toLowerCase()}.`,
+          );
+        }
+      }
+      return { ok: true };
+    },
+    [graph, nodeById],
   );
 
   const deleteRelation = useCallback(
@@ -346,23 +390,35 @@ export function MemoryView() {
                 />
               </div>
 
-              <ul
+              {/* Bottom-right: the bottom-left corner is where the Next.js dev tools put their badge. */}
+              <div
                 aria-label="Legend"
-                className="pointer-events-none absolute bottom-3 left-3 flex max-w-[calc(100%-1.5rem)] flex-wrap gap-x-3 gap-y-1 rounded-md border border-slate-200 bg-white/95 px-3 py-2"
+                role="group"
+                className="pointer-events-none absolute bottom-3 right-3 max-w-[calc(100%-1.5rem)] rounded-md border border-slate-200 bg-white/95 px-3 py-2"
               >
-                {presentGroups.map((item) => (
-                  <li
-                    key={item.id}
-                    className={`flex items-center gap-1.5 text-xs font-medium ${
-                      group === "all" || group === item.id ? "text-slate-700" : "text-slate-400"
-                    }`}
-                  >
-                    <span aria-hidden="true" className="block size-2.5 rounded-full" style={{ background: item.color }} />
-                    {item.label}
-                    <span className="tabular-nums text-slate-600">{groupCounts.get(item.id)}</span>
-                  </li>
-                ))}
-              </ul>
+                <ul aria-label="Entry types" className="flex flex-wrap justify-end gap-x-3 gap-y-1">
+                  {presentGroups.map((item) => (
+                    <li
+                      key={item.id}
+                      className={`flex items-center gap-1.5 text-xs font-medium ${
+                        group === "all" || group === item.id ? "text-slate-700" : "text-slate-400"
+                      }`}
+                    >
+                      <span aria-hidden="true" className="block size-2.5 rounded-full" style={{ background: item.color }} />
+                      {item.label}
+                      <span className="tabular-nums text-slate-600">{groupCounts.get(item.id)}</span>
+                    </li>
+                  ))}
+                </ul>
+                <ul aria-label="Relations" className="mt-1.5 flex flex-wrap justify-end gap-x-3 gap-y-1 border-t border-slate-100 pt-1.5">
+                  {RELATION_STATUSES.map((status) => (
+                    <li key={status} className="flex items-center gap-1.5 text-xs font-medium text-slate-700">
+                      <LineSample status={status} />
+                      {RELATION_STATUS_LABEL[status]}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             </>
           )}
 
@@ -384,10 +440,10 @@ export function MemoryView() {
             key={selected.id}
             node={selected}
             relations={relations}
-            knownTypes={knownTypes}
             onSave={(changes) => save(selected, changes)}
             onDelete={() => deleteEntity(selected)}
             onDeleteRelation={deleteRelation}
+            onRelationStatus={setRelationStatus}
             onOpen={open}
             onClose={() => setSelectedId(null)}
           />
@@ -395,6 +451,25 @@ export function MemoryView() {
       </div>
     </div>
     </div>
+  );
+}
+
+/** A 20px stretch of a relation's line as the canvas draws that status (RELATION_DASH). */
+function LineSample({ status }: { status: RelationStatus }) {
+  const dash = RELATION_DASH[status];
+  return (
+    <svg aria-hidden="true" width="20" height="6" viewBox="0 0 20 6" className="shrink-0">
+      <line
+        x1="0"
+        y1="3"
+        x2="20"
+        y2="3"
+        // One colour for all three: the pattern is what tells them apart (Faint, so it reads at 20px).
+        stroke="#90a1b9"
+        strokeWidth="1.5"
+        strokeDasharray={dash ? dash.map((part) => part * 1.2).join(" ") : undefined}
+      />
+    </svg>
   );
 }
 

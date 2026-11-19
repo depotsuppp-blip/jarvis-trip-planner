@@ -1,6 +1,7 @@
 import { chatApi, type ApiFailure, type ApprovalRequest } from "./chatApi";
 import { demoReply, initialAgents, parseDemoCommand, type DemoTool } from "./demo";
-import { toChatMessage } from "./messageContent";
+import { readMemoryNote } from "./memoryNote";
+import { toChatMessage, type ServerMessageLike } from "./messageContent";
 import { canSpeak, type ReplyAudio } from "./replyAudio";
 import { createSpeechPlayer } from "./speechPlayer";
 import { createStore } from "./store";
@@ -456,7 +457,7 @@ export class ChatController {
     let toSpeak: SpokenReply | null = null;
     if (result.ok) {
       this.setAgent("brain", "ready");
-      const reply = toChatMessage(result.data.reply);
+      const reply = replyWithMemory(result.data.reply, result.data.memory);
       // The saved copy of what was sent: its real id is what Delete needs.
       const sent = toChatMessage(result.data.userMessage);
       const { conversationId } = result.data;
@@ -617,7 +618,7 @@ export class ChatController {
       this.setAgent("voice", "ready", result.data.engine === "local" ? "Heard you, on this device" : "Heard you");
       this.setAgent("brain", "ready");
       const heard = toChatMessage(result.data.userMessage);
-      const reply = toChatMessage(result.data.reply);
+      const reply = replyWithMemory(result.data.reply, result.data.memory);
       const { conversationId } = result.data;
       if (epoch === this.epoch) {
         // The English spoken text is what the audio says; the reply's words only for a brain from before it.
@@ -958,4 +959,14 @@ export class ChatController {
     for (const id of this.timers) window.clearTimeout(id);
     this.timers = [];
   }
+}
+
+/**
+ * A reply that just arrived, with what Jarvis's memory wrote while answering (the pill under it,
+ * memoryNote.ts) when its memory tool was used - checked again here, as anything the page draws.
+ */
+function replyWithMemory(reply: ServerMessageLike, memory: unknown): ChatMessage {
+  const message = toChatMessage(reply);
+  const note = readMemoryNote(memory);
+  return note ? { ...message, memory: note } : message;
 }

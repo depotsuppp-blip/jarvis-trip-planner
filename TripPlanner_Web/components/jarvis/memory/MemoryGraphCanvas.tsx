@@ -2,7 +2,17 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ForceGraph2D, { type ForceGraphMethods, type LinkObject, type NodeObject } from "react-force-graph-2d";
-import { displayName, groupInfo, groupOf, isMe, relationLabel, type MemoryLink, type MemoryNode, type TypeGroupId } from "@/lib/jarvis/memory";
+import {
+  displayName,
+  groupInfo,
+  groupOf,
+  isMe,
+  RELATION_DASH,
+  relationLabel,
+  type MemoryLink,
+  type MemoryNode,
+  type TypeGroupId,
+} from "@/lib/jarvis/memory";
 
 /**
  * The memory graph itself: a force-directed canvas (react-force-graph-2d) of the person's
@@ -18,7 +28,8 @@ import { displayName, groupInfo, groupOf, isMe, relationLabel, type MemoryLink, 
  *     selected, hovered, search matches, "me" - are always drawn.
  *   - a relation is a Perforation line with an arrow at its target, thicker the more often it
  *     was told; its words ("sister of") sit on it, along it, once the view is close enough or
- *     when it touches the selected or hovered entry.
+ *     when it touches the selected or hovered entry. A fact that ended keeps its line, drawn
+ *     as history: dashed when completed, dotted when archived (RELATION_DASH).
  *   - a search dims everything that does not match; the type filter hides the other groups.
  *
  * The library's own hover tooltip is switched off: it writes its text as HTML, and names come
@@ -310,6 +321,12 @@ export default function MemoryGraphCanvas({
     [touches, dimmed, matchIds],
   );
 
+  const linkDash = useCallback(
+    (raw: FGLink) => RELATION_DASH[(raw as GraphLink).status] ?? null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [revision],
+  );
+
   const linkWidth = useCallback(
     (raw: FGLink) => {
       const link = raw as GraphLink;
@@ -409,6 +426,7 @@ export default function MemoryGraphCanvas({
           nodeCanvasObject={paintNode}
           nodePointerAreaPaint={paintPointerArea}
           linkColor={linkColor}
+          linkLineDash={linkDash}
           linkWidth={linkWidth}
           linkCurvature={(link) => curvature.get((link as GraphLink).id) ?? 0}
           linkDirectionalArrowLength={5}

@@ -42,7 +42,7 @@ const TargetSchema = z.object({
  * lose it - the words were heard and the brain then had no answer - saves the
  * transcript before answering 502, as the typed route does.
  *
- * Responses: 200 { conversationId, userMessage, reply, transcript, engine, audio? },
+ * Responses: 200 { conversationId, userMessage, reply, transcript, engine, audio?, memory? },
  * 400 not a recording, 401 signed out, 404 unknown conversation, 413 too big,
  * 415 not audio, 422 nothing was heard, 429 rate-limited, 502 transcription or
  * the brain failed, 500 database failed, 499 the person stopped it ("Stop generating":
@@ -145,6 +145,8 @@ export async function POST(request: NextRequest) {
       transcript: heard.transcript,
       engine: heard.engine,
       ...(audio ? { audio, ...(heard.spokenText ? { spokenAudioText: heard.spokenText } : {}) } : {}),
+      // What Jarvis's memory really wrote this turn, as on POST /api/chat; not stored.
+      ...(heard.memory ? { memory: heard.memory } : {}),
     });
   } catch (error) {
     console.error("POST /api/chat/voice failed saving the turn:", error);

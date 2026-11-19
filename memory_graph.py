@@ -6,6 +6,7 @@ fix or delete what is in it. api_server.py serves it:
     GET    /memory/graph                 graph(scope)
     PATCH  /memory/entities/{id}         update_entity(scope, id, name=, type=, description=)
     DELETE /memory/entities/{id}         delete_entity(scope, id)
+    PATCH  /memory/relations/{id}        update_relation(scope, id, status=)
     DELETE /memory/relations/{id}        delete_relation(scope, id)
 
 The graph is the one mcp_memory.py keeps (tables jarvis_memory.entities and
@@ -23,7 +24,11 @@ not exist.
 
 NOTHING IS CREATED. Unlike the tool server, this never creates memory's tables
 (mcp_memory._transaction(create=False)): a database where nothing has been
-remembered yet shows an empty graph, and an edit there finds nothing.
+remembered yet shows an empty graph, and an edit there finds nothing. Tables
+made by an older version are still brought up to date (relation statuses).
+
+FACTS HAVE A STATUS. A relation is active, completed or archived, with the date
+it last changed (mcp_memory.sql); update_relation lets the person change it.
 
 AN EDIT KEEPS SEARCH RIGHT. recall finds entries by the embedding of
 "name (type): description" (mcp_memory.entity_text), so when an edit changes
@@ -105,12 +110,17 @@ def _node(row: Any) -> dict[str, Any]:
 
 
 def _link(row: Any) -> dict[str, Any]:
+    updated = row["updated_at"]
     return {
         "id": str(row["id"]),
         "source": str(row["source_id"]),
         "target": str(row["target_id"]),
         "relation_type": row["relation_type"],
         "weight": float(row["weight"]),
+        # active (holds now), completed (done) or archived (no longer true) - mcp_memory.sql
+        "status": row["status"],
+        # When it was last told or changed, as an ISO 8601 timestamp.
+        "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else None,
     }
 
 
@@ -123,7 +133,7 @@ _NODES_SQL = (
     f"WHERE scope = $1 ORDER BY name_key LIMIT {mcp_memory.MAX_ENTITIES}"
 )
 _LINKS_SQL = (
-    f"SELECT id, source_id, target_id, relation_type, weight FROM {SCHEMA}.relations "
+    f"SELECT id, source_id, target_id, relation_type, weight, status, updated_at FROM {SCHEMA}.relations "
     f"WHERE scope = $1 ORDER BY weight DESC, updated_at DESC LIMIT {mcp_memory.MAX_RELATIONS}"
 )
 _ENTITY_SQL = (
@@ -145,11 +155,16 @@ _DELETE_LINKS_OF_SQL = (
 )
 _DELETE_ENTITY_SQL = f"DELETE FROM {SCHEMA}.entities WHERE id = $1 AND scope = $2 RETURNING id"
 _DELETE_RELATION_SQL = f"DELETE FROM {SCHEMA}.relations WHERE id = $1 AND scope = $2 RETURNING id"
+_UPDATE_RELATION_SQL = f"""
+UPDATE {SCHEMA}.relations SET status = $3, updated_at = now()
+WHERE id = $1 AND scope = $2
+RETURNING id, source_id, target_id, relation_type, weight, status, updated_at
+"""
 
 # Every statement above, for the test that each one is scoped.
 STATEMENTS = (
     _NODES_SQL, _LINKS_SQL, _ENTITY_SQL, _LOCK_ENTITY_SQL, _UPDATE_ENTITY_SQL,
-    _DELETE_LINKS_OF_SQL, _DELETE_ENTITY_SQL, _DELETE_RELATION_SQL,
+    _DELETE_LINKS_OF_SQL, _DELETE_ENTITY_SQL, _DELETE_RELATION_SQL, _UPDATE_RELATION_SQL,
 )
 
 
@@ -190,13 +205,10 @@ def _clean_name(value: Any) -> str:
 
 
 def _clean_type(value: Any) -> str:
-    try:
-        text = mcp_memory._text(value, "type", mcp_memory.MAX_TYPE, required=False)
-    except ToolError as exc:
-        raise GraphError(400, "invalid", str(exc)) from None
-    kind = mcp_memory._snake(text)[: mcp_memory.MAX_TYPE]
-    if text and not kind:
-        raise GraphError(400, "invalid", "'type' must have letters in it.")
+    """One of mcp_memory.ENTITY_TYPES - the same fixed set the extractor is held to."""
+    kind = str(value or "").strip().lower()
+    if kind not in mcp_memory.ENTITY_TYPES:
+        raise GraphError(400, "invalid", f"'type' must be one of: {', '.join(mcp_memory.ENTITY_TYPES)}.")
     return kind
 
 
@@ -305,6 +317,31 @@ async def delete_entity(scope: str, entity_id: Any) -> dict[str, Any]:
         return await _db(remove, "delete it")
     except mcp_memory.NoMemoryYet:
         raise _not_found() from None
+
+
+async def update_relation(scope: str, relation_id: Any, *, status: Any) -> dict[str, Any]:
+    """
+    Sets a relation's status - active, completed or archived - as a person corrects it by hand
+    ("I finished that project"); its date moves to now. {"link": {...}}.
+    """
+    scope = _scope(scope)
+    key = _uuid(relation_id, "relation")
+    wanted = str(status or "").strip().lower()
+    if wanted not in mcp_memory.RELATION_STATUSES:
+        raise GraphError(400, "invalid", f"'status' must be one of: {', '.join(mcp_memory.RELATION_STATUSES)}.")
+    _usable()
+
+    async def write() -> Any:
+        async with mcp_memory._transaction(create=False) as conn:
+            return await conn.fetchrow(_UPDATE_RELATION_SQL, key, scope, wanted)
+
+    try:
+        row = await _db(write, "save the change")
+    except mcp_memory.NoMemoryYet:
+        raise _not_found("relation") from None
+    if row is None:
+        raise _not_found("relation")
+    return {"link": _link(row)}
 
 
 async def delete_relation(scope: str, relation_id: Any) -> dict[str, Any]:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import os
 import re
 import sys
@@ -56,7 +57,10 @@ def headers(user: str) -> dict[str, str]:
 # An in-memory stand-in for memory's two tables
 # =====================================================================
 
-_WRITES = {G._UPDATE_ENTITY_SQL, G._DELETE_LINKS_OF_SQL, G._DELETE_ENTITY_SQL, G._DELETE_RELATION_SQL}
+_WRITES = {
+    G._UPDATE_ENTITY_SQL, G._DELETE_LINKS_OF_SQL, G._DELETE_ENTITY_SQL, G._DELETE_RELATION_SQL, G._UPDATE_RELATION_SQL,
+}
+T0 = datetime.datetime(2026, 11, 1, 9, 30, tzinfo=datetime.timezone.utc)
 
 
 class FakeStore:
@@ -76,11 +80,14 @@ class FakeStore:
         }
         return key
 
-    def relation(self, scope: str, source: uuid.UUID, target: uuid.UUID, verb: str, weight: float = 1.0) -> uuid.UUID:
+    def relation(
+        self, scope: str, source: uuid.UUID, target: uuid.UUID, verb: str, weight: float = 1.0, status: str = "active",
+    ) -> uuid.UUID:
         key = uuid.uuid4()
         self.relations[key] = {
             "id": key, "scope": scope, "source_id": source, "target_id": target,
             "relation_type": verb, "weight": weight, "order": len(self.relations),
+            "status": status, "updated_at": T0,
         }
         return key
 
@@ -140,6 +147,13 @@ class FakeStore:
             for r in [r for r in R.values() if key in (r["source_id"], r["target_id"])]:  # ON DELETE CASCADE
                 del R[r["id"]]
             return [{"id": key}]
+        if sql == G._UPDATE_RELATION_SQL:
+            key, scope, status = args
+            r = R.get(key)
+            if not r or r["scope"] != scope:
+                return []
+            r.update(status=status, updated_at=datetime.datetime.now(datetime.timezone.utc))
+            return [r]
         if sql == G._DELETE_RELATION_SQL:
             key, scope = args
             r = R.get(key)
@@ -231,6 +245,7 @@ class MemoryApiTests(unittest.TestCase):
             ("PATCH", f"/memory/entities/{some}", {"name": "X"}),
             ("DELETE", f"/memory/entities/{some}", None),
             ("DELETE", f"/memory/relations/{self.a_sister}", None),
+            ("PATCH", f"/memory/relations/{self.a_sister}", {"status": "archived"}),
         ):
             for sent in ({}, headers(""), headers("   ")):
                 response = self.client.request(method, path, json=body, headers=sent)
@@ -283,7 +298,7 @@ class MemoryApiTests(unittest.TestCase):
         sister = next(l for l in a["links"] if l["relation_type"] == "sister_of")
         self.assertEqual(sister, {
             "id": str(self.a_sister), "source": str(self.a_nok), "target": str(self.a_me),
-            "relation_type": "sister_of", "weight": 2.0,
+            "relation_type": "sister_of", "weight": 2.0, "status": "active", "updated_at": "2026-11-01T09:30:00+00:00",
         })
 
     def test_reads_are_read_only_and_nothing_is_ever_created(self) -> None:
@@ -370,9 +385,17 @@ class MemoryApiTests(unittest.TestCase):
 
     def test_description_and_type_changes_reembed(self) -> None:
         self.client.patch(f"/memory/entities/{self.a_cm}", json={"description": "  Nok's  home city "}, headers=headers(ALICE))
-        self.client.patch(f"/memory/entities/{self.a_cm}", json={"type": "City"}, headers=headers(ALICE))
-        self.assertEqual(self.embedded, ["Chiang Mai (place): Nok's home city", "Chiang Mai (city): Nok's home city"])
-        self.assertEqual(self.store.entities[self.a_cm]["type"], "city")
+        self.client.patch(f"/memory/entities/{self.a_cm}", json={"type": "Other"}, headers=headers(ALICE))
+        self.assertEqual(self.embedded, ["Chiang Mai (place): Nok's home city", "Chiang Mai (other): Nok's home city"])
+        self.assertEqual(self.store.entities[self.a_cm]["type"], "other")
+
+    def test_types_are_the_fixed_six(self) -> None:
+        for kind in ("City", "framework", "", "planet"):
+            response = self.client.patch(f"/memory/entities/{self.a_cm}", json={"type": kind}, headers=headers(ALICE))
+            self.assertEqual((response.status_code, response.json()["code"]), (400, "invalid"), kind)
+        for kind in mcp_memory.ENTITY_TYPES:
+            response = self.client.patch(f"/memory/entities/{self.a_cm}", json={"type": kind}, headers=headers(ALICE))
+            self.assertEqual(response.status_code, 200, kind)
 
     def test_no_change_is_no_write(self) -> None:
         response = self.client.patch(
@@ -430,6 +453,32 @@ class MemoryApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["code"], "embedding_failed")
         self.assertEqual(self.store.entities[self.a_nok]["name"], "Nok")
+
+    # ---- relation status ----------------------------------------------------------------
+
+    def test_relation_status_can_be_changed(self) -> None:
+        response = self.client.patch(f"/memory/relations/{self.a_lives}", json={"status": "archived"}, headers=headers(ALICE))
+        self.assertEqual(response.status_code, 200, response.text)
+        link = response.json()["link"]
+        self.assertEqual((link["id"], link["status"]), (str(self.a_lives), "archived"))
+        self.assertGreater(link["updated_at"], "2026-11-01T09:30:00+00:00")
+        self.assertEqual(self.store.relations[self.a_lives]["status"], "archived")
+        shown = next(l for l in self.graph(ALICE)["links"] if l["id"] == str(self.a_lives))
+        self.assertEqual(shown["status"], "archived")
+
+    def test_relation_status_is_one_of_three(self) -> None:
+        for body in ({"status": "done"}, {"status": ""}, {}, {"status": "completed", "weight": 9}):
+            response = self.client.patch(f"/memory/relations/{self.a_lives}", json=body, headers=headers(ALICE))
+            self.assertEqual(response.status_code, 422, body)
+        self.assertEqual(self.store.relations[self.a_lives]["status"], "active")
+
+    def test_another_persons_relation_status_cannot_be_changed(self) -> None:
+        for user in (BOB, OWNER_ID):
+            response = self.client.patch(f"/memory/relations/{self.a_sister}", json={"status": "completed"}, headers=headers(user))
+            self.assertEqual(response.status_code, 404, user)
+        self.assertEqual(self.store.relations[self.a_sister]["status"], "active")
+        response = self.client.patch(f"/memory/relations/{self.a_sister}", json={"status": "completed"})
+        self.assertEqual(response.status_code, 401)
 
     # ---- deleting ------------------------------------------------------------------------
 

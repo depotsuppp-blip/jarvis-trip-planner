@@ -61,6 +61,11 @@ class RequestContext:
     # A mutable list on a frozen dataclass: the context is replaced per request, the list is
     # filled by tools and read once by the brain when it has the final reply.
     widgets: list[dict[str, Any]] = field(default_factory=list, compare=False, repr=False)
+    # What the memory tool wrote during THIS request (mcp_client.py records each remember: saved,
+    # confirmed or failed), handed to the web page with the reply - so the page can show that
+    # memory really was written, instead of trusting the model's "got it". Filled from worker
+    # threads (list.append is atomic), read once by api_server.py when the turn ends.
+    memory_events: list[dict[str, Any]] = field(default_factory=list, compare=False, repr=False)
 
     @property
     def is_web(self) -> bool:
@@ -87,6 +92,15 @@ def add_widget(widget: dict[str, Any]) -> bool:
     if context is None or not context.is_web:
         return False
     context.widgets.append(widget)
+    return True
+
+
+def add_memory_event(event: dict[str, Any]) -> bool:
+    """Records what a memory write did for the current request (see memory_events). False outside one."""
+    context = current()
+    if context is None:
+        return False
+    context.memory_events.append(event)
     return True
 
 

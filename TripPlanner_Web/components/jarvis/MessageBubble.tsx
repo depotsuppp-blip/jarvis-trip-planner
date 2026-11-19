@@ -3,6 +3,7 @@ import { formatMessageTime } from "@/lib/jarvis/sessions";
 import type { ChatMessage } from "@/lib/jarvis/types";
 import { AttachmentChip } from "./AttachmentChip";
 import { DynamicRenderer } from "./DynamicRenderer";
+import { MemoryPill } from "./MemoryPill";
 import { MessageActions } from "./MessageActions";
 import { SampleBadge } from "./widgets/SampleBadge";
 
@@ -21,7 +22,8 @@ import { SampleBadge } from "./widgets/SampleBadge";
  *
  * The message's actions (MessageActions) sit on lines it already has, so they add no
  * height: Edit and Delete beside the time under the person's bubble, Copy and Delete
- * at the end of Jarvis's byline. `locked` - this message's answer is still on its way -
+ * at the end of Jarvis's byline. A reply that saved to Jarvis's memory ends with a
+ * MemoryPill ("Saved to memory · 2 entries"). `locked` - this message's answer is still on its way -
  * holds Delete back.
  */
 export const MessageBubble = memo(function MessageBubble({ message, locked = false }: { message: ChatMessage; locked?: boolean }) {
@@ -62,6 +64,8 @@ export const MessageBubble = memo(function MessageBubble({ message, locked = fal
       <div className="mt-1.5">
         <DynamicRenderer content={message.content} tone={message.tone} />
       </div>
+      {/* What Jarvis's memory really wrote while answering (only on a reply that just arrived). */}
+      {message.memory && <MemoryPill note={message.memory} />}
     </li>
   );
 });

@@ -4,13 +4,17 @@ import { useEffect, useId, useRef, useState } from "react";
 import { Check, Pencil, Trash2, X } from "lucide-react";
 import {
   displayName,
+  ENTITY_TYPES,
   groupInfo,
   groupOf,
   isMe,
   MEMORY_LIMITS,
+  RELATION_STATUS_LABEL,
+  RELATION_STATUSES,
   relationLabel,
   type MemoryEntityChanges,
   type MemoryNode,
+  type RelationStatus,
 } from "@/lib/jarvis/memory";
 import { focusRing, iconButton, thinScroll } from "../styles";
 
@@ -21,6 +25,9 @@ export interface InspectorRelation {
   target: MemoryNode;
   relationType: string;
   weight: number;
+  status: RelationStatus;
+  /** ISO 8601, or null when the brain does not say. */
+  updatedAt: string | null;
 }
 
 export type ActionOutcome = { ok: true } | { ok: false; message: string };
@@ -28,11 +35,11 @@ export type ActionOutcome = { ok: true } | { ok: false; message: string };
 interface MemoryInspectorProps {
   node: MemoryNode;
   relations: InspectorRelation[];
-  /** Every type already in memory, offered while typing one. */
-  knownTypes: string[];
   onSave: (changes: MemoryEntityChanges) => Promise<ActionOutcome>;
   onDelete: () => Promise<ActionOutcome>;
   onDeleteRelation: (id: string) => Promise<ActionOutcome>;
+  /** Marks a relation active, completed or archived. */
+  onRelationStatus: (id: string, status: RelationStatus) => Promise<ActionOutcome>;
   /** Opens another entry (a relation's other end). */
   onOpen: (id: string) => void;
   onClose: () => void;
@@ -56,17 +63,19 @@ const danger = `inline-flex h-10 items-center justify-center gap-2 rounded-md px
  *   - Delete asks first, in words that say how many relations go with it.
  *   - Each relation reads as a sentence ("Nok - sister of - me"); the other end opens that
  *     entry, and the x removes the relation after a second press ("Remove?", 4 seconds),
- *     like a message's Delete in the chat.
+ *     like a message's Delete in the chat. Under it, its status - Active, Completed or
+ *     Archived, a choice that saves at once - and the date it last changed. Facts that ended
+ *     stay listed (after the ones that hold), in Ink Body: they are history, not mistakes.
  *
  * Escape cancels an edit or a pending delete, else closes the panel.
  */
 export function MemoryInspector({
   node,
   relations,
-  knownTypes,
   onSave,
   onDelete,
   onDeleteRelation,
+  onRelationStatus,
   onOpen,
   onClose,
 }: MemoryInspectorProps) {
@@ -146,7 +155,6 @@ export function MemoryInspector({
         {mode === "edit" ? (
           <EditForm
             node={node}
-            knownTypes={knownTypes}
             onCancel={() => {
               setMode("view");
               setError(null);
@@ -235,6 +243,7 @@ export function MemoryInspector({
                   selfId={node.id}
                   onOpen={onOpen}
                   onRemove={() => onDeleteRelation(relation.id)}
+                  onStatus={(status) => onRelationStatus(relation.id, status)}
                 />
               ))}
             </ul>
@@ -247,12 +256,10 @@ export function MemoryInspector({
 
 function EditForm({
   node,
-  knownTypes,
   onSave,
   onCancel,
 }: {
   node: MemoryNode;
-  knownTypes: string[];
   onSave: (changes: MemoryEntityChanges) => Promise<ActionOutcome>;
   onCancel: () => void;
 }) {
@@ -264,8 +271,10 @@ function EditForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const first = useRef<HTMLInputElement | null>(null);
+  const typeField = useRef<HTMLSelectElement | null>(null);
 
-  useEffect(() => first.current?.focus(), []);
+  // The first field that can change: the name, or for "me" (whose name stays) the type.
+  useEffect(() => (first.current ?? typeField.current)?.focus(), []);
 
   const changes: MemoryEntityChanges = {};
   if (!me && name.trim() !== node.name) changes.name = name.trim();
@@ -313,22 +322,21 @@ function EditForm({
         <label htmlFor={`${id}-type`} className="block text-[13px] font-semibold text-slate-800">
           Type
         </label>
-        <input
+        <select
           id={`${id}-type`}
-          ref={me ? first : undefined}
+          ref={me ? typeField : undefined}
           value={type}
           onChange={(event) => setType(event.target.value)}
-          maxLength={MEMORY_LIMITS.type}
-          list={`${id}-types`}
-          placeholder="person, place, project…"
-          autoComplete="off"
-          className={`${field} h-10`}
-        />
-        <datalist id={`${id}-types`}>
-          {knownTypes.map((known) => (
-            <option key={known} value={known} />
+          className={`${field} h-10 pr-8`}
+        >
+          {/* An entry saved before types were fixed keeps its old one until another is picked. */}
+          {!(ENTITY_TYPES as readonly string[]).includes(node.type) && <option value={node.type}>{node.type || "no type"}</option>}
+          {ENTITY_TYPES.map((kind) => (
+            <option key={kind} value={kind}>
+              {kind}
+            </option>
           ))}
-        </datalist>
+        </select>
       </div>
 
       <div>
@@ -369,20 +377,37 @@ function EditForm({
   );
 }
 
+const DATE = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric" });
+
 function RelationRow({
   relation,
   selfId,
   onOpen,
   onRemove,
+  onStatus,
 }: {
   relation: InspectorRelation;
   selfId: string;
   onOpen: (id: string) => void;
   onRemove: () => Promise<ActionOutcome>;
+  onStatus: (status: RelationStatus) => Promise<ActionOutcome>;
 }) {
+  const statusId = useId();
   const [armed, setArmed] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const ended = relation.status !== "active";
+  const updated = relation.updatedAt ? new Date(relation.updatedAt) : null;
+
+  async function changeStatus(status: RelationStatus) {
+    if (status === relation.status) return;
+    setSaving(true);
+    setError(null);
+    const outcome = await onStatus(status);
+    setSaving(false);
+    if (!outcome.ok) setError(outcome.message);
+  }
 
   useEffect(() => {
     if (!armed) return;
@@ -424,13 +449,38 @@ function RelationRow({
   return (
     <li className="border-b border-slate-100 py-2.5 last:border-b-0">
       <div className="flex items-start gap-2">
-        <p className="min-w-0 flex-1 break-words text-sm leading-6 text-slate-700">
-          {end(relation.source)} <span className="text-slate-600">{relationLabel(relation.relationType)}</span>{" "}
-          {end(relation.target)}
-          {relation.weight > 1 && (
-            <span className="ml-2 whitespace-nowrap text-xs tabular-nums text-slate-600">told {relation.weight}×</span>
-          )}
-        </p>
+        <div className="min-w-0 flex-1">
+          <p className={`break-words text-sm leading-6 ${ended ? "text-slate-600" : "text-slate-700"}`}>
+            {end(relation.source)} <span className="text-slate-600">{relationLabel(relation.relationType)}</span>{" "}
+            {end(relation.target)}
+            {relation.weight > 1 && (
+              <span className="ml-2 whitespace-nowrap text-xs tabular-nums text-slate-600">told {relation.weight}×</span>
+            )}
+          </p>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <label htmlFor={statusId} className="sr-only">
+              Status of &ldquo;{sentence}&rdquo;
+            </label>
+            <select
+              id={statusId}
+              value={relation.status}
+              disabled={saving || busy}
+              onChange={(event) => void changeStatus(event.target.value as RelationStatus)}
+              className={`h-8 rounded-md border border-slate-300 bg-white pl-2 pr-7 text-xs font-medium text-slate-800 hover:border-slate-400 disabled:cursor-wait disabled:opacity-60 pointer-coarse:h-10 ${focusRing}`}
+            >
+              {RELATION_STATUSES.map((status) => (
+                <option key={status} value={status}>
+                  {RELATION_STATUS_LABEL[status]}
+                </option>
+              ))}
+            </select>
+            {updated && !Number.isNaN(updated.getTime()) && (
+              <time dateTime={relation.updatedAt ?? undefined} className="text-xs tabular-nums text-slate-600">
+                {saving ? "Saving…" : `Updated ${DATE.format(updated)}`}
+              </time>
+            )}
+          </div>
+        </div>
         <button
           type="button"
           onClick={() => void press()}

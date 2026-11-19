@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getSessionUserId } from "@/lib/auth";
-import { MEMORY_LIMITS } from "@/lib/jarvis/memory";
+import { ENTITY_TYPES, MEMORY_LIMITS } from "@/lib/jarvis/memory";
 import {
   deleteMemoryEntity,
   MEMORY_SIGNED_OUT,
@@ -17,7 +17,8 @@ type RouteParams = { params: Promise<{ id: string }> };
 const ChangesSchema = z
   .strictObject({
     name: z.string().trim().min(1).max(MEMORY_LIMITS.name).optional(),
-    type: z.string().trim().max(MEMORY_LIMITS.type).optional(),
+    // One of the six the brain holds every entry to.
+    type: z.enum(ENTITY_TYPES).optional(),
     description: z.string().trim().max(MEMORY_LIMITS.description).optional(),
   })
   .refine((changes) => Object.values(changes).some((value) => value !== undefined), {
@@ -45,7 +46,7 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
   if (!parsed.success) {
     return NextResponse.json(
       {
-        error: `Send a name (1-${MEMORY_LIMITS.name} characters), a type (up to ${MEMORY_LIMITS.type}) or a description (up to ${MEMORY_LIMITS.description}).`,
+        error: `Send a name (1-${MEMORY_LIMITS.name} characters), a type (${ENTITY_TYPES.join(", ")}) or a description (up to ${MEMORY_LIMITS.description}).`,
         code: "invalid",
       },
       { status: 400 },

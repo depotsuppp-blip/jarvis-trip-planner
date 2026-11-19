@@ -736,6 +736,40 @@ def result_text(result: dict[str, Any]) -> str:
     return text
 
 
+# The bundled long-term memory server (mcp_memory.py): its remember calls are reported to the
+# request (request_context.memory_events), so the web page can show what was really saved.
+MEMORY_SERVER = "memory"
+_EVENT_ACTIONS = ("saved", "confirmed")
+
+
+def _note_memory_write(structured: Any, failure: Optional[str]) -> None:
+    """
+    Records one remember for the current request: what it saved (the server's own
+    structuredContent memory_event, re-checked here) or that it failed - never the model's
+    account of it. A remember that ran but sent no event (an older server) counts as saved.
+    """
+    if failure is not None:
+        # The reason stays here (it can name the database login): the page only learns that it failed.
+        request_context.add_memory_event({"action": "failed", "entries": 0, "facts": 0, "merged": 0, "summary": ""})
+        return
+    raw = structured.get("memory_event") if isinstance(structured, dict) else None
+    event = raw if isinstance(raw, dict) else {}
+
+    def count(name: str) -> int:
+        value = event.get(name)
+        return max(0, min(int(value), 10_000)) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    action = event.get("action") if event.get("action") in _EVENT_ACTIONS else "saved"
+    summary = event.get("summary") if isinstance(event.get("summary"), str) else ""
+    request_context.add_memory_event({
+        "action": action,
+        "entries": count("entries"),
+        "facts": count("facts"),
+        "merged": count("merged"),
+        "summary": re.sub(r"\s+", " ", summary).strip()[:240],
+    })
+
+
 def _labelled(server: str, text: str) -> str:
     """The result as the model sees it: marked as data from outside."""
     return (
@@ -920,13 +954,19 @@ class McpManager:
             conn = owner.conn if owner else None
         if owner is None:
             raise McpError(f"{exposed} is no longer offered by any MCP server")
+        # A remember is reported to the request whatever happens to it (see _note_memory_write).
+        memory_write = owner.config.name == MEMORY_SERVER and original == "remember"
         if conn is None or not conn.alive:
+            if memory_write:
+                _note_memory_write(None, "the memory server is not running")
             raise McpError(f"the {owner.config.name} tool server is not running ({owner.error or 'it stopped'})")
 
         if owner.config.user_scoped:
             # Set here, never taken from the model: a "_scope" it wrote is overwritten.
             scope = caller_scope()
             if not scope:
+                if memory_write:
+                    _note_memory_write(None, "no caller")
                 raise McpToolError(_labelled(
                     owner.config.name,
                     "This tool keeps a separate store for each person, and this request did not say "
@@ -934,10 +974,19 @@ class McpManager:
                 ))
             arguments = {**(arguments or {}), _SCOPE_ARG: scope}
 
-        result = conn.call_tool(original, arguments)  # McpError on timeout / crash / protocol error
+        try:
+            result = conn.call_tool(original, arguments)  # McpError on timeout / crash / protocol error
+        except McpError:
+            if memory_write:
+                _note_memory_write(None, "Jarvis couldn't reach its memory.")
+            raise
         text = result_text(result)
         if result.get("isError"):
+            if memory_write:
+                _note_memory_write(None, text)
             raise McpToolError(_labelled(owner.config.name, text or "the tool reported an error"))
+        if memory_write:
+            _note_memory_write(result.get("structuredContent"), None)
         return _labelled(owner.config.name, text)
 
     # -- reporting -----------------------------------------------------

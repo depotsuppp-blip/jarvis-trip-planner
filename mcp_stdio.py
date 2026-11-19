@@ -35,6 +35,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from typing import Any, Callable
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -49,11 +50,25 @@ class ToolError(Exception):
     """A failure the model should hear about, worded for it."""
 
 
-Handler = Callable[[dict], str]
+@dataclass(frozen=True)
+class ToolOutput:
+    """
+    A result with more than the text the model reads: `structured` goes out as the result's
+    MCP structuredContent, which mcp_client.py hands to Jarvis itself (never to the model) -
+    e.g. the memory server's {"memory_event": {...}}, which the web page shows under the reply.
+    """
+
+    text: str
+    structured: dict[str, Any]
 
 
-def text_result(text: str, *, is_error: bool = False) -> dict:
+Handler = Callable[[dict], "str | ToolOutput"]
+
+
+def text_result(text: str, *, is_error: bool = False, structured: dict | None = None) -> dict:
     result: dict = {"content": [{"type": "text", "text": text}]}
+    if structured is not None:
+        result["structuredContent"] = structured
     if is_error:
         result["isError"] = True
     return result
@@ -111,7 +126,10 @@ class Server:
     def call(self, name: str, arguments: dict) -> dict:
         """One tools/call -> its result. Never raises."""
         try:
-            return text_result(self.handlers[name](arguments))
+            output = self.handlers[name](arguments)
+            if isinstance(output, ToolOutput):
+                return text_result(output.text, structured=output.structured)
+            return text_result(output)
         except ToolError as exc:
             return text_result(str(exc), is_error=True)
         except Exception as exc:  # noqa: BLE001 - a bug in a tool must not take the server down

@@ -67,6 +67,26 @@ CREATE TABLE IF NOT EXISTS jarvis_memory.relations (
 -- relations_unique already indexes source_id first; the other direction of a hop:
 CREATE INDEX IF NOT EXISTS relations_target ON jarvis_memory.relations (target_id);
 
+-- TEMPORAL FACTS (added 2026-11-19; a database made before then is upgraded by these lines).
+-- A fact that ended is not deleted: "me building Jarvis" becomes 'completed' when the person
+-- says they finished it, or 'archived' when it no longer holds ("I left Sony"), and the new
+-- fact is 'active' beside it. recall shows the status and the date it last changed, so the
+-- brain can tell the latest from the history.
+ALTER TABLE jarvis_memory.relations ADD COLUMN IF NOT EXISTS status     varchar(16) NOT NULL DEFAULT 'active';
+ALTER TABLE jarvis_memory.relations ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE jarvis_memory.relations ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'relations_status_known' AND conrelid = 'jarvis_memory.relations'::regclass
+    ) THEN
+        ALTER TABLE jarvis_memory.relations
+            ADD CONSTRAINT relations_status_known CHECK (status IN ('active', 'completed', 'archived'));
+    END IF;
+END
+$$;
+
 -- No approximate (HNSW / IVFFlat) index on purpose: a search only ever looks at
 -- one person's rows (at most 2000, mcp_memory.MAX_ENTITIES), found through
 -- entities_scope_name_key, and an exact scan of those is fast. An approximate
