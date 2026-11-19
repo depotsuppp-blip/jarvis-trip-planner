@@ -39,10 +39,10 @@ export const RELATION_STATUSES = ["active", "completed", "archived"] as const;
 export type RelationStatus = (typeof RELATION_STATUSES)[number];
 
 /**
- * How the Memory graph draws a fact of each status (canvas line dash, in graph units - it scales
- * with the zoom like the line itself): a fact that ended stays drawn, as history.
+ * How the Memory graph draws a fact of each status (a line dash in screen pixels at any zoom,
+ * and the legend's sample of it): a fact that ended stays drawn, as history.
  */
-export const RELATION_DASH: Record<RelationStatus, number[] | null> = { active: null, completed: [4, 3], archived: [1.5, 2.5] };
+export const RELATION_DASH: Record<RelationStatus, number[] | null> = { active: null, completed: [6, 4], archived: [1.5, 3.5] };
 
 export const RELATION_STATUS_LABEL: Record<RelationStatus, string> = {
   active: "Active",
@@ -71,20 +71,22 @@ export const MEMORY_LIMITS = { name: 120, type: 40, description: 300 } as const;
 // ---- the colour groups ---------------------------------------------------------------
 
 /**
- * The legend: every entry's type falls in one of six groups, and the group gives its colour.
- * The five hues were checked as a set (dataviz validate_palette.js, all pairs - any two nodes
- * can sit side by side): worst colour-blind distance 9.2 (deutan), worst normal-vision 16.3,
- * on Paper. Teal is below 3:1 against white, so every node also carries its name on the
- * canvas (and its type in the inspector): colour is never the only sign. "Other" is a neutral.
+ * The legend: every entry's type falls in one of six groups, and the group gives its colour -
+ * six neon hues for the Memory page's deep-space canvas (#060913). Checked as a set with the
+ * dataviz validator, all pairs (any two planets can sit side by side): worst colour-blind
+ * distance 9.2 (deutan, violet/sky), worst normal-vision 15.8 (pink/violet), every one at least
+ * 3:1 on the canvas. They sit above the validator's dark lightness band (OKLCH L 0.70-0.82, not
+ * 0.48-0.67) on purpose: that band is set for a #1a1a19 chart, and here they are lights in the
+ * dark. Every node also carries its name (and the panel its type): colour is never the only sign.
  * Fixed per group, never by rank or count, so filtering never repaints anyone.
  */
 export const TYPE_GROUPS = [
-  { id: "person", label: "Person", color: "#2a78d6" },
-  { id: "place", label: "Place", color: "#1baf7a" },
-  { id: "organization", label: "Organization", color: "#eb6834" },
-  { id: "project", label: "Project", color: "#4a3aa7" },
-  { id: "technology", label: "Technology", color: "#c2417a" },
-  { id: "other", label: "Other", color: "#90a1b9" },
+  { id: "person", label: "Person", color: "#34c8fd" },
+  { id: "project", label: "Project", color: "#cb6cff" },
+  { id: "technology", label: "Technology", color: "#ff53a8" },
+  { id: "organization", label: "Organization", color: "#f87f02" },
+  { id: "place", label: "Place", color: "#3fe691" },
+  { id: "other", label: "Other", color: "#e3c327" },
 ] as const;
 
 export type TypeGroupId = (typeof TYPE_GROUPS)[number]["id"];
