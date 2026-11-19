@@ -1,7 +1,7 @@
 import { focusRing } from "../styles";
 
 /**
- * The Memory page's dark dialect (the Solar System): deep space (#060913) under glass panels.
+ * The Memory page's dark dialect (the Solar System): obsidian black (#06070B, the 3D scene's background) under glass panels.
  * Class strings shared by the page and its panel, so one control is never styled two ways.
  * Text on the glass, measured: Star Ink #f1f5fb 17.2:1, Star Body #c9d3e3 12.5:1, Star Muted
  * #a3b0c6 8.6:1, Flare #ff8095 (errors) 7.9:1, Aurora #4ade80 (saved) 10.8:1. The keyboard

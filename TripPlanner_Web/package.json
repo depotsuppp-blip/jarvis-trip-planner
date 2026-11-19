@@ -24,8 +24,9 @@
     "pg": "^8.23.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "react-force-graph-2d": "^1.29.2",
+    "react-force-graph-3d": "1.29.2",
     "thinking-orbs": "^0.3.2",
+    "three": "0.187.0",
     "zod": "^4.5.4"
   },
   "devDependencies": {
@@ -35,10 +36,15 @@
     "@types/pg": "^8.23.1",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/three": "0.187.0",
     "eslint": "^9",
     "eslint-config-next": "16.3.2",
     "prisma": "7.10.0",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "overrides": {
+    "3d-force-graph": "1.80.1",
+    "three-render-objects": "1.43.0"
   }
 }

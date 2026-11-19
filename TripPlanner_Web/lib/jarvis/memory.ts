@@ -38,12 +38,6 @@ export interface MemoryLink {
 export const RELATION_STATUSES = ["active", "completed", "archived"] as const;
 export type RelationStatus = (typeof RELATION_STATUSES)[number];
 
-/**
- * How the Memory graph draws a fact of each status (a line dash in screen pixels at any zoom,
- * and the legend's sample of it): a fact that ended stays drawn, as history.
- */
-export const RELATION_DASH: Record<RelationStatus, number[] | null> = { active: null, completed: [6, 4], archived: [1.5, 3.5] };
-
 export const RELATION_STATUS_LABEL: Record<RelationStatus, string> = {
   active: "Active",
   completed: "Completed",

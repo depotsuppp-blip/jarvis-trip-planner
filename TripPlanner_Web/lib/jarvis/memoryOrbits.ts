@@ -68,11 +68,11 @@ export const endId = (end: End | undefined | null): string =>
 
 // Hops past this share the last ring.
 const LAST_HOP_RING = 4;
-const FIRST_RADIUS = 150;
-const RING_GAP = 115;
+const FIRST_RADIUS = 230;
+const RING_GAP = 150;
 // Room along a ring for one entry (graph units of arc): planets carry names at every zoom.
-const PLANET_ARC = 120;
-const MOON_ARC = 48;
+const PLANET_ARC = 170;
+const MOON_ARC = 70;
 
 export function computeOrbits(nodes: readonly MemoryNode[], links: readonly LinkEnds[]): Orbits {
   const ids = new Set(nodes.map((node) => node.id));
@@ -162,14 +162,31 @@ export function computeOrbits(nodes: readonly MemoryNode[], links: readonly Link
   };
 }
 
-/** An entry as the canvas holds it: the graph library reads x/y and pins fx/fy. */
+/**
+ * An entry as the 3D scene holds it: x and z are its place on the orbital plane, y its height
+ * above or below it. The layout (lib/jarvis/memoryLayout.ts) pins all three (fx, fy, fz), so
+ * nothing moves once drawn.
+ */
 export interface GraphNode extends MemoryNode {
+  x?: number;
+  y?: number;
+  z?: number;
+  vx?: number;
+  vy?: number;
+  vz?: number;
+  fx?: number;
+  fy?: number;
+  fz?: number;
+}
+
+/** An entry on the flat orbital plane while the layout works it out (x, y in the plane). */
+export interface PlaneNode extends MemoryNode {
   x?: number;
   y?: number;
   vx?: number;
   vy?: number;
-  fx?: number;
-  fy?: number;
+  fx?: number | null;
+  fy?: number | null;
 }
 
 /** A relation as the canvas holds it: the library swaps each end's id for the node itself. */
@@ -188,9 +205,9 @@ export interface SolarGraph {
  * another. The centre is pinned at (0, 0). Starting this close to the answer is what lets the
  * layout settle before the first frame - the orbits are still from the moment they appear.
  */
-export function seedOrbits(nodes: GraphNode[], orbits: Orbits): void {
+export function seedOrbits(nodes: PlaneNode[], orbits: Orbits): void {
   const angle = new Map<string, number>();
-  const byRing = new Map<number, GraphNode[]>();
+  const byRing = new Map<number, PlaneNode[]>();
   for (const node of nodes) {
     const info = orbits.byId.get(node.id);
     if (!info) continue;
@@ -257,49 +274,34 @@ export function seedOrbits(nodes: GraphNode[], orbits: Orbits): void {
   }
 }
 
-/**
- * After entries or relations go, the graph that is left: the centre pinned at (0, 0) - with no
- * "me", the most connected entry can change - and every other entry free to find its orbit.
- */
-export function settle(nodes: GraphNode[], links: GraphLink[]): SolarGraph {
-  const centerId = computeOrbits(nodes, links).centerId;
-  for (const node of nodes) {
-    if (node.id === centerId) {
-      node.fx = 0;
-      node.fy = 0;
-    } else if (node.fx !== undefined || node.fy !== undefined) {
-      delete node.fx;
-      delete node.fy;
-    }
-  }
-  return { nodes, links };
-}
-
 // ---- colour families and statuses -----------------------------------------------------------
 
-/** The Sun: a warm golden-amber glow - its core, its body, the rim of its aura. */
-export const SUN_COLORS = { core: "#FFF3B0", body: "#FFB703", rim: "#E85D04" } as const;
+/** The Sun: a white-gold core warming to amber, inside a golden-orange wireframe globe. */
+export const SUN_COLORS = { core: "#FFF7CC", body: "#FFB703", wire: "#FF8C24" } as const;
 
 /**
- * The planets' signature colours, dealt round the inner orbit in this order: Neon Crimson,
- * Electric Violet, Emerald, Cyber Blue, Neon Magenta, Indigo, Warm Coral, Cyan. The order is
- * the one (of all 5040) that keeps every two neighbours easiest to tell apart, measured like the
- * dataviz validator: worst neighbouring pair 14.7 for colour-blind vision, 26.5 for normal
- * (in the order Crimson, Violet, Blue, Magenta... it was 1.3 - Violet and Indigo are one colour
- * to a colour-blind eye, so they are never dealt side by side). Every one is over 3:1 on the
- * canvas. Colour never works alone: every planet carries its name, and the panel lists each
- * family under its planet.
+ * The planets' signature neon colours, dealt round the inner orbit in this order: Electric Blue,
+ * Ruby Crimson, Solar Lime, Neon Magenta, Neon Cyan, Warm Coral, Plasma Violet, Neon Emerald.
+ * Five are the owner's (Electric Blue first); Lime, Magenta and Coral are the three that, with
+ * the best of all 5040 orders, keep two neighbours round the orbit easiest to tell apart,
+ * measured like the dataviz validator: worst neighbouring pair 16.1 (the smaller of colour-blind
+ * and normal-vision/1.8). Blue and Violet are close to a colour-blind eye, so they are dealt far
+ * apart. Every one is bright on the obsidian canvas. Colour never works alone: every planet
+ * carries its name, and the panel lists each family under its planet.
  */
-export const PLANET_COLORS = ["#FF3B6B", "#8B5CF6", "#10B981", "#3B82F6", "#EC4899", "#6366F1", "#FB923C", "#06B6D4"] as const;
+export const PLANET_COLORS = ["#2E7BFF", "#FF2A55", "#A3E635", "#EC4899", "#00D2FF", "#FB923C", "#8B5CF6", "#10D981"] as const;
 // With one planet over a whole round (9, 17...), the last sits between the last colour and the
-// first: Violet is the one furthest from both.
-const WRAP_COLOR = 1;
+// first: Neon Magenta is the one furthest from both.
+const WRAP_COLOR = 3;
 
 /** Entries no chain of relations links to you belong to no family: a quiet slate. */
 export const STRAY_COLOR = "#94A3B8";
 
-/** How much lighter a moon is than its planet (towards white). */
-export const MOON_LIGHTEN = 0.32;
+/** How much deeper a moon is than its planet (towards the obsidian background). */
+export const MOON_DEEPEN = 0.2;
+
+/** The page's and the scene's background: obsidian black. */
+export const OBSIDIAN = "#06070B";
 
 /** An entry's status as a badge reads: from its main fact. */
 export const ENTRY_STATUS_LABEL: Record<RelationStatus, string> = { active: "Active", completed: "Done", archived: "Archived" };
@@ -388,21 +390,22 @@ export function computeLooks(nodes: readonly MemoryNode[], links: readonly LinkF
   return { family, planetColor, status };
 }
 
-/** An entry's colour: the Sun's amber, its planet's colour (a moon's own is lightened from it), or slate. */
+/** An entry's colour: the Sun's amber, its planet's colour (a moon's own is a deeper tint of it), or slate. */
 export function colorOf(id: string, orbits: Orbits, looks: Looks): string {
   const info = orbits.byId.get(id);
   if (info?.kind === "sun") return SUN_COLORS.body;
   const family = looks.family.get(id);
   const color = family ? looks.planetColor.get(family) : undefined;
   if (!color) return STRAY_COLOR;
-  return info?.kind === "moon" ? lighten(color, MOON_LIGHTEN) : color;
+  return info?.kind === "moon" ? mixHex(color, OBSIDIAN, MOON_DEEPEN) : color;
 }
 
-/** A hex colour moved `amount` (0-1) towards white, as hex. */
-export function lighten(hex: string, amount: number): string {
+/** A hex colour moved `amount` (0-1) towards `toward`, as hex. */
+export function mixHex(hex: string, toward: string, amount: number): string {
+  const target = [1, 3, 5].map((at) => parseInt(toward.slice(at, at + 2), 16));
   return `#${[1, 3, 5]
-    .map((at) => parseInt(hex.slice(at, at + 2), 16))
-    .map((value) => Math.round(value + (255 - value) * amount).toString(16).padStart(2, "0"))
+    .map((at, index) => parseInt(hex.slice(at, at + 2), 16) + (target[index] - parseInt(hex.slice(at, at + 2), 16)) * amount)
+    .map((value) => Math.round(value).toString(16).padStart(2, "0"))
     .join("")}`;
 }
 

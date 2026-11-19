@@ -99,7 +99,7 @@ export function OrbDot({
   const archived = state === "archived";
   const tone = archived ? `color-mix(in srgb, ${color} 38%, #64748b)` : color;
   const background = sun
-    ? `radial-gradient(circle at 35% 32%, ${SUN_COLORS.core} 0%, ${SUN_COLORS.body} 60%, ${SUN_COLORS.rim} 100%)`
+    ? `radial-gradient(circle at 35% 32%, ${SUN_COLORS.core} 0%, ${SUN_COLORS.body} 60%, ${SUN_COLORS.wire} 100%)`
     : `radial-gradient(circle at 35% 32%, color-mix(in srgb, ${tone} 40%, white) 0%, ${tone} 55%, color-mix(in srgb, ${tone} 50%, #060913) 100%)`;
   const glow = sun ? "rgba(255, 183, 3, 0.55)" : `color-mix(in srgb, ${color} ${state === "completed" ? 30 : 55}%, transparent)`;
   return (

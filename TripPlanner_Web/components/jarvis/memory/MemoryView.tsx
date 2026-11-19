@@ -8,7 +8,6 @@ import {
   displayName,
   groupOf,
   loadMemoryGraph,
-  RELATION_DASH,
   RELATION_STATUS_LABEL,
   RELATION_STATUSES,
   relationLabel,
@@ -23,28 +22,28 @@ import {
   type RelationStatus,
   type TypeGroupId,
 } from "@/lib/jarvis/memory";
+import { layoutSystem, settle } from "@/lib/jarvis/memoryLayout";
 import {
   computeLooks,
   computeOrbits,
   endId,
-  lighten,
-  MOON_LIGHTEN,
+  mixHex,
+  MOON_DEEPEN,
+  OBSIDIAN,
   PLANET_COLORS,
-  seedOrbits,
-  settle,
   STRAY_COLOR,
   SUN_COLORS,
   type GraphNode,
   type SolarGraph,
 } from "@/lib/jarvis/memoryOrbits";
-// Types only: a value imported from the canvas module would pull the graph library into server rendering.
-import type { Insets, SolarCanvasApi } from "./SolarCanvas";
+// Types only: a value imported from the scene module would pull Three.js into server rendering.
+import type { HoloSceneApi, Insets } from "./HoloScene";
 import { MemoryPanel, OrbDot, type ActionOutcome, type PanelRelation } from "./MemoryPanel";
 import { glass, glassButton, glassField, glassIcon } from "./solarStyles";
 import { focusRing } from "../styles";
 
-// The graph library touches `window` as it loads: browser only, in a chunk of its own.
-const SolarCanvas = dynamic(() => import("./SolarCanvas"), {
+// Three.js and the graph library need `window` and WebGL: browser only, in a chunk of their own.
+const HoloScene = dynamic(() => import("./HoloScene"), {
   ssr: false,
   loading: () => <CanvasMessage title="Drawing your solar system…" busy />,
 });
@@ -57,17 +56,13 @@ type Status =
 
 const NOTICE_MS = 4000;
 const DESKTOP = "(min-width: 768px)";
-// The legend draws its sample orbs in one family's colour (Cyber Blue).
-const LEGEND_PLANET = PLANET_COLORS[3];
+// The legend draws its sample orbs in one family's colour (Electric Blue).
+const LEGEND_PLANET = PLANET_COLORS[0];
 
-/** The page's working copy: the canvas library writes positions into these objects. */
+/** The page's working copy, every entry placed and pinned before the scene first draws it. */
 function toGraph(data: MemoryGraph): SolarGraph {
   const graph: SolarGraph = { nodes: data.nodes.map((node) => ({ ...node })), links: data.links.map((link) => ({ ...link })) };
-  const orbits = computeOrbits(graph.nodes, graph.links);
-  // On their orbits before the first frame; drawn centre-out, so the Sun's and planets' names
-  // are placed before the moons' (a name is left out where it would cover one already drawn).
-  seedOrbits(graph.nodes, orbits);
-  graph.nodes.sort((a, b) => (orbits.byId.get(a.id)?.ring ?? 0) - (orbits.byId.get(b.id)?.ring ?? 0));
+  layoutSystem(graph.nodes, graph.links, computeOrbits(graph.nodes, graph.links));
   return graph;
 }
 
@@ -88,13 +83,15 @@ function measureInsets(): Insets {
 
 /**
  * The Memory page (/jarvis/memory): what Jarvis remembers about the signed-in person, as a
- * solar system they can search, filter, inspect and correct - on deep space, under glass.
+ * 3D holographic solar system they can search, filter, inspect and correct - on obsidian
+ * black, under glass.
  *
  *   top bar   back to Jarvis, the page's name, search (matches light up on the canvas and in
  *             the panel's list; Enter flies to the first), the type filter, Floating labels,
  *             Fit to view
- *   canvas    SolarCanvas (next/dynamic, browser only): the person at the centre as the Sun,
- *             planets one relation away, moons further out, on still orbits
+ *   scene     HoloScene (next/dynamic, browser only, WebGL): the person at the centre as the
+ *             Sun, planets one relation away, moons further out, pinned in place while the
+ *             wireframe globes turn and, when idle, the camera orbits
  *   panel     MemoryPanel: graph analytics and every entry, or the open entry's details and
  *             its relations - on the right on a desktop, a bottom sheet on a phone
  *   legend    bottom right (the bottom-left corner is the Next.js dev tools' badge)
@@ -116,7 +113,7 @@ export function MemoryView() {
   // null until the page knows the screen: the legend starts open on a desktop, folded on a phone.
   const [legendOpen, setLegendOpen] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const canvas = useRef<SolarCanvasApi | null>(null);
+  const canvas = useRef<HoloSceneApi | null>(null);
   const filterId = useId();
   const legendId = useId();
 
@@ -206,7 +203,7 @@ export function MemoryView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graph, nodeById, selectedId, revision]);
 
-  const onReady = useCallback((api: SolarCanvasApi) => {
+  const onReady = useCallback((api: HoloSceneApi) => {
     canvas.current = api;
   }, []);
 
@@ -226,11 +223,11 @@ export function MemoryView() {
     [nodeById, group, orbits.centerId, reveal],
   );
 
-  /** An orb tapped on the canvas: on a desktop it stays where it is; on a phone it moves clear of the sheet. */
+  /** A globe clicked in the scene: it opens, and the camera flies to it. */
   const pick = useCallback(
     (id: string | null) => {
       setSelectedId(id);
-      if (id && !window.matchMedia(DESKTOP).matches) reveal(id);
+      if (id) reveal(id);
     },
     [reveal],
   );
@@ -343,15 +340,15 @@ export function MemoryView() {
   return (
     <div
       data-memory-stage=""
-      className="relative h-dvh w-full overflow-hidden bg-[#060913] text-[#f1f5fb] [color-scheme:dark] selection:bg-rose-600 selection:text-white"
+      className="relative h-dvh w-full overflow-hidden bg-[#06070B] text-[#f1f5fb] [color-scheme:dark] selection:bg-rose-600 selection:text-white"
     >
       {live && (
         <div
           role="img"
-          aria-label={`Memory as a solar system: ${graph.nodes.length} entries and ${graph.links.length} connections. Use the search or the list of entries to find and open one.`}
+          aria-label={`Memory as a 3D solar system: ${graph.nodes.length} entries and ${graph.links.length} connections. Use the search or the list of entries to find and open one.`}
           className="absolute inset-0"
         >
-          <SolarCanvas
+          <HoloScene
             graph={graph}
             orbits={orbits}
             looks={looks}
@@ -531,7 +528,7 @@ export function MemoryView() {
                   Planet · 1 hop
                 </li>
                 <li className="flex items-center gap-1.5 text-xs font-medium text-[#e6ebf5]">
-                  <OrbDot color={lighten(LEGEND_PLANET, MOON_LIGHTEN)} kind="moon" />
+                  <OrbDot color={mixHex(LEGEND_PLANET, OBSIDIAN, MOON_DEEPEN)} kind="moon" />
                   Moon · 2+
                 </li>
               </ul>
@@ -586,22 +583,12 @@ export function MemoryView() {
   );
 }
 
-/** A 24px stretch of a relation's line as the canvas draws that status (RELATION_DASH). */
+/** A 24px stretch of a relation's hairline as the scene draws that status. */
 function LineSample({ status }: { status: RelationStatus }) {
-  const dash = RELATION_DASH[status];
-  const holds = status === "active";
+  const stroke = status === "active" ? "rgba(120, 165, 255, 0.85)" : status === "completed" ? "rgba(148, 163, 184, 0.6)" : "rgba(148, 163, 184, 0.32)";
   return (
     <svg aria-hidden="true" width="24" height="8" viewBox="0 0 24 8" className="shrink-0">
-      {holds && <line x1="0" y1="4" x2="24" y2="4" stroke="rgba(150, 180, 255, 0.35)" strokeWidth="5" strokeLinecap="round" />}
-      <line
-        x1="0"
-        y1="4"
-        x2="24"
-        y2="4"
-        stroke={holds ? "rgba(214, 226, 255, 0.95)" : "#a3b0c6"}
-        strokeWidth={holds ? 1.5 : 1.25}
-        strokeDasharray={dash ? dash.join(" ") : undefined}
-      />
+      <line x1="0" y1="4" x2="24" y2="4" stroke={stroke} strokeWidth="1" />
     </svg>
   );
 }
