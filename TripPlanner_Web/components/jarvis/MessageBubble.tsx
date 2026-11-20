@@ -2,6 +2,7 @@ import { memo } from "react";
 import { formatMessageTime } from "@/lib/jarvis/sessions";
 import type { ChatMessage } from "@/lib/jarvis/types";
 import { AttachmentChip } from "./AttachmentChip";
+import { DocumentMemoryPill } from "./DocumentMemoryPill";
 import { DynamicRenderer } from "./DynamicRenderer";
 import { MemoryPill } from "./MemoryPill";
 import { MessageActions } from "./MessageActions";
@@ -23,8 +24,9 @@ import { SampleBadge } from "./widgets/SampleBadge";
  * The message's actions (MessageActions) sit on lines it already has, so they add no
  * height: Edit and Delete beside the time under the person's bubble, Copy and Delete
  * at the end of Jarvis's byline. A reply that saved to Jarvis's memory ends with a
- * MemoryPill ("Saved to memory · 2 entries"). `locked` - this message's answer is still on its way -
- * holds Delete back.
+ * MemoryPill ("Saved to memory · 2 entries"), and one whose question came with a file and Save to
+ * Memory switched on, a DocumentMemoryPill per file ("Saved 6 facts from Spec_v2.pdf", which opens
+ * onto the facts). `locked` - this message's answer is still on its way - holds Delete back.
  */
 export const MessageBubble = memo(function MessageBubble({ message, locked = false }: { message: ChatMessage; locked?: boolean }) {
   const time = formatMessageTime(message.createdAt);
@@ -66,6 +68,10 @@ export const MessageBubble = memo(function MessageBubble({ message, locked = fal
       </div>
       {/* What Jarvis's memory really wrote while answering (only on a reply that just arrived). */}
       {message.memory && <MemoryPill note={message.memory} />}
+      {/* What Save to Memory read out of the attached file (only on a reply that just arrived). */}
+      {message.documentMemories?.map((memory) => (
+        <DocumentMemoryPill key={memory.sourceFile} memory={memory} />
+      ))}
     </li>
   );
 });

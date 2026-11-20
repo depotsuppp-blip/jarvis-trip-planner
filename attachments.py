@@ -124,11 +124,14 @@ def resolve(path: str) -> Optional[str]:
     return real if inside and real != uploads and os.path.isfile(real) else None
 
 
-def _quoted_name(name: str, path: str) -> str:
+def quoted_name(name: str, path: str) -> str:
     """The person's name for the file, safe to put in quotes: no quotes, brackets or control characters."""
     clean = _UNSAFE_NAME.sub(" ", name or "").strip()
     clean = " ".join(clean.split())[:MAX_NAME_CHARS]
     return clean or path.rsplit("/", 1)[-1]
+
+
+_quoted_name = quoted_name  # the name this module has always used inside it
 
 
 def describe(
@@ -201,3 +204,12 @@ def with_context(
     if current and not words and readable:
         lines.append("[System Context: The user sent the file without a message. Read it and briefly say what it contains.]")
     return "\n\n".join([words, *lines]) if words else "\n\n".join(lines)
+
+
+# Save to Memory (memory_ingest.py): the file's key facts go into long-term memory on the side, so the
+# model must not also call its remember tool on the same file (that would save it twice, unvetted).
+SAVING_NOTE = (
+    "[System Context: The user switched on Save to Memory for the attached file: its key facts are being "
+    "saved to long-term memory separately, so do not call the remember tool for this file. Answer the "
+    "message as usual.]"
+)

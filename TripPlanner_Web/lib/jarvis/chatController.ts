@@ -1,5 +1,6 @@
 import { chatApi, type ApiFailure, type ApprovalRequest } from "./chatApi";
 import { demoReply, initialAgents, parseDemoCommand, type DemoTool } from "./demo";
+import { readDocumentMemories } from "./documentMemory";
 import { readMemoryNote } from "./memoryNote";
 import { toChatMessage, type ServerMessageLike } from "./messageContent";
 import { canSpeak, type ReplyAudio } from "./replyAudio";
@@ -93,12 +94,19 @@ const MICROPHONE_PROBLEM: Record<VoiceRecorderFailure, { message: string; detail
   failed: { message: "Couldn't start the microphone. Please try again.", detail: "Couldn't start" },
 };
 
+/** A typed turn's choices besides its words and file. */
+export interface SendOptions {
+  /** Save to Memory: read the attached file's key facts into Jarvis's long-term memory too. */
+  saveToMemory?: boolean;
+}
+
 export interface ChatActions {
   /**
    * One typed turn, optionally with a file (already checked with attachmentProblem; the text may then be empty).
    * A message that is exactly a demo command (`/status`) with no file is answered on this page instead.
+   * `saveToMemory` is the dock's "Save to Memory" switch for the file: its key facts also go into memory.
    */
-  send(text: string, file?: File | null): Promise<void>;
+  send(text: string, file?: File | null, options?: SendOptions): Promise<void>;
   selectSession(id: string): Promise<void>;
   /** Opens an empty session; it is saved by its first message. */
   newSession(): void;
@@ -219,7 +227,7 @@ export class ChatController {
 
   /** Stable for the life of the controller: pass them around freely, nothing re-renders because of them. */
   readonly actions: ChatActions = {
-    send: (text, file) => this.send(text, file),
+    send: (text, file, options) => this.send(text, file, options),
     selectSession: (id) => this.selectSession(id),
     newSession: () => this.newSession(),
     refreshSessions: () => this.refreshSessions(),
@@ -390,7 +398,7 @@ export class ChatController {
 
   // -------------------------------------------------------------------- turns
 
-  async send(raw: string, file: File | null = null): Promise<void> {
+  async send(raw: string, file: File | null = null, options: SendOptions = {}): Promise<void> {
     const text = raw.trim();
     if ((!text && !file) || isFocalMode(this.orb.getState().mode)) return;
 
@@ -429,6 +437,7 @@ export class ChatController {
       {
         message: text,
         ...(file ? { file } : {}),
+        ...(file && options.saveToMemory ? { saveToMemory: true } : {}),
         ...(activeSessionId ? { conversationId: activeSessionId } : { newConversation: true }),
         ...(this.speech.getState().enabled ? { speak: true } : {}),
       },
@@ -457,7 +466,7 @@ export class ChatController {
     let toSpeak: SpokenReply | null = null;
     if (result.ok) {
       this.setAgent("brain", "ready");
-      const reply = replyWithMemory(result.data.reply, result.data.memory);
+      const reply = replyWithMemory(result.data.reply, result.data.memory, result.data.savedMemories);
       // The saved copy of what was sent: its real id is what Delete needs.
       const sent = toChatMessage(result.data.userMessage);
       const { conversationId } = result.data;
@@ -963,10 +972,16 @@ export class ChatController {
 
 /**
  * A reply that just arrived, with what Jarvis's memory wrote while answering (the pill under it,
- * memoryNote.ts) when its memory tool was used - checked again here, as anything the page draws.
+ * memoryNote.ts) when its memory tool was used, and what Save to Memory read out of the attached
+ * file (documentMemory.ts) - both checked again here, as anything the page draws.
  */
-function replyWithMemory(reply: ServerMessageLike, memory: unknown): ChatMessage {
+function replyWithMemory(reply: ServerMessageLike, memory: unknown, saved?: unknown): ChatMessage {
   const message = toChatMessage(reply);
   const note = readMemoryNote(memory);
-  return note ? { ...message, memory: note } : message;
+  const documents = readDocumentMemories(saved);
+  return {
+    ...message,
+    ...(note ? { memory: note } : {}),
+    ...(documents.length ? { documentMemories: documents } : {}),
+  };
 }

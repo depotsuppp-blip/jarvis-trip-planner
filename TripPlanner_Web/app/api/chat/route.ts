@@ -20,6 +20,7 @@ import {
   type ChatTurn,
 } from "@/lib/jarvisBrain";
 import { MAX_DOCUMENT_BYTES, storedUserMessage, type Attachment } from "@/lib/jarvis/attachments";
+import type { DocumentMemory } from "@/lib/jarvis/documentMemory";
 import type { MemoryNote } from "@/lib/jarvis/memoryNote";
 import { speakableAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 import { prisma } from "@/lib/prisma";
@@ -45,6 +46,8 @@ const ChatBodySchema = z.object({
 // message may be empty when a file came with it.
 const ChatFormSchema = ChatBodySchema.extend({
   message: z.string().trim().max(MAX_MESSAGE_LENGTH),
+  // The dock's "Save to Memory" switch, on for the attached file: its key facts also go into memory.
+  saveToMemory: z.boolean().optional(),
 });
 
 interface TurnInput {
@@ -52,6 +55,7 @@ interface TurnInput {
   conversationId?: string;
   newConversation?: boolean;
   speak?: boolean;
+  saveToMemory?: boolean;
   file: File | null;
 }
 
@@ -86,6 +90,7 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
     conversationId: field("conversationId")?.trim() || undefined,
     newConversation: field("newConversation") === "true",
     speak: field("speak") === "true",
+    saveToMemory: field("saveToMemory") === "true",
   });
   const file = files[0] ?? null;
   if (!parsed.success || (!parsed.data.message && !file)) {
@@ -99,7 +104,8 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  *
  *   application/json     { message, conversationId?, newConversation?, speak? }
  *   multipart/form-data  message (may be empty when a file is sent), file?,
- *                        conversationId?, newConversation? ("true"), speak? ("true")
+ *                        conversationId?, newConversation? ("true"), speak? ("true"),
+ *                        saveToMemory? ("true", with a file)
  *
  * Saves the signed-in user's message, asks the brain (lib/jarvisBrain.ts) for
  * a reply, saves that too, and returns both. The user is always the
@@ -123,7 +129,7 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  *   { "type": "approval", approval: { id, tool, prompt, details, expiresInSeconds } }   an action is
  *                                   waiting for the person's Allow or Deny (POST /api/chat/approvals/<id>)
  *   { "type": "approval_resolved", id, decision: "allow" | "deny" | "timeout" }   that card is closed
- *   { "type": "final", conversationId, userMessage, reply, audio? }         the JSON answer's body
+ *   { "type": "final", conversationId, userMessage, reply, audio?, memory?, savedMemories? }   the JSON answer's body
  *   { "type": "error", "status": 502 | 500, error, conversationId?, userMessage? }
  *
  * Everything refused before the brain is asked (401, 429, 400, 404, 413, 415, 503,
@@ -154,7 +160,13 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  * used at all (lib/jarvis/memoryNote.ts). The hub draws it under the reply. It is the tool's own
  * record, not the model's words, and is not stored either.
  *
- * Responses: 200 { conversationId, userMessage, reply, audio?, memory? }, 400 bad body, 401
+ * `saveToMemory: "true"` with a file is the dock's "Save to Memory" switch: the brain also reads the
+ * file's few key facts (at most 10) into the person's long-term memory, citing the file
+ * (lib/jarvisBrain.ts, save_to_memory), while it answers as usual. `savedMemories` lists what was
+ * saved, per file ({ sourceFile, count, facts }; lib/jarvis/documentMemory.ts) - left out when
+ * nothing was. Saving never fails the turn, and it is not stored either.
+ *
+ * Responses: 200 { conversationId, userMessage, reply, audio?, memory?, savedMemories? }, 400 bad body, 401
  * signed out, 404 unknown conversation, 413 / 415 / 503 the file (above), 429
  * rate-limited, 502 brain failed, 500 database (or disk) failed, 499 stopped by the person
  * (the reply is not saved). With a file,
@@ -176,7 +188,7 @@ export async function POST(request: NextRequest) {
 
   const read = await readTurn(request);
   if ("refused" in read) return read.refused;
-  const { message, conversationId, newConversation, speak, file } = read.turn;
+  const { message, conversationId, newConversation, speak, saveToMemory, file } = read.turn;
 
   // The file is checked before anything is looked up or written, so a wrong one costs nothing.
   let upload: PreparedUpload | null = null;
@@ -234,6 +246,8 @@ export async function POST(request: NextRequest) {
     userId,
     appUrl: request.nextUrl.origin,
     speak,
+    // Only ever with a file: there is nothing else to save.
+    saveToMemory: Boolean(saveToMemory) && attachments.length > 0,
   };
 
   if (!wantsStream(request)) {
@@ -298,6 +312,7 @@ interface TurnToAnswer {
   userId: string;
   appUrl: string;
   speak?: boolean;
+  saveToMemory?: boolean;
 }
 
 type TurnOutcome =
@@ -324,12 +339,14 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
   let audio: ReplyAudio | null = null;
   let spokenAudioText: string | null = null;
   let memory: MemoryNote | null = null;
+  let savedMemories: DocumentMemory[] = [];
   try {
     const answer = await askJarvis(turn.message, turn.history, {
       userId: turn.userId,
       appUrl: turn.appUrl,
       speak: turn.speak,
       attachments: turn.attachments,
+      saveToMemory: turn.saveToMemory,
       signal,
       ...hooks,
     });
@@ -338,6 +355,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
     audio = speakableAudio(replyText, answer.audio, answer.spokenText);
     spokenAudioText = audio ? answer.spokenText : null;
     memory = answer.memory;
+    savedMemories = answer.documentMemories;
   } catch (error) {
     if (error instanceof JarvisBrainCancelled || signal.aborted) return { kind: "stopped" };
     console.error(`POST /api/chat: the brain failed for conversation ${conversationId}:`, error);
@@ -362,6 +380,8 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
         ...(audio ? { audio, ...(spokenAudioText ? { spokenAudioText } : {}) } : {}),
         // What Jarvis's memory really wrote this turn (lib/jarvis/memoryNote.ts); not stored, like the audio.
         ...(memory ? { memory } : {}),
+        // What Save to Memory read out of the attached file (lib/jarvis/documentMemory.ts); not stored either.
+        ...(savedMemories.length ? { savedMemories } : {}),
       },
     };
   } catch (error) {

@@ -1,0 +1,6 @@
+# What the tests need on top of requirements.txt:
+#     .venv\Scripts\python -m pip install -r requirements-dev.txt
+#     .venv\Scripts\python -m pytest tests
+# The tests are unittest-style, so `python -m unittest discover -s tests` runs them too.
+-r requirements.txt
+pytest>=9.2,<10

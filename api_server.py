@@ -18,7 +18,13 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                               "spoken_audio_text": "..." | null, "audio": null,
                               "memory_events": [{"action": "saved"|"confirmed"|"failed",
                                                  "entries": 2, "facts": 3, "merged": 0,
-                                                 "summary": "Nok sister of me; ..."}]}   once, last
+                                                 "summary": "Nok sister of me; ..."}],
+                              "saved_memories": [{"source_file": "Spec_v2.pdf", "count": 6,
+                                                  "facts": [{"subject": "Atlas", "relation":
+                                                             "deadline_is", "object": "2027-03-01",
+                                                             "status": "active"}, ...],
+                                                  "ingested_at": "2026-11-20T09:15:02+00:00"}]}
+                             once, last
                    error     {"type": "error", "status": "Failed", "message": "...",
                               "code": 502}                    instead of final, last
                    action_required  {"type": "action_required", "approval_id": "...",
@@ -58,6 +64,14 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  saying where it is and which tool reads it (attachments.py), and the model
                  reads it with the filesystem tool server. prompt may be "" when a file
                  came with no words. User turns in history carry theirs the same way.
+                 save_to_memory (default false) is the hub's Save to Memory switch on an
+                 attached file: the file's key facts - at most 10: projects, people, the stack,
+                 deadlines, budgets, constraints - are also read into the signed-in person's
+                 memory with the file's name on each (memory_ingest.py), while the message is
+                 answered as usual. saved_memories says what was saved, per file; a fact a newer
+                 document's value replaced is listed as "archived" with "replaced": true. It is []
+                 when the switch was off, there was no user_id, or nothing was worth keeping -
+                 a failure there never fails the reply.
     POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
                    history (a JSON list shaped like /chat's), user_id, app_url, speak
               -> { "transcript": "...", "reply": "...", "engine": "openai"|"local",
@@ -223,6 +237,7 @@ import approvals
 import attachments
 import mcp_client
 import memory_graph
+import memory_ingest
 import reply_audio
 import request_context
 import rich_reply
@@ -278,6 +293,9 @@ class ChatRequest(BaseModel):
     # a caller that cannot: confirmation-gated tools are then declined at once instead of after the wait.
     interactive: bool = True
     attachments: list[Attachment] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+    # Save to Memory: the person switched it on for the attached file, so its key facts also go into
+    # their long-term memory (memory_ingest.py). Off by default: asking about a file never fills it.
+    save_to_memory: bool = False
 
     @model_validator(mode="after")
     def _says_something(self) -> "ChatRequest":
@@ -403,6 +421,7 @@ def _prepare(
     prompt: str,
     history: list[HistoryTurn],
     files: list[Attachment] | None,
+    saving: bool = False,
 ) -> tuple[str, list[tuple[str, str]]]:
     """
     The prompt as the brain is asked it, and the history as (role, text) pairs. Attached
@@ -410,6 +429,8 @@ def _prepare(
     which tool reads it (attachments.py). Built while the turn holds the brain, because it
     asks the brain which tools it has right now. A .csv/.tsv/.json/.jsonl file is pointed at
     the data tool (load it into a table, answer with SQL) when that server is connected.
+    `saving`: Save to Memory is reading the files into memory on the side (memory_ingest.py), and
+    the model is told not to remember them itself.
     """
     attached = bool(files) or any(t.attachments for t in history)
     tool = attachments.read_tool(brain.tool_names) if attached else None
@@ -417,6 +438,8 @@ def _prepare(
     if files:
         print(f"[API] Attachments: {', '.join(f.path for f in files)} (reader: {tool or 'none'}, data: {data or 'none'}).")
         prompt = attachments.with_context(prompt, files, tool, current=True, data=data)
+        if saving:
+            prompt = f"{prompt}\n\n{attachments.SAVING_NOTE}"
     # A reply that carried widgets is stored as JSON; the model remembers it as the sentence it said.
     turns = [
         (
@@ -440,6 +463,7 @@ async def _turn(
     speak: bool = False,
     files: list[Attachment] | None = None,
     interactive: bool = False,
+    saving: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     One turn through the brain's state machine (LLMBrain.run), as /chat and /voice both
@@ -457,6 +481,7 @@ async def _turn(
     `interactive`: the client is a page that can answer the run (/chat). Its tools may then
     stream an {"type": "action_required"} event and wait for the person's Allow or Deny
     (approvals.py); /voice, which collects one JSON answer, is not, and those tools are declined.
+    `saving`: the attached files are being saved to memory on the side (see _prepare).
     """
     caller = request_context.RequestContext(
         channel=request_context.CHANNEL_WEB,
@@ -485,7 +510,7 @@ async def _turn(
             if _turn_lock.locked():
                 progress("Waiting for the previous request to finish...")
             async with _turn_lock:
-                question, turns = _prepare(brain, prompt, history, files)
+                question, turns = _prepare(brain, prompt, history, files, saving)
                 brain.set_history(turns)
                 try:
                     # The context is current only while this request is being answered, on
@@ -587,45 +612,71 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
     One typed turn, answered as server-sent events (see the top of this file). Errors found
     before the turn starts are plain HTTP errors (422, 503); once the stream is open, a turn
     that fails says so in an `error` event.
+
+    With save_to_memory and a file, the file's key facts are read into the person's memory
+    (memory_ingest.py) side by side with the turn, and the final event says what was saved
+    (saved_memories). That never fails the turn: nothing saved is just []. A turn that is stopped
+    or fails stops the saving too.
     """
     brain = await _ready_brain()
+    # Whose memory: the signed-in person's (mcp_client.web_scope); nobody's without a user_id.
+    scope = mcp_client.web_scope(body.user_id) if body.save_to_memory and body.attachments else ""
 
     async def stream() -> AsyncIterator[str]:
-        async with aclosing(
-            _turn(
-                request, brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments,
-                interactive=body.interactive,
-            )
-        ) as events:
-            async for event in events:
-                kind = event.get("type")
-                if kind == "cancelled":
-                    return
-                if kind != "final":
-                    yield _sse(event)
-                    if kind == "error":
+        saving: Optional[asyncio.Task[list[dict[str, Any]]]] = None
+        if scope:
+            saving = asyncio.create_task(memory_ingest.ingest(scope, body.attachments), name="jarvis-save-to-memory")
+        try:
+            async with aclosing(
+                _turn(
+                    request, brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments,
+                    interactive=body.interactive, saving=saving is not None,
+                )
+            ) as events:
+                async for event in events:
+                    kind = event.get("type")
+                    if kind == "cancelled":
                         return
-                    continue
-                reply = str(event.get("message") or "").strip()
-                if not reply:
-                    yield _sse({"type": "error", "status": "Failed", "message": "The brain returned an empty reply.", "code": 502})
+                    if kind != "final":
+                        yield _sse(event)
+                        if kind == "error":
+                            return
+                        continue
+                    reply = str(event.get("message") or "").strip()
+                    if not reply:
+                        yield _sse({"type": "error", "status": "Failed", "message": "The brain returned an empty reply.", "code": 502})
+                        return
+                    # Only the English spoken text goes to the voice; the chat gets the reply as it is.
+                    spoken = str(event.get("spoken") or "").strip() if body.speak else ""
+                    if spoken and reply_audio.enabled():
+                        yield _sse({"type": "progress", "status": "Recording the spoken reply..."})
+                    audio = await asyncio.to_thread(_audio_for, spoken, body.speak)
+                    saved: list[dict[str, Any]] = []
+                    if saving is not None:
+                        if not saving.done():
+                            name = memory_ingest.source_name(body.attachments[0])
+                            yield _sse({"type": "progress", "status": f"Saving key facts from {name} to memory..."})
+                        while not saving.done():
+                            await asyncio.wait({saving}, timeout=HEARTBEAT_SECONDS)
+                            if not saving.done():
+                                yield _sse({"type": "heartbeat"})
+                        saved = _saved_memories(saving)
+                    yield _sse({
+                        "type": "final",
+                        "node": event.get("node"),
+                        "status": "Done",
+                        "message": reply,
+                        "chat_text": reply,
+                        "spoken_audio_text": spoken or None,
+                        "audio": audio.model_dump() if audio else None,
+                        "memory_events": event.get("memory_events") or [],
+                        # What Save to Memory wrote from the attached files: [] when it was off or saved nothing.
+                        "saved_memories": saved,
+                    })
                     return
-                # Only the English spoken text goes to the voice; the chat gets the reply as it is.
-                spoken = str(event.get("spoken") or "").strip() if body.speak else ""
-                if spoken and reply_audio.enabled():
-                    yield _sse({"type": "progress", "status": "Recording the spoken reply..."})
-                audio = await asyncio.to_thread(_audio_for, spoken, body.speak)
-                yield _sse({
-                    "type": "final",
-                    "node": event.get("node"),
-                    "status": "Done",
-                    "message": reply,
-                    "chat_text": reply,
-                    "spoken_audio_text": spoken or None,
-                    "audio": audio.model_dump() if audio else None,
-                    "memory_events": event.get("memory_events") or [],
-                })
-                return
+        finally:
+            if saving is not None and not saving.done():
+                saving.cancel()
 
     return StreamingResponse(
         stream(),
@@ -633,6 +684,17 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
         # No caching, and no buffering by a proxy in between: each event is meant to arrive as it happens.
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _saved_memories(task: "asyncio.Task[list[dict[str, Any]]]") -> list[dict[str, Any]]:
+    """What a finished Save to Memory task wrote; [] for one that failed (memory_ingest.ingest never should)."""
+    if task.cancelled():
+        return []
+    failure = task.exception()
+    if failure is not None:
+        print(f"[API] Save to Memory failed: {type(failure).__name__}: {failure}")
+        return []
+    return task.result()
 
 
 @app.post("/approvals/{approval_id}")

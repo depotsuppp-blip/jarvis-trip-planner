@@ -87,6 +87,13 @@ BEGIN
 END
 $$;
 
+-- DOCUMENT PROVENANCE (added 2026-11-20; a database made before then is upgraded by these lines).
+-- A fact read out of a document the person attached with "Save to Memory" keeps the file it came
+-- from and when it was read (memory_ingest.py), so recall can cite it ("according to Spec_v2.pdf").
+-- NULL for a fact the person told Jarvis in conversation.
+ALTER TABLE jarvis_memory.relations ADD COLUMN IF NOT EXISTS source_file varchar(300);
+ALTER TABLE jarvis_memory.relations ADD COLUMN IF NOT EXISTS ingested_at timestamptz;
+
 -- No approximate (HNSW / IVFFlat) index on purpose: a search only ever looks at
 -- one person's rows (at most 2000, mcp_memory.MAX_ENTITIES), found through
 -- entities_scope_name_key, and an exact scan of those is fast. An approximate

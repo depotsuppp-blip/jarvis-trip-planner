@@ -364,6 +364,33 @@ def _extract_cached(real: str, label: str, extractor) -> str:
     return text
 
 
+def extract_text(real: str, label: str) -> str:
+    """
+    The whole text of the file at `real` - a resolved path the caller has already allowed - as
+    read_file pages through it: a .pdf or .docx extracted (PyMuPDF / python-docx), a text or code
+    file decoded; other binary types refused. FsError (with a sentence about `label`) when it
+    cannot be read. memory_ingest.py ("Save to Memory") calls it in-process on an uploaded file.
+    """
+    ext = os.path.splitext(real)[1].lower()  # of the resolved file, so a link cannot rename a PDF into text
+    try:
+        size = os.path.getsize(real)
+    except OSError as exc:
+        raise FsError(_os_error_message(exc, label)) from exc
+
+    extractor = _DOCUMENT_READERS.get(ext)
+    if extractor is not None:
+        if size > MAX_DOC_BYTES:
+            raise FsError(f"'{label}' is {_human_size(size)}; documents over {_human_size(MAX_DOC_BYTES)} are not read.")
+        return _extract_cached(real, label, extractor)
+    if ext in _UNSUPPORTED_EXTENSIONS:
+        hint = " Save it as .docx to read it." if ext == ".doc" else ""
+        raise FsError(
+            f"'{label}' is a {ext} file, which cannot be read as text. "
+            f"This tool reads plain text and code files, .pdf and .docx documents.{hint}"
+        )
+    return _read_plain_text(real, label, size)
+
+
 def read_file(arguments: dict) -> str:
     real, label = resolve(arguments.get("path"))
     offset = _whole_number(arguments.get("offset"), "offset", 0, minimum=0)
@@ -377,25 +404,7 @@ def read_file(arguments: dict) -> str:
         raise FsError(f"'{label}' does not exist.")
     if not os.path.isfile(real):
         raise FsError(f"'{label}' is not a regular file.")
-    ext = os.path.splitext(real)[1].lower()  # of the resolved file, so a link cannot rename a PDF into text
-    try:
-        size = os.path.getsize(real)
-    except OSError as exc:
-        raise FsError(_os_error_message(exc, label)) from exc
-
-    extractor = _DOCUMENT_READERS.get(ext)
-    if extractor is not None:
-        if size > MAX_DOC_BYTES:
-            raise FsError(f"'{label}' is {_human_size(size)}; documents over {_human_size(MAX_DOC_BYTES)} are not read.")
-        text = _extract_cached(real, label, extractor)
-    elif ext in _UNSUPPORTED_EXTENSIONS:
-        hint = " Save it as .docx to read it." if ext == ".doc" else ""
-        raise FsError(
-            f"'{label}' is a {ext} file, which cannot be read as text. "
-            f"This tool reads plain text and code files, .pdf and .docx documents.{hint}"
-        )
-    else:
-        text = _read_plain_text(real, label, size)
+    text = extract_text(real, label)
 
     total = len(text)
     if total == 0:

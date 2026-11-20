@@ -16,6 +16,7 @@ import { ACCEPTED_FILE_TYPES, attachmentProblem } from "@/lib/jarvis/attachments
 import { useChatActions, useDraftRequests, useOrb } from "@/lib/jarvis/JarvisProvider";
 import { isFocalMode } from "@/lib/jarvis/types";
 import { AttachmentChip } from "./AttachmentChip";
+import { SaveToMemoryToggle } from "./SaveToMemoryToggle";
 import { focusRing, thinScroll } from "./styles";
 
 // The longest prompt a ?prompt= link may put in the field (the brain takes up to 4000 characters).
@@ -53,6 +54,11 @@ const PROMPT_PARAM_MAX = 2000;
  * A spoken turn does not take the file: it stays in the chip, unsent, for the
  * next typed message.
  *
+ * Beside the chip, "Save to Memory" (SaveToMemoryToggle): off for every new file. Switched on, the
+ * file's key facts also go into Jarvis's long-term memory when the message is sent, and the reply
+ * comes back with a pill that lists them (DocumentMemoryPill). It goes with the file: taking the
+ * file off, picking another or sending it switches it off again.
+ *
  * The draft - words and file - lives here, in this component's own state, and
  * nowhere else. Every keystroke re-renders this form and only this form - not the
  * conversation, not the orb (which has its own store) - so typing never costs the
@@ -71,6 +77,8 @@ export const Composer = memo(function Composer() {
   const [draft, setDraft] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [fileProblem, setFileProblem] = useState<string | null>(null);
+  // Save to Memory for the file in the chip: off for every new file.
+  const [saveToMemory, setSaveToMemory] = useState(false);
   const dock = useRef<HTMLFormElement>(null);
   const field = useRef<HTMLTextAreaElement>(null);
   const talk = useRef<HTMLButtonElement>(null);
@@ -156,13 +164,17 @@ export const Composer = memo(function Composer() {
     if (!chosen) return;
     const problem = attachmentProblem(chosen.name, chosen.size);
     setFileProblem(problem);
-    // A file that cannot be sent does not replace one that can.
-    if (!problem) setFile(chosen);
+    // A file that cannot be sent does not replace one that can. A new file starts with Save to Memory off.
+    if (!problem) {
+      setFile(chosen);
+      setSaveToMemory(false);
+    }
   }
 
   function removeFile() {
     setFile(null);
     setFileProblem(null);
+    setSaveToMemory(false);
     // The remove button is gone with the chip: keep the keyboard where the file came from.
     attach.current?.focus();
   }
@@ -235,10 +247,12 @@ export const Composer = memo(function Composer() {
     if (!canSend) return;
     const text = draft;
     const attached = file;
+    const saving = attached !== null && saveToMemory;
     setDraft("");
     setFile(null);
     setFileProblem(null);
-    void actions.send(text, attached);
+    setSaveToMemory(false);
+    void actions.send(text, attached, saving ? { saveToMemory: true } : undefined);
   }
 
   return (
@@ -248,7 +262,12 @@ export const Composer = memo(function Composer() {
         aria-live="polite"
         className={`mx-auto flex max-w-2xl flex-wrap items-center gap-x-3 gap-y-1.5 ${file || fileProblem ? "mb-2" : ""}`}
       >
-        {file && <AttachmentChip name={file.name} size={file.size} onRemove={removeFile} removeDisabled={busy} />}
+        {file && (
+          <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5">
+            <AttachmentChip name={file.name} size={file.size} onRemove={removeFile} removeDisabled={busy} />
+            <SaveToMemoryToggle pressed={saveToMemory} onToggle={() => setSaveToMemory((on) => !on)} disabled={busy} />
+          </span>
+        )}
         {fileProblem && <p className="text-sm leading-5 text-red-700">{fileProblem}</p>}
       </div>
 

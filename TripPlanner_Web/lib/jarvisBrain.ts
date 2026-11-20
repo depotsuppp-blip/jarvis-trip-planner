@@ -1,4 +1,5 @@
 import type { Attachment } from "@/lib/jarvis/attachments";
+import { readSavedMemories, type DocumentMemory } from "@/lib/jarvis/documentMemory";
 import { memoryNote, readMemoryEvents, type MemoryNote } from "@/lib/jarvis/memoryNote";
 import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 
@@ -10,7 +11,7 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *   body  { prompt: string,
  *           history: [{ role: "user" | "jarvis", content, attachments? }],
  *           user_id?: string, app_url?: string, speak?: true, interactive?: false,
- *           attachments?: [{ path, name, mime, size }] }
+ *           attachments?: [{ path, name, mime, size }], save_to_memory?: true }
  *   reply text/event-stream - the brain's state machine as it works, one JSON per `data:`:
  *           { type: "progress", node?, status: "Delegating to Head of Analytics..." }   any number
  *           { type: "action_required", approval_id, tool, prompt, details: [{ name, value }], expires_in }
@@ -18,7 +19,9 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *           { type: "action_resolved", approval_id, decision: "allow" | "deny" | "timeout" }   it was answered
  *           { type: "final", status: "Done", message: string | object, chat_text?: string,
  *             spoken_audio_text?: string | null, audio?: { mime, base64 } | null,
- *             memory_events?: [{ action: "saved" | "confirmed" | "failed", entries, facts, merged, summary }] }
+ *             memory_events?: [{ action: "saved" | "confirmed" | "failed", entries, facts, merged, summary }],
+ *             saved_memories?: [{ source_file, count, facts: [{ subject, relation, object, status, replaced? }],
+ *                                 ingested_at }] }
  *           { type: "error", status: "Failed", message, code }                            instead of final
  *         (a brain from before the stream answers { reply, audio } as JSON, and that is read too)
  *
@@ -48,6 +51,14 @@ import { parseReplyAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
  *           and the model reads it from there. `prompt` may be "" when a file came
  *           with no words. A user turn in `history` carries its attachments the same
  *           way, so a follow-up question can still find the file.
+ *
+ *   save_to_memory = the dock's "Save to Memory" switch was on for the attached file (sent only with
+ *           one): besides answering, the brain reads the file's few key facts - at most 10 - into the
+ *           person's long-term memory, with the file's name on each (memory_ingest.py), and its final
+ *           event lists them as `saved_memories`, one entry per file that saved anything. They become
+ *           `documentMemories` on the answer (lib/jarvis/documentMemory.ts) and the hub draws them as a
+ *           pill under the reply ("Saved 6 facts from Spec_v2.pdf"). Empty when nothing was saved -
+ *           saving never fails the reply. Checked and capped there; not stored.
  *
  *   speak = the person has voice replies on: the brain also sends what the voice
  *           says - `spoken_audio_text`, ENGLISH ALWAYS (the reply when it is already
@@ -148,6 +159,8 @@ export type ChatContext = { userId?: string; appUrl?: string; speak?: boolean; s
  */
 export type AskContext = ChatContext & {
   attachments?: Attachment[];
+  /** Save to Memory: also read the attached files' key facts into the person's memory (see save_to_memory above). */
+  saveToMemory?: boolean;
   onProgress?: (status: string) => void;
   /** A confirmation-gated tool is waiting for the person (see action_required above). */
   onApproval?: (approval: BrainApproval) => void;
@@ -166,6 +179,8 @@ export interface BrainAnswer {
    * up - lib/jarvis/memoryNote.ts), or null when memory was not written to. Not stored.
    */
   memory: MemoryNote | null;
+  /** What Save to Memory saved from the attached files (the final event's `saved_memories`); [] for none. Not stored. */
+  documentMemories: DocumentMemory[];
 }
 
 // The brain keeps the spoken text within 200 characters; this only refuses a runaway value.
@@ -249,6 +264,7 @@ export async function askJarvis(
         // A caller that cannot show an Approval Card says so, and gated tools are declined at once.
         ...(context.onApproval ? {} : { interactive: false }),
         ...(context.attachments?.length ? { attachments: context.attachments } : {}),
+        ...(context.saveToMemory && context.attachments?.length ? { save_to_memory: true } : {}),
       }),
       cache: "no-store",
       signal: brainSignal(context),
@@ -271,7 +287,7 @@ export async function askJarvis(
   const data =
     streamed && response.body
       ? await readBrainStream(response.body, context)
-      : ((await response.json().catch(() => null)) as { reply?: unknown; audio?: unknown; spoken?: unknown; memory?: unknown } | null);
+      : ((await response.json().catch(() => null)) as BrainFinal | null);
   if (context.signal?.aborted) throw new JarvisBrainCancelled();
   const reply = replyAsText(data?.reply);
   if (!reply) throw new JarvisBrainError("Jarvis brain sent an empty reply.");
@@ -280,7 +296,17 @@ export async function askJarvis(
     audio: context.speak ? parseReplyAudio(data?.audio) : null,
     spokenText: context.speak ? spokenText(data?.spoken) : null,
     memory: memoryNote(readMemoryEvents(data?.memory)),
+    documentMemories: readSavedMemories(data?.saved),
   };
+}
+
+/** The final event's fields askJarvis reads, unchecked (a brain from before the stream sends `reply` and `audio`). */
+interface BrainFinal {
+  reply?: unknown;
+  audio?: unknown;
+  spoken?: unknown;
+  memory?: unknown;
+  saved?: unknown;
 }
 
 // One progress line as the page may show it: one line, no control characters, a sensible length.
@@ -388,7 +414,7 @@ function parseEvent(block: string): Record<string, unknown> | null {
 async function readBrainStream(
   body: ReadableStream<Uint8Array>,
   context: AskContext
-): Promise<{ reply?: unknown; audio?: unknown; spoken?: unknown; memory?: unknown }> {
+): Promise<BrainFinal> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -421,7 +447,13 @@ async function readBrainStream(
           const resolved = readApprovalResolved(event);
           if (resolved) context.onApprovalResolved?.(resolved);
         } else if (event.type === "final") {
-          return { reply: event.message, audio: event.audio, spoken: event.spoken_audio_text, memory: event.memory_events };
+          return {
+            reply: event.message,
+            audio: event.audio,
+            spoken: event.spoken_audio_text,
+            memory: event.memory_events,
+            saved: event.saved_memories,
+          };
         } else if (event.type === "error") {
           const code = typeof event.code === "number" ? event.code : 502;
           console.error(`Jarvis brain reported an error (${code}) mid-turn.`);

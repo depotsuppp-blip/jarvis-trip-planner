@@ -5,6 +5,7 @@
  * (`messageContent.ts`) and the components all speak the same types.
  */
 
+import type { DocumentMemory } from "./documentMemory";
 import type { MemoryNote } from "./memoryNote";
 
 /** What the orb (and so the whole hub) is doing right now. */
@@ -63,6 +64,11 @@ export interface ChatMessage {
    * Only on a reply that just arrived: it is not stored, so a session loaded later has none.
    */
   memory?: MemoryNote;
+  /**
+   * What Save to Memory read into memory from the file sent with the question - the collapsible pill
+   * under the reply (documentMemory.ts). Only on a reply that just arrived, like `memory`.
+   */
+  documentMemories?: DocumentMemory[];
 }
 
 export interface SessionSummary {

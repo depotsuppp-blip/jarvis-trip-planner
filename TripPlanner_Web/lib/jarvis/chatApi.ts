@@ -10,7 +10,7 @@ import type { ReplyAudio } from "./replyAudio";
  *   GET  /api/chat?conversationId=<id>      one session's messages
  *   GET  /api/chat/sessions                 the signed-in person's sessions, newest first
  *   POST /api/chat { message, conversationId?, newConversation?, speak? }   one typed turn
- *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?)   one typed turn with a file
+ *   POST /api/chat (multipart: message, file, conversationId?, newConversation?, speak?, saveToMemory?)   one typed turn with a file
  *        - asked for as lines of JSON (Accept: application/x-ndjson) when the caller wants Jarvis's
  *          steps on the way ("Searching the web..."): `send` with `onProgress`; the same lines carry
  *          an action waiting for the person's yes or no (`approval`) and its closing (`approval_resolved`)
@@ -66,6 +66,8 @@ export interface TurnData {
   spokenAudioText?: string | null;
   /** What Jarvis's memory really wrote during the turn (memoryNote.ts). Not stored: for this response only. */
   memory?: unknown;
+  /** What Save to Memory read out of the attached file (documentMemory.ts). Not stored: for this response only. */
+  savedMemories?: unknown;
 }
 
 /** A spoken turn: the same answer as a typed one, plus the words that were heard. */
@@ -147,6 +149,8 @@ export interface TurnRequest {
   newConversation?: boolean;
   /** Also return the reply as audio (when it is short enough). */
   speak?: boolean;
+  /** Save to Memory: also read the file's key facts into Jarvis's long-term memory. Only sent with a file. */
+  saveToMemory?: boolean;
 }
 
 const READ_TIMEOUT_MS = 15_000;
@@ -307,6 +311,7 @@ export const chatApi = {
       if (turn.conversationId) form.append("conversationId", turn.conversationId);
       else if (turn.newConversation) form.append("newConversation", "true");
       if (turn.speak) form.append("speak", "true");
+      if (turn.saveToMemory) form.append("saveToMemory", "true");
       init = { method: "POST", body: form, signal };
     }
     return events ? streamedTurn("/api/chat", init, events) : request<TurnData>("/api/chat", init);
