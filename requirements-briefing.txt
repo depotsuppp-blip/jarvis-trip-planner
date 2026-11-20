@@ -1,0 +1,32 @@
+# The Morning Briefing (scripts/morning_briefing.py) - and nothing else.
+#
+# GitHub Actions installs only this file (.github/workflows/morning-briefing.yml),
+# so the daily run stays a few seconds of pip instead of the whole voice
+# assistant (Whisper, ONNX, PyAudio...). Every package has prebuilt wheels for
+# Linux, macOS and Windows.
+#
+#   pip install -r requirements-briefing.txt
+#   python scripts/morning_briefing.py --dry-run
+#
+# Upper bounds on the major version on purpose: this runs unattended every
+# morning, and a breaking major release should fail a pull of the pin, not the
+# 08:00 briefing.
+
+# RSS / Atom feeds (Step 1). The script downloads each feed itself (requests,
+# with a timeout) and hands the bytes to feedparser, which has no timeout of its own.
+feedparser>=6.0.11,<7
+
+# Full article text (Step 3), extracted from the HTML the script downloads
+# (again with requests and a timeout). Brings lxml, justext, htmldate, courlan.
+trafilatura>=2.0.0,<3
+
+# gpt-4o-mini picks the stories and writes the Thai summaries (OPENAI_API_KEY).
+openai>=1.60.0,<4
+
+# Feeds, article pages, the Google token refresh + Calendar REST call, and the
+# LINE push - every call with an explicit timeout.
+requests>=2.31.0,<3
+
+# Optional: today's focus from Jarvis's memory (DATABASE_URL, read-only). Only
+# imported when DATABASE_URL is set; without the package that card line is skipped.
+psycopg2-binary>=2.9.9,<3
