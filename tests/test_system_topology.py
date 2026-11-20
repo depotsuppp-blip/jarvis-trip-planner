@@ -218,14 +218,15 @@ class TopologyApiTests(unittest.TestCase):
         data = self.topology(OWNER_ID)
         self.assertTrue(data["viewer"]["owner"])
         self.assertEqual(data["viewer"]["hidden"], 0)
-        self.assertTrue({"head:database", "head:schedule", "head:classroom"} <= self.ids(data))
+        self.assertTrue({"head:database", "head:schedule", "head:classroom", "channel:line"} <= self.ids(data))
         self.assertTrue(self.provider(data, "head:database")["owner_only"])
+        self.assertTrue(self.provider(data, "channel:line")["owner_only"])
 
     def test_anyone_else_never_sees_them(self) -> None:
         data = self.topology(ALICE)
         self.assertFalse(data["viewer"]["owner"])
-        self.assertEqual(data["viewer"]["hidden"], 3)
-        self.assertFalse({"head:database", "head:schedule", "head:classroom"} & self.ids(data))
+        self.assertEqual(data["viewer"]["hidden"], 4)
+        self.assertFalse({"head:database", "head:schedule", "head:classroom", "channel:line"} & self.ids(data))
         text = json.dumps(data)
         self.assertNotIn("delegate_to_database", text)
         self.assertNotIn("classroom", text.lower())

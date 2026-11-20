@@ -124,6 +124,12 @@ async def ingest_document(
     M.db_settings()
     M._openai_client()
     text, cut = await asyncio.to_thread(document_text, attachment)
+    return await _save_text(scope, name, text, cut, when)
+
+
+async def _save_text(scope: str, name: str, text: str, cut: bool, when: datetime.datetime) -> Optional[dict[str, Any]]:
+    """A document's text (already read) into `scope`'s memory as `name`: the part ingest_document and
+    ingest_text share - secrets out, the facts extracted and checked, saved with their provenance."""
     text = M.redact_secrets(text)
     known, facts = await M._known_memory(scope)
     graph = await M.extract_document(text, name, known, facts)
@@ -149,6 +155,46 @@ async def ingest_document(
         "facts": stated + replaced,
         "ingested_at": when.isoformat(),
     }
+
+
+async def ingest_text(
+    scope: str,
+    source_file: str,
+    text: str,
+    *,
+    now: Optional[datetime.datetime] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Text that is not a file in uploads/ - what the vision model read off a photo the owner sent from
+    LINE (api_server.py, line_channel.py) - into `scope`'s memory exactly like a document, with
+    `source_file` (e.g. "line_image_20261120_093015.jpg") as its provenance. What was saved (the shape
+    of one ingest() entry), or None when nothing was: nothing worth keeping, not set up, a failure, or
+    INGEST_TIMEOUT_SECONDS passed. Never raises (a cancelled request still cancels it).
+    """
+    name = attachments.quoted_name(source_file, "image")[: M.MAX_SOURCE_FILE]
+    when = now or datetime.datetime.now(datetime.timezone.utc)
+    body = str(text or "").strip()
+    if not scope or not body:
+        return None
+    cut = len(body) > MAX_DOCUMENT_CHARS
+    if cut:
+        body = body[:MAX_DOCUMENT_CHARS] + "\n\n[The rest of the document is not included here.]"
+    try:
+        M.db_settings()
+        M._openai_client()
+        result = await asyncio.wait_for(_save_text(scope, name, body, cut, when), INGEST_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        _log(f"'{name}': gave up after {INGEST_TIMEOUT_SECONDS:g} s; nothing more was saved")
+        return None
+    except M.ToolError as exc:
+        _log(f"'{name}': not saved to memory: {exc}")
+        return None
+    except Exception as exc:  # noqa: BLE001 - a bug here must not cost the person their answer
+        _log(f"'{name}': not saved to memory: {type(exc).__name__}: {exc}")
+        return None
+    return result if result and result["count"] else None
 
 
 async def ingest(scope: str, files: Sequence[AttachmentLike]) -> list[dict[str, Any]]:

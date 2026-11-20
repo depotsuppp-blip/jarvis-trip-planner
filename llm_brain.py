@@ -766,6 +766,19 @@ result; when its result says so, the person can already see it, so do not \
 read it out or repeat what is in it - one short sentence is enough. \
 Everything else stands: plain text with no markdown, and short."""
 
+# Appended after WEB_CHAT_ADDENDUM when the chat is the owner's LINE chat on their phone
+# (request_context.CHANNEL_LINE, api_server.py's POST /webhooks/line). LINE shows plain text:
+# markdown arrives as stray symbols and a table as a mess on a narrow screen. api_server.py also
+# cleans the reply (line_channel.line_texts); this keeps the model from writing it in the first place.
+LINE_CHAT_ADDENDUM = """
+
+This chat is the owner's LINE chat with you, on their phone, not the web \
+page: the same person, memory and conversation as the web app. LINE shows \
+plain text only - no markdown, no tables, no headings, no bold markers, no \
+cards - so write short plain sentences, and for a list use short lines that \
+start with "- ". Put a link on a line of its own. Keep it brief: a few short \
+paragraphs at most."""
+
 # Appended after WEB_CHAT_ADDENDUM when the person has voice replies turned on
 # (request_context.voice_reply). The page reads a reply aloud only when its text is
 # at most rich_reply.VOICE_MAX_CHARS characters, so this asks for conversational
@@ -1614,6 +1627,12 @@ _FRONT_DOOR_WEB = (
     "\n- This input comes from a text chat on a screen, not a microphone: write response in the language "
     "the user writes in, or the one they ask for (Thai for Thai). Spoken replies get an English version "
     "of it made automatically, so the English-only rule above does not apply here."
+)
+
+# And when that text chat is the owner's LINE chat (request_context.CHANNEL_LINE; LINE_CHAT_ADDENDUM).
+_FRONT_DOOR_LINE = (
+    "\n- This chat is LINE, on the owner's phone (the same person, memory and conversation as the web app). "
+    "LINE shows plain text only: no markdown, tables, headings or bold markers; keep a response short."
 )
 
 # The same while it can build presentations (delegate_to_publishing): the cheap model would
@@ -5114,6 +5133,8 @@ class LLMBrain:
         caller = request_context.current()
         if caller is not None and caller.is_web:
             base += _FRONT_DOOR_WEB
+            if caller.is_line:
+                base += _FRONT_DOOR_LINE
         if self._creative is not None and self._creative.available:
             base += _FRONT_DOOR_CREATIVE
         if self._publishing is not None and self._publishing.available:
@@ -6062,6 +6083,8 @@ class LLMBrain:
             # stop a tool's link from reaching the user (see WEB_CHAT_ADDENDUM).
             if caller is not None and caller.is_web:
                 prompt += WEB_CHAT_ADDENDUM
+                if caller.is_line:
+                    prompt += LINE_CHAT_ADDENDUM
                 if caller.voice_reply:
                     prompt += VOICE_REPLY_ADDENDUM
         else:

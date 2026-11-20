@@ -163,6 +163,31 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  starter prompts (system_topology.py). Same X-Jarvis-User-Id header as /memory:
                  401 no_user without it; the owner-only parts are left out for anyone but the owner.
 
+    POST /webhooks/line  the LINE Official Account's Messaging API webhook: the owner chats with Jarvis
+                 from LINE on their phone - the same brain, tools and memory as the web hub, and the
+                 same transcript: LINE turns are kept in a "LINE" session of the web app (chat_sync.py),
+                 which /jarvis lists and opens like any other. LINE's side is line_channel.py.
+              -> 200 {"ok": true} at once, before anything is answered (LINE gives up on a slow
+                 webhook and retries it); the messages are then answered as a background task, one at
+                 a time, in order. 400 no X-Line-Signature (or a body that is not JSON), 401 a signature
+                 that is not LINE's (HMAC-SHA256 of the raw body with LINE_CHANNEL_SECRET), 413 a body
+                 over 1 MB, 503 no LINE_CHANNEL_SECRET. Events from anyone but the owner's own 1:1
+                 chat (LINE_TARGET_USER_ID, or LINE_USER_ID) are ignored, still with 200.
+                 A text is asked like a typed /chat prompt; a photo is fetched from LINE's content API
+                 and read by a vision model, and Jarvis is asked about what it shows - a document or a
+                 whiteboard, or any photo after "save this", also goes into memory as
+                 line_image_<YYYYmmdd_HHMMSS>.jpg (memory_ingest.ingest_text). While a turn runs LINE
+                 shows its loading animation; the answer goes back as a reply (falling back to a push
+                 when the reply token has expired) in plain-text bubbles of at most 5000 characters.
+                 Tools that need the owner's approval are declined, as for /voice: LINE has no
+                 Approval Card. The owner's memory is "owner", whoever JARVIS_OWNER_USER_ID is.
+                 EXPOSURE: LINE must reach this from the internet, through a tunnel (Cloudflare Tunnel,
+                 ngrok). With LINE_CHANNEL_SECRET set, a second listener on 127.0.0.1:8001
+                 (JARVIS_LINE_PORT; 0 turns it off) serves ONLY this path - point the tunnel at that
+                 port, never at 8000. And here on 8000, a request that came through a proxy or tunnel
+                 (X-Forwarded-For, Forwarded, CF-Connecting-IP and the like) gets 404 for every path
+                 but this one (_TunnelGuard; JARVIS_ALLOW_PROXIED=1 lifts that).
+
 Stateless by design: the web app's database is the source of truth for the
 transcript, so every request carries its own history and replaces whatever
 the brain remembered from the last one (LLMBrain.set_history). `history`
@@ -211,7 +236,8 @@ Things that differ from the voice assistant, deliberately:
   message the owner's own LINE (LINE_TARGET_USER_ID) and sending the daily
   briefing there is its job - and it is capped per task.
 * Bound to loopback with no authentication: anything on this machine can
-  call it, so do not expose the port. Like /chat's user_id, the /memory
+  call it, so do not expose the port - the LINE webhook has its own listener
+  for that (see POST /webhooks/line). Like /chat's user_id, the /memory
   endpoints' X-Jarvis-User-Id is taken as given - the web app sets it from the
   session. A browser page cannot send it here: CORS allows only GET and POST
   with Content-Type, so a page on another origin cannot add the header or
@@ -221,13 +247,20 @@ Things that differ from the voice assistant, deliberately:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import datetime
 import json
 import mimetypes
+import os
+import socket
 import threading
+from collections import deque
 from contextlib import aclosing, asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated, Any, AsyncIterator, Literal, Optional
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+import httpx
+from fastapi import APIRouter, BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -235,6 +268,8 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 
 import approvals
 import attachments
+import chat_sync
+import line_channel
 import mcp_client
 import memory_graph
 import memory_ingest
@@ -348,8 +383,47 @@ async def _lifespan(_app: FastAPI):
     threading.Thread(target=stt.warm_up, name="jarvis-stt-warmup", daemon=True).start()
     # Same idea for the brain: its MCP tool servers take a few seconds to start.
     threading.Thread(target=_warm_brain, name="jarvis-brain-warmup", daemon=True).start()
-    yield
-    await memory_graph.close()
+    # The LINE webhook's own listener, the one port a tunnel may point at (POST /webhooks/line).
+    listener = await _start_line_listener()
+    try:
+        yield
+    finally:
+        if listener is not None:
+            await _stop_line_listener(*listener)
+        await _chat_store.close()
+        await memory_graph.close()
+
+
+# Request headers a proxy or tunnel adds (Cloudflare Tunnel, ngrok, Tailscale Funnel, nginx...); a
+# request on this machine's loopback from the web app or a script carries none of them.
+_PROXY_HEADERS = frozenset({
+    b"x-forwarded-for", b"x-forwarded-host", b"forwarded", b"x-real-ip", b"true-client-ip",
+    b"cf-connecting-ip", b"cf-ray", b"tailscale-funnel-request",
+})
+
+
+class _TunnelGuard:
+    """
+    Plain ASGI (no BaseHTTPMiddleware, which would get in the way of /chat's stream and its Stop): a
+    request that came through a proxy or tunnel may reach POST /webhooks/line and nothing else. The rest
+    of this server has no authentication (see the top of this file), so a tunnel pointed at port 8000
+    by mistake must not hand the internet the chat, the memory or the files. JARVIS_ALLOW_PROXIED=1
+    lifts it, for a setup that really does put a proxy in front of the brain.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") == "http"
+            and scope.get("path") != line_channel.WEBHOOK_PATH
+            and os.environ.get("JARVIS_ALLOW_PROXIED", "").strip() != "1"
+            and any(name in _PROXY_HEADERS or name.startswith(b"ngrok-") for name, _ in scope.get("headers") or [])
+        ):
+            await JSONResponse(status_code=404, content={"detail": "Not Found"})(scope, receive, send)
+            return
+        await self.inner(scope, receive, send)
 
 
 app = FastAPI(title="Jarvis brain", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -359,6 +433,7 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+app.add_middleware(_TunnelGuard)
 
 # GET /artifacts/<file>: the folder Jarvis saves what it makes in (agents/creative_agent.py,
 # agents/publishing_agent.py, agents/analytics_agent.py). StaticFiles keeps requests inside it (no ../), and answers 404
@@ -454,7 +529,7 @@ def _prepare(
 
 
 async def _turn(
-    request: Request,
+    request: Any,
     brain: LLMBrain,
     prompt: str,
     history: list[HistoryTurn],
@@ -464,6 +539,7 @@ async def _turn(
     files: list[Attachment] | None = None,
     interactive: bool = False,
     saving: bool = False,
+    channel: str = request_context.CHANNEL_WEB,
 ) -> AsyncIterator[dict[str, Any]]:
     """
     One turn through the brain's state machine (LLMBrain.run), as /chat and /voice both
@@ -482,9 +558,11 @@ async def _turn(
     stream an {"type": "action_required"} event and wait for the person's Allow or Deny
     (approvals.py); /voice, which collects one JSON answer, is not, and those tools are declined.
     `saving`: the attached files are being saved to memory on the side (see _prepare).
+    `request` is the client's Request, or anything with an async is_disconnected() (a LINE turn has
+    no connection to watch); `channel` says who asks - the web hub, or the owner on LINE.
     """
     caller = request_context.RequestContext(
-        channel=request_context.CHANNEL_WEB,
+        channel=channel,
         user_id=user_id.strip(),
         app_url=app_url.strip(),
         # Only asked to keep answers short when they can actually be spoken.
@@ -877,6 +955,314 @@ async def voice(
         audio=voiced,
         memory_events=memory_events,
     )
+
+
+# ---- LINE: the owner's chat with Jarvis from their phone (line_channel.py, chat_sync.py) ----------
+
+# A LINE turn still running after this long is stopped, and the owner told so (an agent's long job
+# can take minutes; the answer then arrives by push, as the reply token will have expired).
+LINE_TURN_TIMEOUT_SECONDS = 300.0
+# How long the answer waits, once Jarvis has replied, for a photo's facts to finish saving to memory.
+LINE_SAVE_WAIT_SECONDS = 90.0
+# LINE turns run one at a time, in the order they arrived: each reads the session the last one wrote.
+_line_lock = asyncio.Lock()
+_chat_store = chat_sync.ChatStore()
+# The LINE conversation when the web app's database cannot be used (no JARVIS_OWNER_USER_ID, no
+# database, a failure): its last turns, in this process only, so a follow-up still has its context.
+_line_transcript: deque[tuple[str, str]] = deque(maxlen=chat_sync.HISTORY_TURNS)
+
+line_router = APIRouter()
+
+
+class _NoClient:
+    """What _turn watches for a LINE turn: nobody holds a connection open, so nobody can go away."""
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+@dataclass
+class _LineOutcome:
+    texts: list[str]          # the LINE text messages to send
+    reply: str = ""           # Jarvis's reply as the session keeps it ("" = keep nothing)
+    conversation: Optional[str] = None
+
+
+@line_router.post(line_channel.WEBHOOK_PATH)
+async def line_webhook(
+    request: Request,
+    background: BackgroundTasks,
+    signature: Annotated[str, Header(alias="X-Line-Signature", max_length=200)] = "",
+) -> Any:
+    """
+    LINE's delivery of what happened in the account's chats (see the top of this file). Checked and
+    acknowledged at once; the owner's messages are answered afterwards, as a background task, so LINE
+    never waits on Jarvis. Never reads a message before its signature is known to be LINE's.
+    """
+    config = line_channel.settings()
+    if not config.secret:
+        return JSONResponse(status_code=503, content={"code": "not_configured", "detail": f"Set {line_channel.SECRET_ENV} to receive LINE messages."})
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > line_channel.MAX_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"code": "too_large", "detail": "That delivery is too large."})
+    if not signature:
+        return JSONResponse(status_code=400, content={"code": "no_signature", "detail": "X-Line-Signature is missing."})
+    body = await request.body()
+    if len(body) > line_channel.MAX_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"code": "too_large", "detail": "That delivery is too large."})
+    if not line_channel.verify_signature(config.secret, body, signature):
+        print("[LINE] Refused a delivery whose signature is not LINE's.")
+        return JSONResponse(status_code=401, content={"code": "bad_signature", "detail": "X-Line-Signature does not match the body."})
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"code": "bad_body", "detail": "The body is not JSON."})
+
+    events, others = line_channel.owner_events(payload, config.owner)
+    if others:
+        unset = "" if config.owner else f" ({line_channel.LEGACY_OWNER_ENV} is not set, so nobody is the owner)"
+        print(f"[LINE] Ignored {others} event{'s' if others != 1 else ''} from outside the owner's own chat{unset}.")
+    if events:
+        if config.token:
+            background.add_task(_line_events, events, config)
+        else:
+            print(f"[LINE] {len(events)} message(s) from the owner, but {line_channel.TOKEN_ENV} is not set: no answer can be sent.")
+    return {"ok": True}
+
+
+app.include_router(line_router)
+
+# The webhook-only app served on the LINE listener's port (JARVIS_LINE_PORT): this one path and
+# nothing else - no /chat, no /memory, no /artifacts, no OpenAPI page.
+line_app = FastAPI(title="Jarvis LINE webhook", docs_url=None, redoc_url=None, openapi_url=None)
+line_app.include_router(line_router)
+
+
+async def _start_line_listener() -> Optional[tuple[Any, "asyncio.Task[None]"]]:
+    """
+    Serves line_app on 127.0.0.1:JARVIS_LINE_PORT (8001) on this event loop - the same process, so
+    LINE turns share the brain and its one-turn-at-a-time lock with the web. Only with
+    LINE_CHANNEL_SECRET set. The socket is bound here, so a port that is taken is a console line, not
+    a uvicorn exit that would take the whole server down with it.
+    """
+    config = line_channel.settings()
+    if not config.secret or not config.port:
+        return None
+    if config.port == PORT:
+        print(f"[LINE] {line_channel.PORT_ENV} is the brain's own port; no separate webhook listener.")
+        return None
+    import uvicorn
+
+    class _Listener(uvicorn.Server):
+        @contextlib.contextmanager
+        def capture_signals(self) -> Any:  # Ctrl+C belongs to the main server, which stops this one
+            yield
+
+    try:
+        sock = socket.create_server((HOST, config.port))
+    except OSError as exc:
+        print(
+            f"[LINE] The webhook listener could not use {HOST}:{config.port} ({exc.strerror or type(exc).__name__}). "
+            f"Set {line_channel.PORT_ENV} to a free port. Do not point a tunnel at port {PORT} instead."
+        )
+        return None
+    server = _Listener(uvicorn.Config(line_app, lifespan="off", log_level="info"))
+    task = asyncio.create_task(server.serve(sockets=[sock]), name="jarvis-line-listener")
+    print(f"[LINE] Webhook listener on http://{HOST}:{config.port}{line_channel.WEBHOOK_PATH} - point the tunnel at port {config.port} only.")
+    return server, task
+
+
+async def _stop_line_listener(server: Any, task: "asyncio.Task[None]") -> None:
+    server.should_exit = True
+    try:
+        await asyncio.wait_for(task, 10)
+    except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001 - shutting down regardless
+        print(f"[LINE] The webhook listener did not stop cleanly ({type(exc).__name__}).")
+
+
+def _line_http() -> httpx.AsyncClient:
+    """The HTTP client LINE's API is called with, for one delivery (a test hands in its own)."""
+    return httpx.AsyncClient()
+
+
+async def _line_events(events: list[dict[str, Any]], config: line_channel.LineSettings) -> None:
+    """One delivery's messages from the owner, answered one after another (LINE already has its 200)."""
+    async with _line_lock:
+        async with _line_http() as client:
+            api = line_channel.LineApi(config.token, client)
+            for event in events:
+                try:
+                    await _line_event(api, config, event, events)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one message's failure never costs the next its answer
+                    print(f"[LINE] A message could not be answered: {type(exc).__name__}")
+
+
+async def _keep_typing(api: line_channel.LineApi, chat_id: str) -> None:
+    """LINE's loading animation, started again before it runs out, until the answer is ready."""
+    while True:
+        await api.start_loading(chat_id)
+        await asyncio.sleep(line_channel.LOADING_REFRESH_SECONDS)
+
+
+async def _line_event(
+    api: line_channel.LineApi,
+    config: line_channel.LineSettings,
+    event: dict[str, Any],
+    batch: list[dict[str, Any]],
+) -> None:
+    message = event["message"]
+    kind = message.get("type")
+    reply_token = str(event.get("replyToken") or "")
+    if kind not in ("text", "image"):
+        if kind in ("audio", "video", "file", "location"):
+            await api.deliver(reply_token, config.owner, [line_channel.UNSUPPORTED_REPLY])
+        return  # a sticker needs no answer
+    if kind == "text" and not str(message.get("text") or "").strip():
+        return
+
+    typing = asyncio.create_task(_keep_typing(api, config.owner), name="jarvis-line-typing")
+    try:
+        if kind == "text":
+            text = str(message["text"]).strip()[:MAX_PROMPT_CHARS]
+            line_channel.note_text(text)
+            print(f"[LINE] A message from the owner ({len(text)} characters).")
+            outcome = await _line_turn(text, text)
+        else:
+            outcome = await _line_photo(api, message, batch)
+    finally:
+        # Stopped before the answer goes out: a restart after it would show "typing" under the answer.
+        typing.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await typing
+
+    how = await api.deliver(reply_token, config.owner, outcome.texts)
+    print(f"[LINE] Answered by {how} ({len(outcome.texts)} message{'s' if len(outcome.texts) != 1 else ''}).")
+    if outcome.reply:
+        await _keep_in_session(outcome.conversation, "jarvis", outcome.reply)
+
+
+async def _line_photo(api: line_channel.LineApi, message: dict[str, Any], batch: list[dict[str, Any]]) -> _LineOutcome:
+    """A photo from the owner: fetched from LINE, read by the vision model, then a turn about what it shows."""
+    when = datetime.datetime.now()
+    try:
+        data, mime = await api.content(str(message.get("id") or ""))
+        reading = await line_channel.read_image(data, mime)
+    except line_channel.LineError as exc:
+        print(f"[LINE] A photo from the owner could not be read: {exc}.")
+        name = line_channel.image_name(when)
+        conversation, _ = await _line_session()
+        await _keep_in_session(conversation, "user", line_channel.stored_photo_message(name, None))
+        reply = f"I couldn't read that photo: {exc}."
+        return _LineOutcome(line_channel.line_texts(reply), reply, conversation)
+
+    source_file = line_channel.image_name(when, mime)
+    asked = " ".join(
+        str(item["message"].get("text") or "") for item in batch if item["message"].get("type") == "text"
+    )
+    saving = reading.kind in line_channel.SAVE_KINDS or line_channel.wants_saving(f"{asked} {line_channel.recent_text()}")
+    print(f"[LINE] A photo from the owner: {reading.kind}" + (", saving its key facts to memory." if saving else "."))
+    task: Optional[asyncio.Task[Optional[dict[str, Any]]]] = None
+    if saving:
+        task = asyncio.create_task(
+            memory_ingest.ingest_text("owner", source_file, reading.as_document()), name="jarvis-line-save-photo"
+        )
+    return await _line_turn(
+        line_channel.image_prompt(source_file, reading, saving=saving),
+        line_channel.stored_photo_message(source_file, reading),
+        saving=task,
+    )
+
+
+async def _line_session() -> tuple[Optional[str], list[tuple[str, str]]]:
+    """The owner's LINE session in the web app and its last turns; (None, this process's) without one."""
+    owner = os.environ.get("JARVIS_OWNER_USER_ID", "").strip()
+    conversation = await _chat_store.line_conversation(owner) if owner else None
+    rows = await _chat_store.history(conversation) if conversation else None
+    if rows is None:
+        if not owner:
+            print("[LINE] JARVIS_OWNER_USER_ID is not set: this chat is not kept in a /jarvis session.")
+        return None, list(_line_transcript)
+    return conversation, rows
+
+
+async def _keep_in_session(conversation: Optional[str], role: str, content: str) -> None:
+    _line_transcript.append((role, content))
+    if conversation:
+        await _chat_store.add(conversation, role, content)
+
+
+def _line_history(rows: list[tuple[str, str]]) -> list[HistoryTurn]:
+    """The session's turns as /chat's history: a web file message keeps its file (chat_sync.parse_stored_user_message)."""
+    turns: list[HistoryTurn] = []
+    limit = MAX_PROMPT_CHARS * 2
+    for role, content in rows[-MAX_HISTORY_TURNS:]:
+        if role != "user":
+            turns.append(HistoryTurn(role="jarvis", content=content[:limit]))
+            continue
+        text, files = chat_sync.parse_stored_user_message(content)
+        try:
+            kept = [Attachment(**item) for item in files]
+        except ValidationError:
+            text, kept = content, []
+        turns.append(HistoryTurn(role="user", content=text[:limit], attachments=kept))
+    return turns
+
+
+async def _line_final(brain: LLMBrain, prompt: str, history: list[HistoryTurn], user_id: str) -> Optional[dict[str, Any]]:
+    """One turn of the state machine for LINE: its final (or error) event."""
+    async with aclosing(
+        _turn(_NoClient(), brain, prompt, history, user_id, "", channel=request_context.CHANNEL_LINE)
+    ) as events:
+        async for event in events:
+            if event.get("type") in ("final", "error", "cancelled"):
+                return event
+    return None
+
+
+async def _line_turn(
+    prompt: str,
+    stored: str,
+    saving: Optional["asyncio.Task[Optional[dict[str, Any]]]"] = None,
+) -> _LineOutcome:
+    """
+    One LINE message through the brain, in the owner's LINE session: the session's last turns as its
+    history, the message kept in the session (`stored`, what the web shows) before the turn, and the
+    answer as LINE text messages - with a line saying what was saved to memory, when anything was.
+    """
+    conversation, rows = await _line_session()
+    history = _line_history(rows)
+    await _keep_in_session(conversation, "user", stored)
+    owner = os.environ.get("JARVIS_OWNER_USER_ID", "").strip()
+    reply, failure = "", ""
+    memory_events: list[dict[str, Any]] = []
+    try:
+        brain = await _ready_brain()
+        final = await asyncio.wait_for(_line_final(brain, prompt, history, owner), LINE_TURN_TIMEOUT_SECONDS)
+        if final and final.get("type") == "final":
+            reply = str(final.get("message") or "").strip()
+            memory_events = list(final.get("memory_events") or [])
+        if not reply:
+            failure = "Jarvis hit an internal error and has no answer. Please try again."
+    except HTTPException:
+        failure = "Jarvis has no language model set up right now, so it cannot answer."
+    except asyncio.TimeoutError:
+        failure = "That took too long, so I stopped. Please try again, or ask in /jarvis on the computer."
+    except Exception as exc:  # noqa: BLE001 - the owner still hears that it failed
+        print(f"[LINE] The turn failed: {type(exc).__name__}")
+        failure = "Jarvis hit an internal error and has no answer. Please try again."
+
+    saved: Optional[dict[str, Any]] = None
+    if saving is not None:
+        try:
+            saved = await asyncio.wait_for(saving, LINE_SAVE_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            print("[LINE] Saving the photo to memory took too long; it was stopped.")
+        except Exception as exc:  # noqa: BLE001 - ingest_text never raises; belt and braces
+            print(f"[LINE] Saving the photo to memory failed: {type(exc).__name__}")
+    note = line_channel.memory_note(saved, memory_events)
+    return _LineOutcome(line_channel.line_texts(reply or failure, note), reply, conversation)
 
 
 if __name__ == "__main__":

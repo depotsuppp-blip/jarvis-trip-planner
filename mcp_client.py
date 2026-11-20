@@ -275,7 +275,8 @@ def caller_scope() -> str:
     `background`), so the answer is about the request being served.
     """
     context = request_context.current()
-    if context is None or not context.is_web:
+    # LINE answers only the owner's own LINE account (api_server.py checks the sender first).
+    if context is None or not context.is_web or context.is_line:
         return "owner"
     return web_scope(context.user_id)
 

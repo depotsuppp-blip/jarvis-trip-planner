@@ -55,6 +55,7 @@ from the configuration are model names, tool names and Google scope URLs.
 from __future__ import annotations
 
 import datetime
+import os
 import re
 from typing import Any, Iterable, Optional
 
@@ -147,6 +148,7 @@ DESCRIPTIONS = {
     "core:automation": "Runs your n8n workflows and sends LINE notifications.",
     "core:subtrack": "Reads Subtrack's ESG records and starts or stops its development environment.",
     "core:system": "Jarvis's own tools: how the machine is doing, what is on the screen, and new tools it writes itself.",
+    "channel:line": "Chat with Jarvis from LINE on your phone: the same memory and tools, and a LINE session you can open here.",
 }
 
 WORKFLOWS: dict[str, list[tuple[str, str]]] = {
@@ -221,6 +223,9 @@ WORKFLOWS: dict[str, list[tuple[str, str]]] = {
     "core:system": [
         ("Machine health", "How is the system doing? CPU, memory and disk."),
         ("List capabilities", "List your capabilities."),
+    ],
+    "channel:line": [
+        ("Photos in memory", "What have you saved to memory from the photos I sent you on LINE?"),
     ],
 }
 
@@ -589,13 +594,93 @@ def _agenda_ready() -> bool:
         return False
 
 
+def _line_settings() -> Any:
+    import line_channel
+
+    return line_channel.settings()
+
+
+def _line_webhook_ready() -> bool:
+    try:
+        return _line_settings().ready
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _line_photos_ready() -> bool:
+    return _line_webhook_ready() and bool(os.environ.get("OPENAI_API_KEY", "").strip())
+
+
+def _line_session_ready() -> bool:
+    return _line_webhook_ready() and bool(os.environ.get("JARVIS_OWNER_USER_ID", "").strip())
+
+
 # Tools that need something set up in .env, checked by the tool's own module (no network call).
 SETUP_CHECKS = {
     "send_line_notification": (_line_ready, "Not set up: needs LINE_CHANNEL_ACCESS_TOKEN and LINE_TARGET_USER_ID."),
     "push_line_notification": (_line_ready, "Not set up: needs LINE_CHANNEL_ACCESS_TOKEN and LINE_TARGET_USER_ID."),
     "trigger_n8n_webhook": (_n8n_ready, "No n8n webhook is set up (N8N_WEBHOOK_* in .env)."),
     "get_todays_agenda": (_agenda_ready, "Not set up: needs GOOGLE_SERVICE_ACCOUNT_FILE and GOOGLE_CALENDAR_ID."),
+    # The LINE channel (channel:line below): not tools the model calls, ways in for the owner.
+    "line_chat": (
+        _line_webhook_ready,
+        "Not set up: needs LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN and LINE_USER_ID (or LINE_TARGET_USER_ID).",
+    ),
+    "line_photos": (_line_photos_ready, "Not set up: needs the LINE settings and OPENAI_API_KEY (photos are read by a vision model)."),
+    "line_session": (_line_session_ready, "Not set up: needs the LINE settings and JARVIS_OWNER_USER_ID (whose /jarvis keeps the LINE session)."),
 }
+
+# The LINE channel's parts, as capabilities: (name, label, description).
+LINE_CAPABILITIES = (
+    ("line_chat", "Chat from LINE", "Your LINE messages reach Jarvis with its memory and tools; the answer comes back on LINE."),
+    ("line_photos", "Photos from LINE", "Documents, whiteboards and receipts you photograph are read; documents and whiteboards go into memory."),
+    ("line_session", "Shared LINE session", "Every LINE turn is kept in a \"LINE\" session you can open and continue in /jarvis."),
+)
+
+
+def _line_channel() -> dict[str, Any]:
+    """The owner's LINE webhook (api_server.py POST /webhooks/line): whether it is set up, from .env only."""
+    caps = []
+    for name, label, description in LINE_CAPABILITIES:
+        cap = _capability(name, label=label)
+        cap["description"] = description
+        _mark_setup(cap)
+        caps.append(cap)
+    provider = _provider(
+        "channel:line",
+        name="LINE",
+        title="Omni-channel webhook",
+        kind="core",
+        category="core",
+        vendor="LINE",
+        access="API",
+        owner_only=True,
+        capabilities=caps,
+    )
+    if caps[0]["status"] != ONLINE:
+        provider.update(status=OFFLINE, status_note="Not set up")
+        missing = []
+        try:
+            missing = _line_settings().missing
+        except Exception:  # noqa: BLE001
+            pass
+        provider["diagnostics"].append(
+            "LINE cannot reach Jarvis yet: " + (", ".join(missing) + " not set in .env." if missing else "its settings are incomplete.")
+        )
+    else:
+        port = 0
+        try:
+            port = _line_settings().port
+        except Exception:  # noqa: BLE001
+            pass
+        if port:
+            provider["diagnostics"].append(
+                f"LINE's webhook listener is set to 127.0.0.1:{port}/webhooks/line (JARVIS_LINE_PORT); the tunnel to LINE must point at that port only."
+            )
+        for cap in caps[1:]:
+            if cap["status"] != ONLINE:
+                provider["diagnostics"].append(cap["note"])
+    return provider
 
 
 def _mark_setup(cap: dict[str, Any]) -> None:
@@ -662,7 +747,7 @@ def build(brain: Any, owner: bool = True) -> dict[str, Any]:
     servers_rows = [_server(row, specs, notes) for row in servers]
     core = _core(specs, taken)
 
-    providers = agents + heads + servers_rows + core
+    providers = agents + heads + servers_rows + core + [_line_channel()]
     # A provider that cannot work cannot do any of its tools either.
     for provider in providers:
         if provider["status"] != ONLINE:

@@ -41,13 +41,16 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional
 
 CHANNEL_WEB = "web"
+# The owner's LINE chat with Jarvis (api_server.py's POST /webhooks/line): a text chat like the web
+# hub's - read, not heard; links reach the person - on a phone, from the owner alone.
+CHANNEL_LINE = "line"
 
 
 @dataclass(frozen=True)
 class RequestContext:
     """One request's caller. Absent (None) means the voice assistant."""
 
-    channel: str
+    channel: str  # CHANNEL_WEB or CHANNEL_LINE
     # TripPlanner_Web User.id of the signed-in person, "" when not known.
     user_id: str = ""
     # Origin of the TripPlanner_Web instance that sent the request, e.g.
@@ -69,7 +72,12 @@ class RequestContext:
 
     @property
     def is_web(self) -> bool:
-        return self.channel == CHANNEL_WEB
+        """A text chat with a person (the web hub, or LINE): tools answer with what to SEE, not say."""
+        return self.channel in (CHANNEL_WEB, CHANNEL_LINE)
+
+    @property
+    def is_line(self) -> bool:
+        return self.channel == CHANNEL_LINE
 
 
 _CURRENT: contextvars.ContextVar[Optional[RequestContext]] = contextvars.ContextVar(
@@ -85,11 +93,12 @@ def current() -> Optional[RequestContext]:
 def add_widget(widget: dict[str, Any]) -> bool:
     """
     Asks the web page to draw `widget` with this reply. True when the request is a
-    web chat (which can draw it), False for the voice assistant or outside a request -
-    the caller then puts the information in its spoken result instead.
+    web chat (which can draw it), False for the voice assistant, LINE (a LINE chat
+    shows text only) or outside a request - the caller then puts the information in
+    its result instead.
     """
     context = current()
-    if context is None or not context.is_web:
+    if context is None or not context.is_web or context.is_line:
         return False
     context.widgets.append(widget)
     return True
