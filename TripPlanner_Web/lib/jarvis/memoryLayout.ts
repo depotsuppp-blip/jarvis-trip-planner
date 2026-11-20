@@ -146,14 +146,29 @@ export function layoutSystem(nodes: GraphNode[], links: readonly GraphLink[], or
 
   for (const node of nodes) {
     const flat = byId.get(node.id);
-    const x = flat?.x ?? 0;
-    const z = flat?.y ?? 0;
-    const y = lift(node.id, orbits);
+    let x = flat?.x;
+    let z = flat?.y;
+    if (!Number.isFinite(x) || !Number.isFinite(z)) {
+      // Not expected (d3 re-seeds a start it cannot use), but an entry the forces could not place
+      // - and every entry a NaN reached through its relations - still gets a place: a stable spot
+      // on its own ring. One bad number must never take the whole scene with it.
+      const at = unit(node.id, 5) * 2 * Math.PI;
+      const radius = radiusAt(orbits.byId.get(node.id)?.ring ?? 0);
+      x = radius * Math.cos(at);
+      z = radius * Math.sin(at);
+    }
+    const height = lift(node.id, orbits);
+    const y = Number.isFinite(height) ? height : 0;
     node.x = node.fx = x;
     node.y = node.fy = y;
     node.z = node.fz = z;
     node.vx = node.vy = node.vz = 0;
   }
+}
+
+/** Whether an entry has a place the scene can draw: three finite coordinates. */
+export function isPlaced(node: { x?: number; y?: number; z?: number }): node is { x: number; y: number; z: number } {
+  return Number.isFinite(node.x) && Number.isFinite(node.y) && Number.isFinite(node.z);
 }
 
 /**

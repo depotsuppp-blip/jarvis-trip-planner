@@ -71,7 +71,9 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  answered as usual. saved_memories says what was saved, per file; a fact a newer
                  document's value replaced is listed as "archived" with "replaced": true. It is []
                  when the switch was off, there was no user_id, or nothing was worth keeping -
-                 a failure there never fails the reply.
+                 a failure there never fails the reply. The facts are prepared beside the turn and
+                 written only once the reply is ready (a failed or stopped turn writes nothing),
+                 and never past SAVE_BUDGET_SECONDS (100 s) from the start of the request.
     POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
                    history (a JSON list shaped like /chat's), user_id, app_url, speak
               -> { "transcript": "...", "reply": "...", "engine": "openai"|"local",
@@ -297,6 +299,11 @@ MAX_ATTACHMENTS = 5
 # A streamed turn sends a comment line after this long without an event, so nothing in between
 # takes a long tool call for a dead connection.
 HEARTBEAT_SECONDS = 10.0
+# Save to Memory may hold a /chat reply back at most this long from the start of the request: the web
+# app gives up at 120 s (TripPlanner_Web lib/jarvisBrain.ts, BRAIN_TIMEOUT_MS), and a reply must never
+# be lost to facts that are still being read. What is not done by then is cancelled and nothing is
+# written (production, 2026-11-20: a 315 KB PDF took the whole request past 120 s).
+SAVE_BUDGET_SECONDS = 100.0
 # How often a turn checks that its client is still there (and stops it when it is not).
 DISCONNECT_POLL_SECONDS = 0.25
 
@@ -692,23 +699,28 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
     that fails says so in an `error` event.
 
     With save_to_memory and a file, the file's key facts are read into the person's memory
-    (memory_ingest.py) side by side with the turn, and the final event says what was saved
-    (saved_memories). That never fails the turn: nothing saved is just []. A turn that is stopped
-    or fails stops the saving too.
+    (memory_ingest.py) in two steps: prepared (read, extracted, checked) side by side with the
+    turn, then written only once the reply is ready - a turn that fails, is stopped or runs out of
+    time writes nothing. The final event says what was saved (saved_memories). That never fails or
+    holds up the turn past SAVE_BUDGET_SECONDS from the start of the request: what is not done by
+    then is cancelled, and the reply goes out with saved_memories [].
     """
     brain = await _ready_brain()
     # Whose memory: the signed-in person's (mcp_client.web_scope); nobody's without a user_id.
     scope = mcp_client.web_scope(body.user_id) if body.save_to_memory and body.attachments else ""
 
     async def stream() -> AsyncIterator[str]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SAVE_BUDGET_SECONDS
+        preparing: Optional[asyncio.Task[list[memory_ingest.Prepared]]] = None
         saving: Optional[asyncio.Task[list[dict[str, Any]]]] = None
         if scope:
-            saving = asyncio.create_task(memory_ingest.ingest(scope, body.attachments), name="jarvis-save-to-memory")
+            preparing = asyncio.create_task(memory_ingest.prepare(scope, body.attachments), name="jarvis-save-to-memory")
         try:
             async with aclosing(
                 _turn(
                     request, brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments,
-                    interactive=body.interactive, saving=saving is not None,
+                    interactive=body.interactive, saving=preparing is not None,
                 )
             ) as events:
                 async for event in events:
@@ -730,15 +742,24 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
                         yield _sse({"type": "progress", "status": "Recording the spoken reply..."})
                     audio = await asyncio.to_thread(_audio_for, spoken, body.speak)
                     saved: list[dict[str, Any]] = []
-                    if saving is not None:
-                        if not saving.done():
-                            name = memory_ingest.source_name(body.attachments[0])
+                    if preparing is not None:
+                        # The reply is ready: the facts (prepared meanwhile) are written now, inside the budget.
+                        name = memory_ingest.source_name(body.attachments[0])
+                        if not preparing.done() or _saved_memories(preparing):
                             yield _sse({"type": "progress", "status": f"Saving key facts from {name} to memory..."})
-                        while not saving.done():
-                            await asyncio.wait({saving}, timeout=HEARTBEAT_SECONDS)
-                            if not saving.done():
-                                yield _sse({"type": "heartbeat"})
-                        saved = _saved_memories(saving)
+                        async for beat in _heartbeats_until(preparing, deadline):
+                            yield beat
+                        prepared = _saved_memories(preparing) if preparing.done() else []
+                        if not preparing.done():
+                            print(f"[API] Save to Memory: '{name}' was not ready in time; nothing was saved.")
+                        elif prepared and loop.time() < deadline:
+                            saving = asyncio.create_task(memory_ingest.save(scope, prepared), name="jarvis-save-to-memory-write")
+                            async for beat in _heartbeats_until(saving, deadline):
+                                yield beat
+                            if saving.done():
+                                saved = _saved_memories(saving)
+                            else:
+                                print(f"[API] Save to Memory: writing '{name}' ran out of time; nothing was saved.")
                     yield _sse({
                         "type": "final",
                         "node": event.get("node"),
@@ -753,8 +774,11 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
                     })
                     return
         finally:
-            if saving is not None and not saving.done():
-                saving.cancel()
+            # Not done when the reply went out, or the turn failed or was stopped: nothing more is written
+            # (a cancelled write rolls back).
+            for task in (preparing, saving):
+                if task is not None and not task.done():
+                    task.cancel()
 
     return StreamingResponse(
         stream(),
@@ -764,8 +788,25 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
     )
 
 
-def _saved_memories(task: "asyncio.Task[list[dict[str, Any]]]") -> list[dict[str, Any]]:
-    """What a finished Save to Memory task wrote; [] for one that failed (memory_ingest.ingest never should)."""
+async def _heartbeats_until(task: "asyncio.Task[Any]", deadline: float) -> AsyncIterator[str]:
+    """
+    Waits for `task` until the loop's clock reaches `deadline`, with a keep-alive comment line after
+    every HEARTBEAT_SECONDS of waiting so nothing in between takes the quiet for a dead connection.
+    The task is left as it is: the caller reads it, or cancels it when it is not done.
+    """
+    loop = asyncio.get_running_loop()
+    while not task.done():
+        left = deadline - loop.time()
+        if left <= 0:
+            return
+        await asyncio.wait({task}, timeout=min(HEARTBEAT_SECONDS, left))
+        if not task.done() and deadline - loop.time() > 0:
+            yield _sse({"type": "heartbeat"})
+
+
+def _saved_memories(task: "asyncio.Task[list[Any]]") -> list[Any]:
+    """What a finished Save to Memory step gave (prepared facts, or what was saved); [] for one that
+    failed or was cancelled (memory_ingest's steps never should fail)."""
     if task.cancelled():
         return []
     failure = task.exception()

@@ -110,12 +110,93 @@ export function relationLabel(relationType: string): string {
 
 /** The person's own entry. */
 export function isMe(node: Pick<MemoryNode, "name">): boolean {
-  return node.name.trim().toLowerCase() === "me";
+  return asText(node.name).trim().toLowerCase() === "me";
 }
 
 /** How an entry's name is shown: the person's own entry is "me (you)". */
 export function displayName(node: Pick<MemoryNode, "name">): string {
-  return isMe(node) ? "me (you)" : node.name;
+  return isMe(node) ? "me (you)" : asText(node.name) || UNNAMED;
+}
+
+// ---- what the server sent, checked -----------------------------------------------------------
+
+/** The name shown for an entry whose name came back empty (never expected; never a blank orb). */
+export const UNNAMED = "(no name)";
+// Longer than the brain ever stores (mcp_memory.py: names 120, descriptions 300): headroom, not a target.
+const MAX_NAME = 200;
+const MAX_TYPE = 60;
+const MAX_DESCRIPTION = 600;
+const MAX_RELATION = 100;
+
+/**
+ * Any value as text: a string as it is, a finite number or a boolean as its digits or word
+ * ("0.0812"), anything else (null, an object, NaN) as "". Everything the page reads from the
+ * server goes through it, so a name is never a number and `.trim()` never meets null.
+ */
+export function asText(value: unknown, max = Infinity): string {
+  const text =
+    typeof value === "string"
+      ? value
+      : (typeof value === "number" && Number.isFinite(value)) || typeof value === "boolean" || typeof value === "bigint"
+        ? String(value)
+        : "";
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+/** One entry from the server, or null when it has no id. */
+export function readMemoryNode(value: unknown): MemoryNode | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const id = asText(raw.id).trim();
+  if (!id) return null;
+  return {
+    id,
+    name: asText(raw.name, MAX_NAME).trim() || UNNAMED,
+    type: asText(raw.type, MAX_TYPE).trim() || "other",
+    description: asText(raw.description, MAX_DESCRIPTION),
+  };
+}
+
+/**
+ * The graph the server sent, made safe to lay out and draw whatever it holds: every entry with a
+ * string id, name, type and description (a numeric name such as 0.0812 becomes "0.0812"), no two
+ * entries or relations with one id, and only relations between two different entries that are
+ * both there, with a known status and a finite weight. An answer that is not a graph is an empty one.
+ */
+export function readMemoryGraph(value: unknown): MemoryGraph {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const nodes: MemoryNode[] = [];
+  const ids = new Set<string>();
+  for (const item of Array.isArray(raw.nodes) ? raw.nodes : []) {
+    const node = readMemoryNode(item);
+    if (!node || ids.has(node.id)) continue;
+    ids.add(node.id);
+    nodes.push(node);
+  }
+  const links: MemoryLink[] = [];
+  const linkIds = new Set<string>();
+  (Array.isArray(raw.links) ? raw.links : []).forEach((item, index) => {
+    if (!item || typeof item !== "object") return;
+    const link = item as Record<string, unknown>;
+    const source = asText(link.source).trim();
+    const target = asText(link.target).trim();
+    if (!ids.has(source) || !ids.has(target) || source === target) return;
+    let id = asText(link.id).trim() || `link-${index}`;
+    while (linkIds.has(id)) id = `${id}'`;
+    linkIds.add(id);
+    const weight = typeof link.weight === "number" && Number.isFinite(link.weight) && link.weight > 0 ? link.weight : 1;
+    const status = RELATION_STATUSES.find((known) => known === link.status) ?? "active";
+    links.push({
+      id,
+      source,
+      target,
+      relation_type: asText(link.relation_type, MAX_RELATION).trim() || "related_to",
+      weight,
+      status,
+      updated_at: typeof link.updated_at === "string" ? link.updated_at : null,
+    });
+  });
+  return { nodes, links };
 }
 
 /** Folded for search: case, accents and spacing do not count; Thai stays as it is. */
@@ -170,16 +251,26 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<MemoryRe
   };
 }
 
-export function loadMemoryGraph(): Promise<MemoryResult<MemoryGraph>> {
-  return request<MemoryGraph>("/api/memory/graph");
+/** The graph, checked (readMemoryGraph): whatever the server sent, the scene gets strings and real ends. */
+export async function loadMemoryGraph(): Promise<MemoryResult<MemoryGraph>> {
+  const result = await request<unknown>("/api/memory/graph");
+  return result.ok ? { ok: true, data: readMemoryGraph(result.data) } : result;
 }
 
-export function saveMemoryEntity(id: string, changes: MemoryEntityChanges) {
-  return request<{ node: MemoryNode; reembedded: boolean }>(`/api/memory/entities/${encodeURIComponent(id)}`, {
+/** The edited entry comes back checked like the graph's (readMemoryNode); an answer without one is a failure. */
+export async function saveMemoryEntity(
+  id: string,
+  changes: MemoryEntityChanges,
+): Promise<MemoryResult<{ node: MemoryNode; reembedded: boolean }>> {
+  const result = await request<{ node?: unknown; reembedded?: unknown }>(`/api/memory/entities/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(changes),
   });
+  if (!result.ok) return result;
+  const node = readMemoryNode(result.data.node);
+  if (!node) return { ok: false, status: 502, message: "Something went wrong. Please try again." };
+  return { ok: true, data: { node, reembedded: result.data.reembedded === true } };
 }
 
 export function removeMemoryEntity(id: string) {

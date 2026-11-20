@@ -351,6 +351,22 @@ export function createVisual(id: string, kind: OrbitKind, radius: number): NodeV
   return { id, kind, sun, radius, group, core, wire, glow: halo, halos, done, badge, focus, label, labelKey: "", labelSize: [0, 0], labelWanted: false, labelPriority: 3 };
 }
 
+/**
+ * What an entry is drawn as when its real visual could not be built or styled (HoloScene catches
+ * the failure): a plain slate sphere with a geometry and a material of its own - no shared
+ * geometry, no textures, no shader, nothing that can fail the same way - so the entry stays in the
+ * scene and can still be pointed at and opened, and every other entry is left as it is.
+ */
+export function createFallbackObject(id: string, radius: number): Group {
+  const group = new Group();
+  group.userData = { nodeId: id, kind: "fallback" };
+  const size = Number.isFinite(radius) && radius > 0 ? radius : 10;
+  const ball = new Mesh(new SphereGeometry(size, 16, 12), new MeshBasicMaterial({ color: SLATE, transparent: true, opacity: 0.85 }));
+  ball.userData.role = "fallback";
+  group.add(ball);
+  return group;
+}
+
 function setOpacity(object: Sprite | LineSegments<BufferGeometry, LineBasicMaterial>, opacity: number) {
   object.visible = opacity > 0.004;
   object.material.opacity = opacity;

@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from typing import Any
 from unittest import mock
@@ -171,7 +172,14 @@ class DocCase(KGCase):
 
 
 class SwitchTests(DocCase):
-    def chat(self, body: dict[str, Any], *, reply: str = "Here is what the spec says.") -> tuple[dict[str, Any], list[str]]:
+    def chat(
+        self,
+        body: dict[str, Any],
+        *,
+        reply: str = "Here is what the spec says.",
+        turn: Any = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        """POST /chat with a stand-in brain; `turn` (async, given the question) replaces its answer."""
         questions: list[str] = []
 
         class Brain:
@@ -183,6 +191,10 @@ class SwitchTests(DocCase):
 
             async def run(self, question: str, **kwargs: Any):
                 questions.append(question)
+                if turn is not None:
+                    async for event in turn(question):
+                        yield event
+                    return
                 yield {"type": "final", "node": "Final_Response", "message": reply}
 
         async def ready() -> Any:
@@ -191,9 +203,9 @@ class SwitchTests(DocCase):
         with mock.patch.object(api_server, "_ready_brain", ready):
             response = TestClient(api_server.app).post("/chat", json=body)
         self.assertEqual(response.status_code, 200, response.text)
+        self.last_response = response.text
         finals = [json.loads(m.group(1)) for m in re.finditer(r"event: final\ndata: (.+)\n", response.text)]
-        self.assertEqual(len(finals), 1, response.text)
-        return finals[0], questions
+        return (finals[0] if finals else {}), questions
 
     def body(self, attachment: api_server.Attachment, **extra: Any) -> dict[str, Any]:
         return {"prompt": "What is the deadline?", "user_id": "u1", "attachments": [attachment.model_dump()], **extra}
@@ -201,13 +213,15 @@ class SwitchTests(DocCase):
     def test_save_to_memory_false_skips_graph_writes_completely(self) -> None:
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
         attachment = self.upload("Spec_v2.md", "# Atlas\nDeadline: 2027-03-01")
-        with mock.patch.object(memory_ingest, "ingest", wraps=memory_ingest.ingest) as spy:
+        with mock.patch.object(memory_ingest, "prepare", wraps=memory_ingest.prepare) as prepare, \
+                mock.patch.object(memory_ingest, "save", wraps=memory_ingest.save) as save:
             for body in (self.body(attachment), self.body(attachment, save_to_memory=False)):
                 final, questions = self.chat(body)
                 self.assertEqual(final["message"], "Here is what the spec says.")
                 self.assertEqual(final["saved_memories"], [])
                 self.assertNotIn(attachments.SAVING_NOTE, questions[0])
-        spy.assert_not_called()
+        prepare.assert_not_called()
+        save.assert_not_called()
         self.assertEqual(self.doc_args, [], "the extractor was never asked")
         self.assertEqual(self.kg.calls, [], "memory was not even read")
         self.assertEqual((self.kg.entities, self.kg.relations), ({}, {}))
@@ -232,19 +246,20 @@ class SwitchTests(DocCase):
         )
         datetime.datetime.fromisoformat(saved["ingested_at"])
         self.assertIn(attachments.SAVING_NOTE, questions[0], "the model is told not to remember the file itself")
+        self.assertIn("Saving key facts from Spec_v2.md to memory...", self.last_response)
         self.assertEqual(len(self.kg.relations), 2)
         self.assertTrue(all(r["scope"] == "user:u1" for r in self.kg.relations.values()), "the signed-in person's memory")
 
     def test_no_user_no_saving(self) -> None:
         attachment = self.upload("Spec_v2.md")
-        with mock.patch.object(memory_ingest, "ingest") as spy:
+        with mock.patch.object(memory_ingest, "prepare") as spy:
             final, questions = self.chat({**self.body(attachment, save_to_memory=True), "user_id": ""})
         spy.assert_not_called()
         self.assertEqual(final["saved_memories"], [])
         self.assertNotIn(attachments.SAVING_NOTE, questions[0])
 
     def test_no_file_no_saving(self) -> None:
-        with mock.patch.object(memory_ingest, "ingest") as spy:
+        with mock.patch.object(memory_ingest, "prepare") as spy:
             final, _questions = self.chat({"prompt": "hi", "user_id": "u1", "save_to_memory": True})
         spy.assert_not_called()
         self.assertEqual(final["saved_memories"], [])
@@ -257,15 +272,140 @@ class SwitchTests(DocCase):
         self.assertEqual(final["saved_memories"], [])
         self.assertEqual(self.kg.writes(), [])
 
-    def test_a_crash_inside_ingest_is_contained_by_the_server(self) -> None:
-        async def broken(scope: str, files: Any) -> list[dict[str, Any]]:
+    def test_a_crash_inside_either_step_is_contained_by_the_server(self) -> None:
+        async def broken(*args: Any, **kwargs: Any) -> list[Any]:
             raise RuntimeError("a bug")
 
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
         attachment = self.upload("Spec_v2.md")
-        with mock.patch.object(memory_ingest, "ingest", broken):
+        for step in ("prepare", "save"):
+            with mock.patch.object(memory_ingest, step, broken):
+                final, _questions = self.chat(self.body(attachment, save_to_memory=True))
+            self.assertEqual(final["message"], "Here is what the spec says.", step)
+            self.assertEqual(final["saved_memories"], [], step)
+
+
+# =====================================================================
+# 1b. The production fix (2026-11-20): bounded, written only with a reply
+# =====================================================================
+
+
+class BudgetTests(DocCase):
+    """A 315 KB PDF took /chat past the web app's 120 s and still wrote six orphan facts afterwards."""
+
+    chat = SwitchTests.chat
+    body = SwitchTests.body
+
+    def slow_extractor(self, seconds: float) -> dict[str, Any]:
+        """The extractor takes `seconds` (and records whether it was cancelled)."""
+        record: dict[str, Any] = {"started": 0, "cancelled": False}
+        original = M.extract_document
+
+        async def slow(*args: Any, **kwargs: Any) -> M.Graph:
+            record["started"] += 1
+            try:
+                await asyncio.sleep(seconds)
+            except asyncio.CancelledError:
+                record["cancelled"] = True
+                raise
+            return await original(*args, **kwargs)
+
+        patcher = mock.patch.object(M, "extract_document", slow)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return record
+
+    def test_the_document_text_is_capped_between_12k_and_15k(self) -> None:
+        self.assertTrue(12_000 <= memory_ingest.MAX_DOCUMENT_CHARS <= 15_000)
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        self.ingest(self.upload("Long.md", "Atlas data. " * 30_000))  # 360,000 characters
+        sent = self.doc_args[0][0]
+        self.assertLessEqual(len(sent), memory_ingest.MAX_DOCUMENT_CHARS + 80)
+        self.assertTrue(sent.endswith("[The rest of the document is not included here.]"))
+
+    def test_the_extraction_call_has_its_own_timeout(self) -> None:
+        self.assertTrue(20 <= memory_ingest.EXTRACT_TIMEOUT_SECONDS <= 30)
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        record = self.slow_extractor(5)
+        started = time.monotonic()
+        with mock.patch.object(memory_ingest, "EXTRACT_TIMEOUT_SECONDS", 0.2):
+            self.assertEqual(self.ingest(self.upload("Spec.md")), [])
+        self.assertLess(time.monotonic() - started, 2.0, "given up at the extraction's own limit")
+        self.assertTrue(record["cancelled"], "the model call itself was stopped")
+        self.assertEqual(self.kg.writes(), [])
+
+    def test_slow_ingestion_never_holds_the_reply_past_the_budget(self) -> None:
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        record = self.slow_extractor(4)
+        attachment = self.upload("tgo CFO.pdf.md")
+        started = time.monotonic()
+        with mock.patch.object(api_server, "SAVE_BUDGET_SECONDS", 0.6):
             final, _questions = self.chat(self.body(attachment, save_to_memory=True))
-        self.assertEqual(final["message"], "Here is what the spec says.")
+        elapsed = time.monotonic() - started
+        self.assertEqual(final["message"], "Here is what the spec says.", "the reply arrives")
         self.assertEqual(final["saved_memories"], [])
+        self.assertLess(elapsed, 2.5, f"answered within the budget (took {elapsed:.2f} s)")
+        self.assertTrue(record["cancelled"], "the unfinished ingestion was cancelled")
+        time.sleep(0.3)
+        self.assertEqual(self.kg.writes(), [], "and nothing was written afterwards")
+
+    def test_the_facts_are_prepared_while_the_turn_runs(self) -> None:
+        # The stand-in turn only ends once the extraction has run: it would time out if they ran one after the other.
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        attachment = self.upload("Spec.md")
+
+        async def turn(question: str):
+            for _ in range(100):
+                if self.doc_args:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertTrue(self.doc_args, "extraction started during the turn")
+            self.assertEqual(self.kg.writes(), [], "but nothing is written before the reply is ready")
+            yield {"type": "final", "node": "Final_Response", "message": "Done."}
+
+        final, _questions = self.chat(self.body(attachment, save_to_memory=True), turn=turn)
+        self.assertEqual(final["message"], "Done.")
+        self.assertEqual(final["saved_memories"][0]["count"], 1)
+        self.assertEqual(len(self.kg.relations), 1)
+
+    def test_a_turn_that_fails_writes_nothing(self) -> None:
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        attachment = self.upload("Spec.md")
+
+        async def failing(question: str):
+            for _ in range(100):  # let the extraction finish first: it must still not be written
+                if self.doc_args:
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.sleep(0.1)
+            yield {"type": "error", "status": "Failed", "message": "The model is unavailable.", "code": 502}
+
+        final, _questions = self.chat(self.body(attachment, save_to_memory=True), turn=failing)
+        self.assertEqual(final, {}, "no final event")
+        self.assertIn("event: error", self.last_response)
+        self.assertTrue(self.doc_args, "the facts were prepared")
+        time.sleep(0.2)
+        self.assertEqual(self.kg.writes(), [], "and never written")
+        self.assertEqual((self.kg.entities, self.kg.relations), ({}, {}))
+
+    def test_a_write_that_runs_out_of_time_is_cancelled(self) -> None:
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        attachment = self.upload("Spec.md")
+        cancelled: list[bool] = []
+
+        async def slow_save(scope: str, graph: M.Graph, **kwargs: Any) -> Any:
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        started = time.monotonic()
+        with mock.patch.object(M, "save_graph", slow_save), mock.patch.object(api_server, "SAVE_BUDGET_SECONDS", 0.8):
+            final, _questions = self.chat(self.body(attachment, save_to_memory=True))
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertEqual(final["saved_memories"], [])
+        self.assertEqual(cancelled, [True])
 
 
 # =====================================================================
@@ -321,6 +461,67 @@ class CapTests(DocCase):
         [saved] = self.ingest(self.upload("Spec_v2.md"))
         self.assertEqual(saved["facts"], [{"subject": "Atlas", "relation": "backend_is", "object": "FastAPI", "status": "active"}])
         self.assertEqual({e["name"] for e in self.kg.entities.values()}, {"Atlas", "FastAPI"})
+
+
+# =====================================================================
+# 2b. Anti-pollution: no bare numbers, nothing unlinked to the person's world
+# =====================================================================
+
+
+class PollutionTests(DocCase):
+    def test_the_tgo_cfo_shape_saves_nothing(self) -> None:
+        # What gpt-4o-mini made of "tgo CFO.pdf" (an emission-factor guideline) on 2026-11-20.
+        factors = ["0.0812", "0.5986", "0.4750", "0.4999", "0.0987"]
+        self.doc_extracted = spec(
+            "Electricity, grid mix (ไฟฟ้า)", *[("Electricity, grid mix (ไฟฟ้า)", "emission_factor", f) for f in factors],
+            kinds={"Electricity, grid mix (ไฟฟ้า)": "other"},
+        )
+        self.assertEqual(self.ingest(self.upload("tgo CFO.pdf.md")), [])
+        self.assertEqual(self.kg.writes(), [])
+        self.assertEqual((self.kg.entities, self.kg.relations), ({}, {}))
+
+    def test_bare_numbers_go_values_with_units_and_dates_stay(self) -> None:
+        self.doc_extracted = spec(
+            "Atlas",
+            ("Atlas", "budget_is", "800,000 THB"),
+            ("Atlas", "deadline_is", "2027-03-01"),
+            ("Atlas", "launch_year_is", "2027"),
+            ("Atlas", "emission_factor", "0.0812"),
+            ("Atlas", "growth_is", "12.5%"),
+        )
+        [saved] = self.ingest(self.upload("Spec.md"))
+        self.assertEqual(
+            [f["object"] for f in saved["facts"]], ["800,000 THB", "2027-03-01", "2027"],
+        )
+        self.assertNotIn("0.0812", {e["name"] for e in self.kg.entities.values()})
+
+    def test_an_entry_already_in_memory_anchors_its_facts(self) -> None:
+        self.kg.entity("Electricity", "other", "the grid electricity the person's factory buys", unit(1))
+        self.doc_extracted = spec("Electricity", ("Electricity", "emission_factor_is", "0.4999 kgCO2e/kWh"), kinds={"Electricity": "other"})
+        [saved] = self.ingest(self.upload("Factors.md"))
+        self.assertEqual(saved["facts"][0]["object"], "0.4999 kgCO2e/kWh")
+
+    def test_an_unanchored_group_goes_and_an_anchored_one_stays(self) -> None:
+        self.doc_extracted = spec(
+            "Atlas",
+            ("Atlas", "backend_is", "FastAPI"),
+            ("Carbon footprint", "includes", "Scope 1 emissions"),
+            ("Scope 1 emissions", "measured_in", "tCO2e"),
+            kinds={"FastAPI": "technology", "Carbon footprint": "other", "Scope 1 emissions": "other"},
+        )
+        [saved] = self.ingest(self.upload("Mixed.md"))
+        self.assertEqual([(f["subject"], f["object"]) for f in saved["facts"]], [("Atlas", "FastAPI")])
+
+    def test_bare_value(self) -> None:
+        for name in ("0.0812", "1,250", "12.5%", "-3", "42", ""):
+            self.assertTrue(M.bare_value(name), name)
+        for name in ("2027-03-01", "15/04/2027", "2027", "800,000 THB", "15 June 2027", "ไฟฟ้า", "v2", "FastAPI"):
+            self.assertFalse(M.bare_value(name), name)
+
+    def test_the_prompt_forbids_tables_and_unanchored_facts(self) -> None:
+        prompt = M.DOCUMENT_EXTRACTION_PROMPT
+        for words in ("NEVER TABLES", "emission factors", "table cells", "ANCHORED", "never a bare number"):
+            self.assertIn(words, prompt)
 
 
 # =====================================================================

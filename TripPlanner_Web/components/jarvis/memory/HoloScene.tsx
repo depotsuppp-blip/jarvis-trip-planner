@@ -5,7 +5,7 @@ import ForceGraph3D, { type ForceGraphMethods, type LinkObject, type NodeObject 
 import { FogExp2, Vector3, type PerspectiveCamera } from "three";
 import type { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { displayName, groupOf, type TypeGroupId } from "@/lib/jarvis/memory";
-import { nodeRadius } from "@/lib/jarvis/memoryLayout";
+import { isPlaced, nodeRadius } from "@/lib/jarvis/memoryLayout";
 import {
   colorOf,
   endId,
@@ -18,7 +18,17 @@ import {
   type Orbits,
   type SolarGraph,
 } from "@/lib/jarvis/memoryOrbits";
-import { createRings, createVisual, disposeRings, placeLabels, spin, styleVisual, type NodeVisual, type VisualStyle } from "./holoObjects";
+import {
+  createFallbackObject,
+  createRings,
+  createVisual,
+  disposeRings,
+  placeLabels,
+  spin,
+  styleVisual,
+  type NodeVisual,
+  type VisualStyle,
+} from "./holoObjects";
 
 /**
  * The Memory page's 3D holographic solar system (react-force-graph-3d on Three.js). Loaded only
@@ -107,6 +117,14 @@ const FOG_REACH = 0.75;
 
 /** 0 under reduced motion (camera moves jump), else 1. */
 const motion = () => (window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 1);
+
+// Failures already logged: a fault that happens every frame is reported once, not 60 times a second.
+const reported = new Set<string>();
+function reportOnce(what: string, error: unknown): void {
+  if (reported.has(what)) return;
+  reported.add(what);
+  console.error(`Memory 3D view: ${what}; the rest of the scene is still drawn.`, error);
+}
 
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
@@ -276,7 +294,13 @@ export default function HoloScene({
     styleNode.current = (node, visual) => styleVisual(visual, styleOf(node), pixelUnit());
     for (const node of graph.nodes) {
       const visual = visuals.current.get(`${node.id}|${shapeOf(node, orbits)}`);
-      if (visual) styleVisual(visual, styleOf(node), pixelUnit());
+      if (!visual) continue;
+      try {
+        styleVisual(visual, styleOf(node), pixelUnit());
+      } catch (error) {
+        // One entry that cannot be restyled keeps its last look; the others are still restyled.
+        reportOnce("an entry could not be restyled", error);
+      }
     }
   }, [graph, orbits, styleOf, pixelUnit]);
 
@@ -289,9 +313,16 @@ export default function HoloScene({
       const key = `${node.id}|${shapeOf(node, current)}`;
       let visual = visuals.current.get(key);
       if (!visual) {
-        visual = createVisual(node.id, current.byId.get(node.id)?.kind ?? "moon", nodeRadius(node, current));
+        try {
+          visual = createVisual(node.id, current.byId.get(node.id)?.kind ?? "moon", nodeRadius(node, current));
+          styleNode.current(node, visual);
+        } catch (error) {
+          // An exception here would stop the library building every entry after this one (only the
+          // rings would be left): this entry becomes a plain sphere instead, and the rest carry on.
+          reportOnce("an entry could not be built", error);
+          return createFallbackObject(node.id, nodeRadius(node, current));
+        }
         visuals.current.set(key, visual);
-        styleNode.current(node, visual);
       }
       return visual.group;
     },
@@ -341,7 +372,9 @@ export default function HoloScene({
     (durationMs = 800) => {
       const api = fg.current;
       if (!api || !size) return;
-      const shown = graph.nodes.filter((node) => visible(node) && node.x !== undefined);
+      // Only entries with a real place: one NaN here would make the camera (and the fog) NaN too,
+      // and then nothing but the rings would be left on screen.
+      const shown = graph.nodes.filter((node) => visible(node) && isPlaced(node));
       if (!shown.length) return;
       const camera = api.camera() as PerspectiveCamera;
       const controls = api.controls() as OrbitControls;
@@ -376,9 +409,15 @@ export default function HoloScene({
           depth + ((Math.abs(p.dot(up)) + r) * size.height) / (t * height),
         );
       }
+      // Never move the camera somewhere it cannot be: the view stays as it is instead.
+      if (![centre.x, centre.y, centre.z, distance, reach].every(Number.isFinite)) {
+        reportOnce("the view could not be framed", new Error("non-finite camera position"));
+        return;
+      }
       api.cameraPosition(centre.clone().add(dir.multiplyScalar(distance)), centre, durationMs * motion());
       const fog = api.scene().fog;
-      if (fog instanceof FogExp2) fog.density = FOG_REACH / (distance + reach);
+      const density = FOG_REACH / (distance + reach);
+      if (fog instanceof FogExp2 && Number.isFinite(density) && density > 0) fog.density = density;
     },
     [graph, orbits, size, visible, insets],
   );
@@ -387,7 +426,7 @@ export default function HoloScene({
     (id: string) => {
       const api = fg.current;
       const node = nodeById.get(id);
-      if (!api || !node || node.x === undefined) return;
+      if (!api || !node || !isPlaced(node)) return;
       const camera = api.camera() as PerspectiveCamera;
       const controls = api.controls() as OrbitControls;
       const dir = camera.position.clone().sub(controls.target).normalize();
@@ -406,6 +445,7 @@ export default function HoloScene({
       const across = Math.min(140, Math.max(36, room * 0.16));
       const t = Math.tan((camera.fov * Math.PI) / 360);
       const distance = (2 * nodeRadius(node, orbits) * height) / (2 * t * across);
+      if (!Number.isFinite(distance) || distance <= 0) return;
       lastTouch.current = performance.now();
       api.cameraPosition(at.clone().add(dir.multiplyScalar(distance)), at, 1100 * motion());
     },
@@ -442,6 +482,14 @@ export default function HoloScene({
       frame = requestAnimationFrame(tick);
       const api = fg.current;
       if (!api) return;
+      try {
+        frameWork(api);
+      } catch (error) {
+        // The next frame is already asked for: a fault here costs the spin or a label, never the scene.
+        reportOnce("a frame could not be finished", error);
+      }
+    };
+    const frameWork = (api: Graph) => {
       if (!reduce.matches) for (const visual of visuals.current.values()) spin(visual, SPIN);
 
       const controls = api.controls() as OrbitControls;
@@ -451,7 +499,8 @@ export default function HoloScene({
 
       const camera = api.camera() as PerspectiveCamera;
       const centre = centreRef.current;
-      placeLabels(visuals.current.values(), camera, renderSize.current.width, renderSize.current.height, centre ? new Vector3(centre.x, centre.y, centre.z) : null);
+      const sun = centre && isPlaced(centre) ? new Vector3(centre.x, centre.y, centre.z) : null;
+      placeLabels(visuals.current.values(), camera, renderSize.current.width, renderSize.current.height, sun);
       const o = offset.current;
       const step = reduce.matches ? 1 : 0.2;
       o.x = Math.abs(o.tx - o.x) < 0.5 ? o.tx : o.x + (o.tx - o.x) * step;

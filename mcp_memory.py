@@ -81,7 +81,7 @@ import sys
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from mcp_stdio import Server, ToolError, ToolOutput, scope_of
 
@@ -488,11 +488,13 @@ Be strict: memory is for what the person will want recalled months from now, not
 - relations: AT MOST {MAX_DOCUMENT_FACTS} facts, the most important first. A rich document gives 5-{MAX_DOCUMENT_FACTS}; a thin one fewer; one with nothing worth keeping, none.
 - KEEP: the projects and what they are; the people and organizations involved and their roles; the tech stack and tools; deadlines, dates and milestones; budgets, prices and other key numbers; critical constraints, requirements and agreements; and how any of it links to the person ("me") or to a project already in memory.
 - IGNORE: legal boilerplate, generic definitions, tables of contents, introductions and background, examples, formatting, and trivia. Never a fact about the document itself (its title page, its page count, its author's address).
+- NEVER TABLES: standalone numbers, coefficients, emission factors, conversion factors, rates, percentages, statistics and other table cells are not facts to remember - a table is never copied row by row or cell by cell ("Electricity emission_factor 0.0812" is wrong). A reference document (a standard, a guideline, a manual, a list of factors or prices) gives at most what it is, who issued it, and what it is for in the person's own project or work.
+- ANCHORED: every fact hangs off a named project, person or organization - or "me", or an entity already in memory. Never a fact whose subject is a value, a generic concept or a table row; a group of facts that links to none of those is not worth keeping.
 
 Each relation is a triplet subject - relation - object with a status.
 - relation: a short English verb phrase in snake_case, active voice: building, uses, built_with, works_at, led_by, owned_by, client_of, partner_of, located_in, requires, must_not.
 - One value at a time: for these, use exactly these relation names, so a newer document replaces the old value - deadline_is, budget_is, launch_date_is, start_date_is, end_date_is, version_is, backend_is, frontend_is, database_is. (Not hosts or people: a project often has several of each - hosted_on, led_by, owned_by for each one.) ("The deadline moved to 15 April" -> TripPlanner deadline_is 15 April 2026.)
-- A value is an entity of its own, named by the value: "15 April 2026", "120,000 THB", "FastAPI".
+- A value is an entity of its own, named by the value WITH its unit or currency: "15 April 2026", "120,000 THB", "FastAPI" - never a bare number such as "0.0812" or "1,200". It is only ever the object of a fact about a project, person or organization (Atlas budget_is 120,000 THB).
 - The person is "me" ("I", "my", "the user"). Link the person only when the document is theirs to act on - their project, their job, their agreement: me building TripPlanner, me client_of Acme. Never invent a link.
 - Only what the document states: no guesses, no general knowledge.
 
@@ -557,6 +559,59 @@ def drop_misshapen(graph: Graph) -> tuple[Graph, int]:
     used = {key for source, _verb, target, _status in edges for key in (source, target)}
     kept = Graph({key: node for key, node in graph.nodes.items() if key in used}, edges)
     return kept, len(graph.edges) - len(edges)
+
+
+# A name with no letter in any script ("0.0812", "1,250", "12.5%", "-3") is a table cell, not an entry;
+# a date or a year is the one kind of letterless value worth keeping ("2027-03-01", "15/04/2027", "2027").
+_HAS_LETTER = re.compile(r"[^\W\d_]")
+_DATE_LIKE = re.compile(r"^\s*(?:\d{4}-\d{1,2}(?:-\d{1,2})?|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|(?:19|20)\d{2})\s*$")
+# What a document's facts must reach (DOCUMENT_EXTRACTION_PROMPT, ANCHORED): someone or something the
+# person's memory is about. Technology, places and "other" alone are generic knowledge, not theirs.
+ANCHOR_TYPES = frozenset({"person", "project", "organization"})
+
+
+def bare_value(name: str) -> bool:
+    """True for a name that is only a number (no letter in any script) and not a date or a year."""
+    text = str(name or "")
+    return not _HAS_LETTER.search(text) and not _DATE_LIKE.match(text)
+
+
+def drop_pollution(graph: Graph, known_keys: Iterable[str] = ()) -> tuple[Graph, int]:
+    """
+    A document's graph without what memory must not keep (DOCUMENT_EXTRACTION_PROMPT: NEVER TABLES,
+    ANCHORED), and how many relations went:
+    - bare values: an entry named only by a number ("0.0812", an emission factor copied out of a
+      table) goes, with its relations - a date or a year stays;
+    - unanchored groups: relations are kept only in a group (a connected part of the graph) that
+      reaches "me", an entry already in memory (`known_keys`), or a person, project or organization.
+      "Electricity, grid mix" and its factors, linked to nothing of the person's, is not theirs.
+    Measured on a TGO emission-factor guideline (2026-11-20): 5 numeric entries hung off one
+    "other" entry, none linked to the person - all six were saved as an orphan cluster.
+    """
+    known = set(known_keys)
+    numbers = {key for key, node in graph.nodes.items() if key != ME and bare_value(node.name)}
+    edges = [edge for edge in graph.edges if edge[0] not in numbers and edge[2] not in numbers]
+
+    parent: dict[str, str] = {}
+
+    def root(key: str) -> str:
+        parent.setdefault(key, key)
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    for source, _verb, target, _status in edges:
+        parent[root(source)] = root(target)
+
+    def anchor(key: str) -> bool:
+        node = graph.nodes.get(key)
+        return key == ME or key in known or (node is not None and node.type in ANCHOR_TYPES)
+
+    anchored_roots = {root(key) for source, _verb, target, _status in edges for key in (source, target) if anchor(key)}
+    kept = [edge for edge in edges if root(edge[0]) in anchored_roots]
+    used = {key for source, _verb, target, _status in kept for key in (source, target)}
+    return Graph({key: node for key, node in graph.nodes.items() if key in used}, kept), len(graph.edges) - len(kept)
 
 
 _REDACTED_KEY = "[redacted key]"

@@ -39,6 +39,7 @@ import {
 // Types only: a value imported from the scene module would pull Three.js into server rendering.
 import type { HoloSceneApi, Insets } from "./HoloScene";
 import { MemoryPanel, OrbDot, type ActionOutcome, type PanelRelation } from "./MemoryPanel";
+import { SceneBoundary } from "./SceneBoundary";
 import { glass, glassButton, glassField, glassIcon } from "./solarStyles";
 import { focusRing } from "../styles";
 
@@ -348,19 +349,21 @@ export function MemoryView() {
           aria-label={`Memory as a 3D solar system: ${graph.nodes.length} entries and ${graph.links.length} connections. Use the search or the list of entries to find and open one.`}
           className="absolute inset-0"
         >
-          <HoloScene
-            graph={graph}
-            orbits={orbits}
-            looks={looks}
-            revision={revision}
-            selectedId={selectedId}
-            matchIds={matchIds}
-            group={group}
-            labels={labels}
-            insets={measureInsets}
-            onSelect={pick}
-            onReady={onReady}
-          />
+          <SceneBoundary>
+            <HoloScene
+              graph={graph}
+              orbits={orbits}
+              looks={looks}
+              revision={revision}
+              selectedId={selectedId}
+              matchIds={matchIds}
+              group={group}
+              labels={labels}
+              insets={measureInsets}
+              onSelect={pick}
+              onReady={onReady}
+            />
+          </SceneBoundary>
         </div>
       )}
 
