@@ -18,13 +18,17 @@ What is checked:
   dropped; every link in the Flex message is a URL a feed gave; summary sentences with a
   link or an unverifiable number are removed.
 - Hero images: feed media / og:image / twitter:image / feed <img> extraction and their order,
-  the https + 2000-character + JPEG/PNG + no-SVG/avatar/pixel rules, LINE-size URL variants,
-  the probe (status, type, real PNG/JPEG dimensions), and the accent bar when nothing passes.
-- The structured summary: three parts, capped (2 / 2 / 1), grounded part by part, and the
-  fallback when nothing about what happened survives.
+  the public-http(s) + no-SVG/avatar/pixel/private-host rules (WebP allowed), the wsrv.nl
+  URL (1000 x 660 JPEG, q 85, within LINE's 2000 characters), its HEAD check (and the GET
+  fallback), and the slate header when nothing loads.
+- The card copy: kicker + key stat + 3-4 sentences under a strict schema at the columnist's
+  temperature; sentences grounded, a stat only with numbers from the text, the kicker cleaned,
+  no robotic labels anywhere.
 - The Flex Message against LINE's limits (bubbles, bytes, altText, labels, URIs, image URLs,
-  aspect ratios, colours, empty texts) - for normal and worst-case input - validate_flex
-  catching each break, and the editorial layout (palette, masthead, index, blocks, callout).
+  aspect ratios, colours, gradients, positions, empty texts) - for normal and worst-case input -
+  validate_flex catching each break, and the magazine layout: the full-bleed photo block with
+  its scrim, kicker pill and white headline; the stat bar; the one-row footer; the overview card
+  only when there is a day to show.
 - Graceful degradation: no / broken / expired Google token, a token without the Calendar
   scope, Calendar errors, no DATABASE_URL, a failing DB, OpenAI down, LINE refusing the
   Flex message (plain-text fallback), and what reaches the logs (no token, no LINE user ID,
@@ -38,7 +42,6 @@ import email.utils
 import importlib.util
 import io
 import json
-import struct
 import sys
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -116,6 +119,9 @@ class FakeSession:
     def get(self, url: str, **kwargs: Any) -> FakeResponse:
         return self._answer("GET", url, kwargs)
 
+    def head(self, url: str, **kwargs: Any) -> FakeResponse:
+        return self._answer("HEAD", url, kwargs)
+
     def post(self, url: str, **kwargs: Any) -> FakeResponse:
         return self._answer("POST", url, kwargs)
 
@@ -192,22 +198,6 @@ def rss(items: list[dict], title: str = "Feed") -> bytes:
     ).encode()
 
 
-def png(width: int, height: int) -> bytes:
-    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, height) + b"\x08\x02\x00\x00\x00" + b"\x00" * 64
-
-
-def jpeg(width: int, height: int) -> bytes:
-    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 9
-    exif = b"\xff\xe1" + struct.pack(">H", 2002) + b"\x00" * 2000  # a big block before the frame header
-    sof = b"\xff\xc2" + struct.pack(">H", 17) + b"\x08" + struct.pack(">HH", height, width) + b"\x03" + b"\x00" * 9
-    return b"\xff\xd8" + app0 + exif + sof + b"\x00" * 64
-
-
-def image_response(data: bytes, kind: str = "") -> FakeResponse:
-    kind = kind or ("image/png" if data.startswith(b"\x89PNG") else "image/jpeg")
-    return FakeResponse(200, content=data, headers={"Content-Type": kind, "Content-Length": str(len(data))})
-
-
 def pages_of(texts: dict, images: Optional[dict] = None) -> Callable[[Any, str], Any]:
     """An extract_article stand-in: url -> Page(text, og images)."""
     return lambda session, url: mb.Page(texts.get(url), tuple((images or {}).get(url, ())))
@@ -240,15 +230,15 @@ def all_uris(node: Any):
 
 
 SUMMARY = {
-    "what_happened": ["ประโยคที่หนึ่ง", "ประโยคที่สอง"],
-    "why_it_matters": ["ประโยคที่สาม"],
-    "takeaway": "ประโยคที่สี่",
+    "kicker": "AI INFRASTRUCTURE",
+    "key_stat": "$81.3B IPO",   # 81.3 is in LONG_TEXT
+    "summary": ["ประโยคที่หนึ่ง", "ประโยคที่สอง", "ประโยคที่สาม"],
 }
 
 
 def summary(**parts: Any) -> Any:
     data = {**SUMMARY, **parts}
-    return mb.Summary(list(data["what_happened"]), list(data["why_it_matters"]), data["takeaway"])
+    return mb.Summary(list(data["summary"]), data["kicker"], data["key_stat"] or "")
 
 
 def story(number: int, title: str, url: str, parts: Optional[Any] = None, basis: str = "article", image: str = "") -> Any:
@@ -321,14 +311,14 @@ class RssParsingTests(unittest.TestCase):
             "<media:content url='https://cdn.ars.example/hero-1152x648.jpg' medium='image' type='image/jpeg' width='1152' height='648'/>"
             "<media:content url='https://cdn.ars.example/clip.mp4' medium='video'/>"
             "<media:thumbnail url='https://cdn.ars.example/hero-150x150.jpg' width='150' height='150'/>"  # too small
-            "<media:thumbnail url='http://cdn.ars.example/plain-http.jpg' width='800' height='450'/>"    # not https
+            "<media:thumbnail url='http://cdn.ars.example/plain-http.jpg' width='800' height='450'/>"    # http: fine, the proxy serves it over https
             "<enclosure url='https://cdn.ars.example/diagram.svg' type='image/svg+xml' length='100'/>"
             "<enclosure url='https://cdn.ars.example/enclosed.png' type='image/png' length='90000'/>"
         )
         description = "<p><img src='https://cdn.ars.example/inline.jpg?a=1&amp;b=2' width='1200'/> Body text that is long enough.</p>"
         content = rss([{"title": "A story", "link": "https://ars.example/a", "published": NOW - timedelta(hours=1), "description": description, "extra": extra}])
         [item] = mb.parse_feed(content, feed, NOW)
-        self.assertEqual(item.images, ("https://cdn.ars.example/hero-1152x648.jpg", "https://cdn.ars.example/enclosed.png"))
+        self.assertEqual(item.images, ("https://cdn.ars.example/hero-1152x648.jpg", "http://cdn.ars.example/plain-http.jpg", "https://cdn.ars.example/enclosed.png"))
         self.assertEqual(item.inline_images, ("https://cdn.ars.example/inline.jpg?a=1&b=2",))
 
     def test_dedupe_keeps_the_publisher_and_numbers_newest_first(self):
@@ -408,33 +398,40 @@ class UrlHelperTests(unittest.TestCase):
 
 
 class ImageTests(unittest.TestCase):
-    def test_clean_image_url_keeps_only_https_jpeg_png_photos(self):
+    def test_clean_image_url_keeps_public_photos_of_any_format(self):
         good = {
             "https://cdn.example/a.jpg": "https://cdn.example/a.jpg",
             "https://cdn.example/a.PNG?w=1200": "https://cdn.example/a.PNG?w=1200",
-            "https://media.example/photos/1/191:100/w_1280,c_limit/Story": "https://media.example/photos/1/191:100/w_1280,c_limit/Story",  # no extension: the probe decides
+            "https://cdn.example/photo.webp": "https://cdn.example/photo.webp",       # the proxy turns it into a JPEG
+            "http://cdn.example/plain.jpg": "http://cdn.example/plain.jpg",          # so is a plain-http original
+            "https://cdn.example/anim.gif": "https://cdn.example/anim.gif",
+            "https://media.example/photos/1/191:100/w_1280,c_limit/Story": "https://media.example/photos/1/191:100/w_1280,c_limit/Story",
             "HTTPS://cdn.example/b.jpeg": "https://cdn.example/b.jpeg",
             "//cdn.example/protocol-relative.jpg": "https://cdn.example/protocol-relative.jpg",
             "https://cdn.example/ไฟล์ ภาพ.jpg": "https://cdn.example/%E0%B9%84%E0%B8%9F%E0%B8%A5%E0%B9%8C%20%E0%B8%A0%E0%B8%B2%E0%B8%9E.jpg",
-            "https://www.blognone.example/files/LINE%20THAILAND/image4.jpg": "https://www.blognone.example/files/LINE%20THAILAND/image4.jpg",
         }
         for raw, expected in good.items():
             self.assertEqual(mb.clean_image_url(raw), expected, raw)
         bad = (
-            "http://cdn.example/a.jpg",                  # LINE loads https only
             "https://cdn.example/logo.svg",
-            "https://cdn.example/anim.gif",
-            "https://cdn.example/photo.webp",
             "https://cdn.example/clip.mp4",
+            "https://cdn.example/page.html",
             "https://cdn.example/pixel.png",
             "https://cdn.example/t/1x1.jpg",
             "https://secure.gravatar.com/avatar/abc.jpg",
             "https://cdn.example/avatars/author.jpg",
             "https://pixel.wp.com/g.png",
+            "https://localhost/a.jpg",
+            "http://127.0.0.1/a.jpg",
+            "http://192.168.1.10/a.jpg",
+            "http://[::1]/a.jpg",
+            "https://printer.local/a.jpg",
+            "https://user:pass@cdn.example/a.jpg",
+            "ftp://cdn.example/a.jpg",
             "data:image/png;base64,iVBORw0KGgo=",
             "javascript:alert(1)",
             "/relative/without/base.jpg",
-            "https://cdn.example/" + "a" * 2000 + ".jpg",  # over LINE's 2000 characters
+            "https://cdn.example/" + "a" * 2000 + ".jpg",
             "",
             None,
         )
@@ -447,13 +444,32 @@ class ImageTests(unittest.TestCase):
         for bad in ("http://cdn.example/a.jpg", "https://cdn.example/ภาพ.jpg", "https://cdn.example/a b.jpg", "https://", "https://e.example/" + "a" * 2000, 42):
             self.assertFalse(mb.is_line_image_url(bad), bad)
 
+    def test_public_sources_only(self):
+        for url in ("https://cdn.example/a.jpg", "http://8.8.8.8/a.jpg", "https://images.ctfassets.net/x/y.webp"):
+            self.assertTrue(mb.is_public_image_source(url), url)
+        for url in ("https://localhost/a.jpg", "http://10.0.0.5/a.jpg", "http://169.254.169.254/latest", "https://intranet/a.jpg", "https://svc.internal/a.jpg", "https://a:b@cdn.example/x.jpg", 7):
+            self.assertFalse(mb.is_public_image_source(url), url)
+
+    def test_the_proxied_hero_url(self):
+        self.assertEqual(
+            mb.proxied_image_url("https://cdn.example/a.webp?w=1456&q=90"),
+            "https://wsrv.nl/?url=https%3A%2F%2Fcdn.example%2Fa.webp%3Fw%3D1456%26q%3D90&w=1000&h=660&fit=cover&output=jpg&q=85",
+        )
+        self.assertTrue(mb.proxied_image_url("http://cdn.example/a.jpg").startswith("https://wsrv.nl/?url=http%3A%2F%2Fcdn.example%2Fa.jpg&"))
+        self.assertTrue(mb.is_line_image_url(mb.proxied_image_url("https://cdn.example/%E0%B8%A0.jpg")))
+        for bad in ("http://127.0.0.1/a.jpg", "javascript:alert(1)", "", None, "https://cdn.example/" + "a/" * 600 + "x.jpg"):
+            self.assertEqual(mb.proxied_image_url(bad), "", bad)  # the last: 1225 characters, over 2000 once each "/" is %2F
+
     def test_feed_media_order_and_filters_without_feedparser(self):
         entry = {
             "media_content": [{"url": "", "medium": None}, {"url": "https://c.example/video.jpg", "medium": "video"}, {"url": "https://c.example/content.jpg", "medium": "image", "type": "image/jpeg", "width": "1152", "height": "648"}],
             "media_thumbnail": [{"url": "https://c.example/thumb-big.jpg", "width": "1232", "height": "1232"}, {"url": "https://c.example/thumb-small.jpg", "width": "150"}],
             "enclosures": [{"href": "https://c.example/enc.png", "type": "image/png"}, {"href": "https://c.example/enc.webp", "type": "image/webp"}, {"href": "https://c.example/a.mp3", "type": "audio/mpeg"}],
         }
-        self.assertEqual(mb.feed_media_images(entry), ("https://c.example/content.jpg", "https://c.example/thumb-big.jpg", "https://c.example/enc.png"))
+        self.assertEqual(
+            mb.feed_media_images(entry),
+            ("https://c.example/content.jpg", "https://c.example/thumb-big.jpg", "https://c.example/enc.png", "https://c.example/enc.webp"),
+        )
         self.assertEqual(mb.feed_media_images({}), ())
 
     def test_page_images_prefer_og_then_twitter_from_the_head(self):
@@ -479,95 +495,55 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(mb.inline_images(markup), ("https://b.example/lead.jpg", "https://b.example/second.jpg"))
         self.assertEqual(mb.inline_images("no images here"), ())
 
-    def test_line_sized_variants(self):
-        cases = {
-            "https://tc.example/a.jpg?resize=1200,800": "https://tc.example/a.jpg?resize=1024,683",
-            "https://mit.example/a.jpg?resize=1200%2C600": "https://mit.example/a.jpg?resize=1024%2C512",
-            "https://verge.example/a.jpg?quality=90&strip=all&crop=0%2C10%2C100%2C80&w=1200": "https://verge.example/a.jpg?quality=90&strip=all&crop=0%2C10%2C100%2C80&w=1024",
-            "https://p.example/a.jpg?w=2048&h=1024": "https://p.example/a.jpg?w=1024&h=512",
-            "https://media.example/photos/1/191:100/w_1280,c_limit/Story": "https://media.example/photos/1/191:100/w_1024,c_limit/Story",
-        }
-        for url, expected in cases.items():
-            self.assertEqual(mb.line_sized(url), expected, url)
-        for url in ("https://ars.example/hero-1152x648.jpg", "https://p.example/a.jpg?w=800", "https://p.example/a.jpg?resize=1024,576", "https://p.example/a.jpg?width=2000&show=w=5000"):
-            self.assertEqual(mb.line_sized(url), "", url)
-
-    def test_image_size_reads_png_and_jpeg_headers(self):
-        self.assertEqual(mb.image_size(png(1200, 630)), (1200, 630))
-        self.assertEqual(mb.image_size(jpeg(1024, 576)), (1024, 576))
-        self.assertEqual((mb.image_format(png(1, 1)), mb.image_format(jpeg(1, 1)), mb.image_format(b"GIF89a")), ("png", "jpeg", ""))
-        self.assertIsNone(mb.image_size(jpeg(1024, 576)[:600]))  # cut before the frame header
-        self.assertIsNone(mb.image_size(b"<html>"))
-
-    def test_probe_accepts_real_photos_and_rejects_the_rest(self):
+    def test_check_image_heads_the_proxied_url(self):
+        jpeg_head = {"Content-Type": "image/jpeg", "Content-Length": "84512"}
         routes = {
-            ("GET", "https://ok.example/png"): image_response(png(1200, 630)),
-            ("GET", "https://ok.example/jpeg"): image_response(jpeg(1024, 576)),
-            ("GET", "https://ok.example/unknown-size"): image_response(jpeg(1024, 576)[:600]),
-            ("GET", "https://bad.example/pixel"): image_response(png(1, 1)),
-            ("GET", "https://bad.example/thumb"): image_response(jpeg(150, 150)),
-            ("GET", "https://bad.example/blocked"): FakeResponse(403),
-            ("GET", "https://bad.example/html"): FakeResponse(200, content=b"<html>", headers={"Content-Type": "text/html"}),
-            ("GET", "https://bad.example/webp"): FakeResponse(200, content=b"RIFF....WEBP", headers={"Content-Type": "image/webp"}),
-            ("GET", "https://bad.example/lies"): FakeResponse(200, content=b"<svg/>", headers={"Content-Type": "image/png"}),
-            ("GET", "https://bad.example/huge"): FakeResponse(200, content=png(2000, 1000), headers={"Content-Type": "image/png", "Content-Length": str(11 * 1024 * 1024)}),
-            ("GET", "https://bad.example/redirected"): FakeResponse(200, content=png(1200, 630), headers={"Content-Type": "image/png"}, url="http://plain.example/x.png"),
-            ("GET", "https://bad.example/down"): ConnectionError("dns"),
+            ("HEAD", "https://wsrv.nl/?url=ok"): FakeResponse(200, headers=jpeg_head, url="https://wsrv.nl/?url=ok"),
+            ("HEAD", "https://wsrv.nl/?url=missing"): FakeResponse(404, headers={"Content-Type": "application/json"}),
+            ("HEAD", "https://wsrv.nl/?url=html"): FakeResponse(200, headers={"Content-Type": "text/html"}),
+            ("HEAD", "https://wsrv.nl/?url=webp"): FakeResponse(200, headers={"Content-Type": "image/webp"}),
+            ("HEAD", "https://wsrv.nl/?url=redirect"): FakeResponse(200, headers=jpeg_head, url="http://plain.example/x.jpg"),
+            ("HEAD", "https://wsrv.nl/?url=slow"): TimeoutError("read timed out"),
+            ("HEAD", "https://wsrv.nl/?url=nohead"): FakeResponse(405),
+            ("GET", "https://wsrv.nl/?url=nohead"): FakeResponse(206, content=b"\xff\xd8\xff\xe0" + b"\x00" * 12, headers=jpeg_head),
+            ("HEAD", "https://wsrv.nl/?url=png-nohead"): FakeResponse(405),
+            ("GET", "https://wsrv.nl/?url=png-nohead"): FakeResponse(200, content=b"\x89PNG\r\n\x1a\n" + b"\x00" * 8, headers=jpeg_head),
         }
         session = FakeSession(routes)
-        for path in ("png", "jpeg", "unknown-size"):
-            ok, why, _ = mb.probe_image(session, f"https://ok.example/{path}")
-            self.assertTrue(ok, f"{path}: {why}")
-        ok, why, size = mb.probe_image(session, "https://ok.example/png")
-        self.assertEqual(size, (1200, 630))
-        self.assertIn("over LINE's documented 1024 px", why)
-        self.assertIsNone(mb.probe_image(session, "https://ok.example/unknown-size")[2])
-        for path in ("pixel", "thumb", "blocked", "html", "webp", "lies", "huge", "redirected", "down"):
-            ok, why, _ = mb.probe_image(session, f"https://bad.example/{path}")
-            self.assertFalse(ok, f"{path} passed: {why}")
+        for name in ("ok", "nohead"):
+            ok, why = mb.check_image(session, f"https://wsrv.nl/?url={name}")
+            self.assertTrue(ok, f"{name}: {why}")
+        for name in ("missing", "html", "webp", "redirect", "slow", "png-nohead"):
+            ok, why = mb.check_image(session, f"https://wsrv.nl/?url={name}")
+            self.assertFalse(ok, f"{name} passed: {why}")
+        head_calls = [call for call in session.calls if call[0] == "HEAD"]
+        self.assertTrue(all(call[2]["timeout"] == mb.IMAGE_CHECK_TIMEOUT for call in head_calls))
+        self.assertLessEqual(sum(mb.IMAGE_CHECK_TIMEOUT), 15, "a quick check")
 
-    def test_choose_image_follows_the_order_and_prefers_line_size(self):
-        article = make_article(1, "Story", "https://news.example/1", images=("https://feed.example/broken.jpg",), inline_images=("https://feed.example/inline.jpg",))
-        page = mb.Page(LONG_TEXT, ("https://cdn.example/og.jpg?resize=1200,800", "https://cdn.example/tw.jpg"))
+    def test_choose_image_follows_the_order_and_proxies_every_candidate(self):
+        article = make_article(1, "Story", "https://news.example/1", images=("https://feed.example/broken.webp",), inline_images=("https://feed.example/inline.jpg",))
+        page = mb.Page(LONG_TEXT, ("https://cdn.example/og.webp", "https://cdn.example/tw.jpg"))
         tried: list[str] = []
 
-        def probe(session: Any, url: str) -> tuple:
+        def check(session: Any, url: str) -> tuple:
             tried.append(url)
-            return (url != "https://feed.example/broken.jpg", "test", (1024, 683))
+            return ("broken" not in url, "JPEG via wsrv.nl" if "broken" not in url else "HTTP 404")
 
-        url, where = mb.choose_image(None, article, page, probe)
-        self.assertEqual(url, "https://cdn.example/og.jpg?resize=1024,683")
+        url, where = mb.choose_image(None, article, page, check)
+        self.assertEqual(url, mb.proxied_image_url("https://cdn.example/og.webp"))
         self.assertIn("page meta", where)
-        self.assertEqual(tried, ["https://feed.example/broken.jpg", "https://cdn.example/og.jpg?resize=1024,683"])
+        self.assertEqual(tried, [mb.proxied_image_url("https://feed.example/broken.webp"), mb.proxied_image_url("https://cdn.example/og.webp")])
+        self.assertTrue(all(u.startswith("https://wsrv.nl/?url=") and u.endswith("&w=1000&h=660&fit=cover&output=jpg&q=85") for u in tried))
         tried.clear()
-        url, where = mb.choose_image(None, article, mb.Page(), lambda s, u: (tried.append(u) or False, "HTTP 403", None))
+        url, where = mb.choose_image(None, article, mb.Page(), lambda s, u: (tried.append(u) or False, "HTTP 403"))
         self.assertEqual(url, "")
-        self.assertEqual(tried, ["https://feed.example/broken.jpg", "https://feed.example/inline.jpg"])
+        self.assertEqual(len(tried), 2)
         self.assertTrue(where.startswith("none"))
-
-    def test_a_later_image_within_line_size_beats_an_oversized_one(self):
-        sizes = {
-            "https://feed.example/square-1232.jpg": (1232, 1232),
-            "https://cdn.example/photos/1/191:100/w_1024,c_limit/x": (1024, 536),
-            "https://feed.example/thumb-500.jpg": (500, 500),
-            "https://cdn.example/og-1456.jpg": (1456, 816),
-        }
-        probe = lambda s, url: (True, "test", sizes.get(url))  # noqa: E731
-        wired = make_article(1, "WIRED-like", "https://news.example/1", images=("https://feed.example/square-1232.jpg",))
-        url, _ = mb.choose_image(None, wired, mb.Page(None, ("https://cdn.example/photos/1/191:100/w_1280,c_limit/x",)), probe)
-        self.assertEqual(url, "https://cdn.example/photos/1/191:100/w_1024,c_limit/x")
-        ars = make_article(2, "Ars-like", "https://news.example/2", images=("https://cdn.example/og-1456.jpg", "https://feed.example/thumb-500.jpg"))
-        url, _ = mb.choose_image(None, ars, mb.Page(), probe)
-        self.assertEqual(url, "https://cdn.example/og-1456.jpg")  # a small thumbnail never beats a sharp photo
-        decoder = make_article(3, "Decoder-like", "https://news.example/3")
-        url, where = mb.choose_image(None, decoder, mb.Page(None, ("https://cdn.example/og-1456.jpg",)), probe)
-        self.assertEqual(url, "https://cdn.example/og-1456.jpg")  # nothing within 1024 px: the first that loaded
-        self.assertIn("page meta", where)
 
     def test_choose_image_stops_after_a_few_tries(self):
         article = make_article(1, "Story", "https://news.example/1", images=tuple(f"https://feed.example/{n}.jpg" for n in range(10)))
         tried: list[str] = []
-        url, _ = mb.choose_image(None, article, mb.Page(), lambda s, u: (tried.append(u) or False, "HTTP 404", None))
+        url, _ = mb.choose_image(None, article, mb.Page(), lambda s, u: (tried.append(u) or False, "HTTP 404"))
         self.assertEqual((url, len(tried)), ("", mb.MAX_IMAGE_PROBES))
 
     def test_extract_article_returns_the_og_image_even_without_text(self):
@@ -580,6 +556,7 @@ class ImageTests(unittest.TestCase):
             page = mb.extract_article(session, "https://news.example/story")
             self.assertEqual(page, mb.Page(None, ("https://cdn.example/og.jpg",)))
             self.assertEqual(mb.extract_article(FakeSession(), "https://gone.example/"), mb.Page())
+
 
 
 # =====================================================================
@@ -668,89 +645,123 @@ class SelectionIntegrityTests(unittest.TestCase):
     def test_summary_drops_links_and_unverifiable_numbers(self):
         client = FakeOpenAI(
             summary={
-                "what_happened": [
+                "kicker": "big tech",
+                "key_stat": "$81.3B IPO",
+                "summary": [
                     "Anthropic ระดมทุนได้ 81.3 พันล้านดอลลาร์จากการ IPO.",
                     "มูลค่าบริษัทแตะ 500 พันล้านดอลลาร์",          # 500 is not in the article
-                    "ผู้ก่อตั้ง 7 คนขายหุ้นที่ราคา 83 ดอลลาร์",
+                    "อ่านต่อที่ https://evil.example/phish",          # a link from the model
+                    "• ผู้ก่อตั้ง 7 คนขายหุ้นที่ราคา 83 ดอลลาร์",
                 ],
-                "why_it_matters": ["อ่านต่อที่ https://evil.example/phish", "• นี่คือก้าวสำคัญของวงการ AI."],  # a link from the model
-                "takeaway": "ต้องจับตาราคาหุ้นในสัปดาห์หน้า",
             }
         )
         article = make_article(1, "Anthropic IPO", "https://tc.example/ipo")
         result = mb.summarize(client, "gpt-4o-mini", article, LONG_TEXT)
         self.assertEqual(result.basis, "article")
-        self.assertEqual(result.summary.what_happened, ["Anthropic ระดมทุนได้ 81.3 พันล้านดอลลาร์จากการ IPO", "ผู้ก่อตั้ง 7 คนขายหุ้นที่ราคา 83 ดอลลาร์"])
-        self.assertEqual(result.summary.why_it_matters, ["นี่คือก้าวสำคัญของวงการ AI"])
-        self.assertEqual(result.summary.takeaway, "ต้องจับตาราคาหุ้นในสัปดาห์หน้า")
+        self.assertEqual(result.summary.sentences, ["Anthropic ระดมทุนได้ 81.3 พันล้านดอลลาร์จากการ IPO", "ผู้ก่อตั้ง 7 คนขายหุ้นที่ราคา 83 ดอลลาร์"])
+        self.assertEqual((result.summary.kicker, result.summary.key_stat), ("BIG TECH", "$81.3B IPO"))
         prompt = client.requests[0]["messages"][1]["content"]
         self.assertIn(LONG_TEXT.strip()[:200], prompt)
         self.assertNotIn("tc.example", prompt)  # the model is never even shown the URL
 
     def test_summary_from_feed_text_is_labelled_and_failure_falls_back(self):
         article = make_article(1, "Teaser story", "https://x.example/1", description="Company X launched product Y today.")
-        good = mb.summarize(FakeOpenAI(summary={"what_happened": ["บริษัท X เปิดตัว Y"], "why_it_matters": ["เป็นข่าวสำคัญ"], "takeaway": ""}), "m", article, None)
+        good = mb.summarize(FakeOpenAI(summary={"kicker": "PRODUCTS", "key_stat": None, "summary": ["บริษัท X เปิดตัว Y", "Y มาพร้อมฟีเจอร์ใหม่"]}), "m", article, None)
         self.assertEqual(good.basis, "feed")
-        bad = mb.summarize(FakeOpenAI(summary={"what_happened": ["มีผู้ใช้ 9 ล้านคน"], "why_it_matters": [], "takeaway": ""}), "m", article, None)
+        bad = mb.summarize(FakeOpenAI(summary={"kicker": "X", "key_stat": None, "summary": ["มีผู้ใช้ 9 ล้านคน", "เป็นข่าวใหญ่"]}), "m", article, None)
         self.assertEqual((bad.basis, bad.sentences), ("fallback", ["Company X launched product Y today."]))
         down = mb.summarize(FakeOpenAI(fail=True), "m", article, None)
         self.assertEqual(down.basis, "fallback")
         offline = mb.summarize(None, "m", article, None)
         self.assertEqual(offline.basis, "fallback")
+        self.assertEqual((offline.summary.kicker, offline.summary.key_stat), (mb.DEFAULT_KICKER, ""))
 
     def test_every_link_in_the_message_comes_from_a_feed(self):
         articles = [
-            make_article(1, "Story one", "https://one.example/a?utm_source=rss", images=("https://img.example/one.jpg",)),
+            make_article(1, "Story one", "https://one.example/a?utm_source=rss", images=("https://img.example/one.webp",)),
             make_article(2, "Story two", "https://two.example/b"),
         ]
-        client = FakeOpenAI(summary={"what_happened": ["ดูได้ที่ www.fake.example", "ประโยคจริง"], "why_it_matters": ["อีกประโยค"], "takeaway": "https://evil.example"})
-        session = FakeSession({("GET", "https://img.example/"): image_response(jpeg(1024, 563))})
+        client = FakeOpenAI(summary={"kicker": "AI", "key_stat": None, "summary": ["ดูได้ที่ www.fake.example", "ประโยคจริง", "อีกประโยค", "https://evil.example"]})
+        session = FakeSession({("HEAD", "https://wsrv.nl/"): FakeResponse(200, headers={"Content-Type": "image/jpeg"})})
         stories = mb.build_stories(session, client, "m", articles, [1, 2], wanted=2, extract=pages_of({a.url: LONG_TEXT for a in articles}))
         message = mb.build_flex_message(stories, context(), date(2026, 11, 20))
         feed_urls = {a.url for a in articles}
         self.assertEqual(set(all_uris(message)), feed_urls)
         image_urls = {image["url"] for image in components(message, "image")}
-        self.assertEqual(image_urls, {"https://img.example/one.jpg"})
+        self.assertEqual(image_urls, {mb.proxied_image_url("https://img.example/one.webp")})
         for text in all_strings(message):
             if "http" in text or "www." in text:
                 self.assertIn(text, feed_urls | image_urls)
 
 
-class StructuredSummaryTests(unittest.TestCase):
+class SummaryTests(unittest.TestCase):
+    """The new card copy: a kicker, an optional key stat, 3-4 natural sentences - no labels."""
+
     article = make_article(1, "Anthropic IPO", "https://tc.example/ipo")
 
-    def test_the_model_is_asked_for_three_parts_under_a_strict_schema(self):
+    def test_the_model_is_asked_for_kicker_stat_and_summary_under_a_strict_schema(self):
         client = FakeOpenAI(summary=SUMMARY)
         result = mb.summarize(client, "gpt-4o-mini", self.article, LONG_TEXT)
-        schema = client.requests[0]["response_format"]["json_schema"]
+        request = client.requests[0]
+        schema = request["response_format"]["json_schema"]
         self.assertTrue(schema["strict"])
-        self.assertEqual(set(schema["schema"]["required"]), {"what_happened", "why_it_matters", "takeaway"})
-        self.assertEqual(schema["schema"]["properties"]["takeaway"], {"type": "string"})
+        self.assertEqual(set(schema["schema"]["required"]), {"kicker", "key_stat", "summary"})
+        self.assertEqual(schema["schema"]["properties"]["key_stat"], {"type": ["string", "null"]})
+        self.assertEqual(schema["schema"]["properties"]["summary"], {"type": "array", "items": {"type": "string"}})
+        self.assertEqual(request["temperature"], mb.SUMMARY_TEMPERATURE)
         self.assertEqual(result.summary, summary())
-        self.assertEqual(result.sentences, ["ประโยคที่หนึ่ง", "ประโยคที่สอง", "ประโยคที่สาม", "ประโยคที่สี่"])
+        self.assertEqual(result.sentences, ["ประโยคที่หนึ่ง", "ประโยคที่สอง", "ประโยคที่สาม"])
 
-    def test_parts_are_capped_at_two_two_and_one(self):
-        data = {"what_happened": ["ก หนึ่ง", "ก สอง", "ก สาม"], "why_it_matters": ["ข หนึ่ง", "ข สอง", "ข สาม"], "takeaway": "ค หนึ่ง"}
+    def test_the_prompt_asks_for_a_columnist_not_labels(self):
+        prompt = mb.SUMMARY_SYSTEM
+        for words in ("kicker", "key_stat", "3 to 4 sentences", "columnist", "ข่าวนี้สำคัญเพราะ", "Never use", "ONLY facts stated"):
+            self.assertIn(words, prompt)
+        for old_label in ("เกิดอะไรขึ้น", "ทำไมถึงสำคัญ", "สิ่งที่น่าจับตา", "what_happened", "takeaway"):
+            self.assertNotIn(old_label, prompt)
+            self.assertFalse(hasattr(mb, "SUMMARY_LABELS"))
+
+    def test_at_most_four_sentences_and_at_least_two(self):
+        data = {"kicker": "CHIPS", "key_stat": None, "summary": ["ก", "ข", "ค", "ง", "จ"]}
         parsed, dropped = mb.parse_summary(data, LONG_TEXT, self.article)
-        self.assertEqual((parsed.what_happened, parsed.why_it_matters, parsed.takeaway, dropped), (["ก หนึ่ง", "ก สอง"], ["ข หนึ่ง", "ข สอง"], "ค หนึ่ง", 0))
-
-    def test_an_ungrounded_takeaway_is_dropped_but_the_summary_kept(self):
-        data = {"what_happened": ["ผู้ก่อตั้ง 7 คนขายหุ้น", "ราคา IPO อยู่ที่ 83 ดอลลาร์"], "why_it_matters": [], "takeaway": "หุ้นจะขึ้นไปถึง 150 ดอลลาร์"}
-        parsed, dropped = mb.parse_summary(data, LONG_TEXT, self.article)
-        self.assertEqual((parsed.takeaway, parsed.why_it_matters, dropped), ("", [], 1))
-        self.assertEqual(len(parsed.sentences), 2)
-
-    def test_not_a_summary_without_what_happened_or_with_one_sentence(self):
+        self.assertEqual((parsed.sentences, dropped), (["ก", "ข", "ค", "ง"], 0))
         for data in (
-            {"what_happened": [], "why_it_matters": ["ข หนึ่ง", "ข สอง"], "takeaway": "ค หนึ่ง"},
-            {"what_happened": ["ก หนึ่ง"], "why_it_matters": [], "takeaway": ""},
-            {"what_happened": "ก หนึ่ง", "why_it_matters": None, "takeaway": 7},
-            {"sentences": ["the old shape", "is not read"]},
+            {"kicker": "X", "key_stat": None, "summary": ["ประโยคเดียว"]},
+            {"kicker": "X", "key_stat": None, "summary": ["ผู้ก่อตั้ง 7 คน", "หุ้นจะขึ้นไปถึง 150 ดอลลาร์"]},  # one survives grounding
+            {"kicker": "X", "key_stat": None, "summary": []},
+            {"what_happened": ["the old shape", "is not read"]},
             ["not", "an object"],
             None,
         ):
             self.assertIsNone(mb.parse_summary(data, LONG_TEXT, self.article)[0], data)
-        self.assertEqual(mb.summarize(FakeOpenAI(summary={"sentences": ["a", "b"]}), "m", self.article, LONG_TEXT).basis, "fallback")
+        self.assertEqual(mb.summarize(FakeOpenAI(summary={"what_happened": ["a", "b"]}), "m", self.article, LONG_TEXT).basis, "fallback")
+
+    def test_the_kicker_is_a_short_clean_tag(self):
+        cases = {
+            "ai infrastructure": "AI INFRASTRUCTURE",
+            "  Big   Tech!! ": "BIG TECH",
+            "AI chips, data centres and power": "AI CHIPS DATA",
+            "นโยบาย AI": "นโยบาย AI",
+            "see https://evil.example now": "SEE NOW",
+            "OPEN-SOURCE & GPT-5": "OPEN-SOURCE & GPT-5",
+            "": mb.DEFAULT_KICKER,
+            "!!!": mb.DEFAULT_KICKER,
+            None: mb.DEFAULT_KICKER,
+            42: mb.DEFAULT_KICKER,
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(mb.clean_kicker(raw), expected, raw)
+        self.assertLessEqual(len(mb.clean_kicker("SUPERCALIFRAGILISTIC EXPIALIDOCIOUS WORDS")), mb.MAX_KICKER_CHARS)
+
+    def test_the_key_stat_must_be_a_number_from_the_text(self):
+        allowed = mb.allowed_numbers(LONG_TEXT, self.article)
+        self.assertEqual(mb.clean_stat("$81.3B IPO", allowed), "$81.3B IPO")
+        self.assertEqual(mb.clean_stat("  7 founders. ", allowed), "7 founders")
+        self.assertEqual(mb.clean_stat("3.4M shares", allowed), "3.4M shares")
+        for bad in ("$500B valuation", "record IPO", "", None, 7, "x" * 30 + " 7", "7 https://e.example"):
+            self.assertEqual(mb.clean_stat(bad, allowed), "", bad)
+        parsed, dropped = mb.parse_summary({"kicker": "IPO", "key_stat": "$999B", "summary": ["ประโยค ก", "ประโยค ข"]}, LONG_TEXT, self.article)
+        self.assertEqual((parsed.key_stat, dropped), ("", 1))
+
 
 
 # =====================================================================
@@ -885,12 +896,17 @@ class ProjectsTests(unittest.TestCase):
 
 
 class FlexMessageTests(unittest.TestCase):
-    HERO = "https://cdn.example/hero.jpg?resize=1024,563"
+    HERO = mb.proxied_image_url("https://cdn.example/hero.webp")
+
+    def stories(self) -> list:
+        return [
+            story(1, "Story one", "https://one.example/a", image=self.HERO),
+            story(2, "Story two", "https://two.example/b", parts=summary(key_stat="")),
+        ]
 
     def full_message(self) -> dict:
         events = [mb.Event("", "", "Holiday")] + [mb.Event(f"{9 + i:02d}:00", f"{10 + i:02d}:00", f"Meeting {i}") for i in range(7)]
-        stories = [story(1, "Story one", "https://one.example/a", image=self.HERO), story(2, "Story two", "https://two.example/b")]
-        return mb.build_flex_message(stories, context(events, ["TripPlanner", "Jarvis"]), date(2026, 11, 20))
+        return mb.build_flex_message(self.stories(), context(events, ["TripPlanner", "Jarvis"]), date(2026, 11, 20))
 
     def test_full_briefing_is_valid(self):
         message = self.full_message()
@@ -900,11 +916,20 @@ class FlexMessageTests(unittest.TestCase):
         self.assertIn("20 November 2026", message["altText"])
         json.loads(json.dumps(message, ensure_ascii=False))  # serialisable as sent
 
-    def test_every_colour_is_from_the_editorial_palette(self):
+    def test_no_day_to_show_means_the_photos_come_first(self):
+        for quiet in (context(calendar_status="skipped"), context([]), context(calendar_status="error")):
+            message = mb.build_flex_message(self.stories(), quiet, date(2026, 11, 20))
+            self.assertEqual(mb.validate_flex(message), [])
+            bubbles = message["contents"]["contents"]
+            self.assertEqual(len(bubbles), 2, "no overview card")
+            self.assertEqual(bubbles[0]["hero"]["contents"][0]["type"], "image")
+            self.assertNotIn("JARVIS", json.dumps(message, ensure_ascii=False).replace(" ", ""))
+
+    def test_every_colour_is_from_the_magazine_palette(self):
         palette = set(mb.COLORS.values())
         self.assertEqual(
-            {key: mb.COLORS[key] for key in ("card", "callout", "ink", "body", "meta", "crimson", "pill", "hairline")},
-            {"card": "#FFFFFF", "callout": "#F5F5F7", "ink": "#1D1D1F", "body": "#3A3A3C", "meta": "#6E6E73", "crimson": "#FA243C", "pill": "#FFF0F2", "hairline": "#E5E5EA"},
+            {key: mb.COLORS[key] for key in ("slate", "body", "meta", "card", "scrim_top", "scrim_bottom")},
+            {"slate": "#18181B", "body": "#27272A", "meta": "#71717A", "card": "#FFFFFF", "scrim_top": "#00000000", "scrim_bottom": "#000000CC"},
         )
 
         def colours(node: Any):
@@ -919,92 +944,85 @@ class FlexMessageTests(unittest.TestCase):
 
         used = set(colours(self.full_message()))
         self.assertTrue(used <= palette, used - palette)
-        self.assertTrue({"#FFFFFF", "#F5F5F7", "#1D1D1F", "#FA243C", "#FFF0F2", "#E5E5EA"} <= used)
+        self.assertTrue({"#18181B", "#27272A", "#71717A", "#FFFFFF", "#00000000", "#000000CC"} <= used)
 
-    def test_cover_masthead_index_and_context(self):
-        cover = self.full_message()["contents"]["contents"][0]
-        body = cover["body"]["contents"]
-        masthead, thai, english = body[0], body[1], body[2]
-        self.assertEqual(masthead["text"].replace(" ", "").replace(" ", " "), "JARVIS DAILY")
-        self.assertEqual((masthead["weight"], masthead["color"], masthead["size"]), ("bold", "#FA243C", "xs"))
-        self.assertEqual((thai["text"], thai["weight"], thai["color"]), ("วันศุกร์ที่ 20 พฤศจิกายน 2569", "bold", "#1D1D1F"))
-        self.assertEqual((english["text"], english["color"]), ("Friday, 20 November 2026 · Bangkok", "#6E6E73"))
-        index = [b for b in components(cover, "box") if b.get("backgroundColor") == "#F5F5F7" and b.get("layout") == "horizontal"]
-        self.assertEqual(len(index), 2)
-        for number, card in zip(("01", "02"), index):
-            self.assertEqual(card["cornerRadius"], "md")
-            numeral, words = card["contents"]
-            self.assertEqual((numeral["text"], numeral["weight"], numeral["color"]), (number, "bold", "#FA243C"))
-            self.assertEqual([t["text"] for t in words["contents"]], [f"Story {'one' if number == '01' else 'two'}", "TechCrunch"])
-        context_box = body[-1]
-        self.assertEqual((context_box["backgroundColor"], context_box["cornerRadius"]), ("#F5F5F7", "md"))
-        text = json.dumps(context_box, ensure_ascii=False)
-        self.assertIn("ตารางวันนี้", text)
-        self.assertIn("และอีก 3 นัดหมาย", text)  # 8 events, 5 shown
-        self.assertIn("TripPlanner · Jarvis", text)
-        self.assertEqual(cover["hero"]["backgroundColor"], "#FA243C")  # the accent rule on top
-
-    def test_news_card_with_a_hero_image(self):
+    def test_news_card_with_a_photo(self):
         news = self.full_message()["contents"]["contents"][1]
+        hero = news["hero"]
+        self.assertEqual((hero["type"], hero["height"], hero["paddingAll"]), ("box", "220px", "0px"))
+        self.assertEqual(hero["action"], {"type": "uri", "label": "อ่านต่อ", "uri": "https://one.example/a"})
+        photo, caption = hero["contents"]
         self.assertEqual(
-            news["hero"],
-            {"type": "image", "url": self.HERO, "size": "full", "aspectRatio": "20:11", "aspectMode": "cover", "action": {"type": "uri", "label": "อ่านข่าวเต็ม", "uri": "https://one.example/a"}},
+            photo,
+            {"type": "image", "url": self.HERO, "size": "full", "aspectMode": "cover", "aspectRatio": "15:11", "position": "absolute", "offsetTop": "0px", "offsetStart": "0px", "offsetEnd": "0px"},
         )
-        meta_row, headline, separator, blocks, note = news["body"]["contents"]
-        pill, source = meta_row["contents"]
-        self.assertEqual((pill["backgroundColor"], pill["contents"][0]["text"], pill["contents"][0]["color"]), ("#FFF0F2", "TECH & AI", "#FA243C"))
-        self.assertTrue(source["text"].startswith("TechCrunch · ") and source["color"] == "#6E6E73" and source["align"] == "end")
-        self.assertEqual((headline["text"], headline["weight"], headline["color"], headline["wrap"]), ("Story one", "bold", "#1D1D1F", True))
-        self.assertIn(headline["size"], ("lg", "xl"))
-        self.assertEqual((separator["type"], separator["color"]), ("separator", "#E5E5EA"))
-        self.assertEqual(blocks["spacing"], "md")
-        what, why, takeaway = blocks["contents"]
-        self.assertEqual([t["text"] for t in what["contents"]], ["เกิดอะไรขึ้น", "ประโยคที่หนึ่ง ประโยคที่สอง"])
-        self.assertEqual([t["text"] for t in why["contents"]], ["ทำไมถึงสำคัญ", "ประโยคที่สาม"])
-        self.assertEqual([t["text"] for t in takeaway["contents"]], ["สิ่งที่น่าจับตา", "ประโยคที่สี่"])
-        self.assertEqual((takeaway["backgroundColor"], takeaway["cornerRadius"], takeaway["paddingAll"]), ("#F5F5F7", "md", "md"))
-        for block in (what, why, takeaway):
-            label, paragraph = block["contents"]
-            self.assertEqual((label["weight"], label["color"]), ("bold", "#FA243C"))
-            self.assertEqual((paragraph["size"], paragraph["wrap"]), ("sm", True))
-        self.assertEqual(what["contents"][1]["color"], "#3A3A3C")
-        self.assertEqual(note["text"], mb.BASIS_NOTE["article"])
-        button = news["footer"]["contents"][0]
-        self.assertEqual((button["style"], button["color"], button["height"]), ("primary", "#1D1D1F", "sm"))
-        self.assertEqual(button["action"], {"type": "uri", "label": "อ่านข่าวเต็ม", "uri": "https://one.example/a"})
+        self.assertEqual((caption["position"], caption["offsetBottom"], caption["justifyContent"]), ("absolute", "0px", "flex-end"))
+        self.assertEqual(caption["background"], {"type": "linearGradient", "angle": "180deg", "startColor": "#00000000", "endColor": "#000000CC"})
+        kicker_row, headline = caption["contents"]
+        pill = kicker_row["contents"][0]
+        self.assertEqual((pill["backgroundColor"], pill["cornerRadius"], pill["contents"][0]["text"], pill["contents"][0]["color"]), ("#FFFFFF", "xxl", "AI INFRASTRUCTURE", "#18181B"))
+        self.assertEqual((headline["text"], headline["color"], headline["weight"], headline["maxLines"], headline["wrap"]), ("Story one", "#FFFFFF", "bold", 3, True))
 
-    def test_news_card_without_an_image_gets_the_accent_bar(self):
+        stat_row, paragraph = news["body"]["contents"]
+        self.assertEqual(news["body"]["paddingAll"], "20px")
+        bar, figure = stat_row["contents"]
+        self.assertEqual((bar["width"], bar["flex"], bar["backgroundColor"]), ("3px", 0, "#18181B"))
+        self.assertEqual((figure["text"], figure["weight"], figure["color"]), ("$81.3B IPO", "bold", "#18181B"))
+        self.assertEqual((paragraph["text"], paragraph["color"], paragraph["size"], paragraph["wrap"]), ("ประโยคที่หนึ่ง ประโยคที่สอง ประโยคที่สาม", "#27272A", "sm", True))
+        self.assertIn("lineSpacing", paragraph)
+
+        separator, row = news["footer"]["contents"]
+        self.assertEqual(separator["type"], "separator")
+        source, link = row["contents"]
+        self.assertEqual((source["text"], source["color"], source["size"]), ("TechCrunch · 20 พ.ย.", "#71717A", "xs"))
+        self.assertEqual((link["text"], link["align"], link["flex"]), ("อ่านต่อ →", "end", 0))
+        self.assertEqual(link["action"], {"type": "uri", "label": "อ่านต่อ", "uri": "https://one.example/a"})
+        self.assertEqual(list(components(news, "button")), [], "no heavy button block")
+
+    def test_no_robotic_labels_anywhere(self):
+        text = json.dumps(self.full_message(), ensure_ascii=False)
+        for label in ("เกิดอะไรขึ้น", "ทำไมถึงสำคัญ", "สิ่งที่น่าจับตา", "สรุปจากเนื้อข่าวฉบับเต็ม"):
+            self.assertNotIn(label, text)
+
+    def test_news_card_without_a_photo_gets_the_slate_header(self):
         news = self.full_message()["contents"]["contents"][2]
-        self.assertEqual(news["hero"], {"type": "box", "layout": "vertical", "height": "6px", "backgroundColor": "#FA243C", "contents": []})
+        hero = news["hero"]
+        self.assertEqual((hero["backgroundColor"], hero["height"]), ("#18181B", "220px"))
         self.assertEqual(list(components(news, "image")), [])
+        watermark, caption = hero["contents"]
+        self.assertEqual((watermark["text"], watermark["size"], watermark["color"], watermark["position"]), ("TECHCRUNCH", "3xl", "#2E2E33", "absolute"))
+        self.assertNotIn("background", caption)
+        self.assertEqual(caption["contents"][1]["text"], "Story two")
+        self.assertEqual(len(news["body"]["contents"]), 1, "no key stat: just the summary")
         bad = mb.build_flex_message([story(1, "S", "https://one.example/a", image="http://plain.example/x.jpg")], context(), date(2026, 11, 20))
-        self.assertEqual(bad["contents"]["contents"][1]["hero"]["type"], "box")  # never an image LINE would not load
+        self.assertEqual(list(components(bad, "image")), [])  # never an image LINE would not load
         self.assertEqual(mb.validate_flex(bad), [])
 
-    def test_a_summary_without_why_or_takeaway_shows_only_what_it_has(self):
-        parts = mb.Summary(["Company X launched product Y today."])
-        message = mb.build_flex_message([story(1, "S", "https://one.example/a", parts=parts, basis="fallback")], context(), date(2026, 11, 20))
+    def test_a_summary_not_from_the_article_says_so(self):
+        message = mb.build_flex_message([story(1, "S", "https://one.example/a", parts=mb.Summary(["Company X launched product Y today."]), basis="fallback")], context(), date(2026, 11, 20))
         self.assertEqual(mb.validate_flex(message), [])
-        blocks = message["contents"]["contents"][1]["body"]["contents"][3]["contents"]
-        self.assertEqual(len(blocks), 1)
-        self.assertNotIn("สิ่งที่น่าจับตา", json.dumps(message, ensure_ascii=False))
-        self.assertIn(mb.BASIS_NOTE["fallback"], json.dumps(message, ensure_ascii=False))
+        body = message["contents"]["contents"][0]["body"]["contents"]
+        self.assertEqual(body[-1]["text"], mb.BASIS_NOTE["fallback"])
+        self.assertEqual(json.dumps(message, ensure_ascii=False).count(mb.DEFAULT_KICKER), 1)
 
-    def test_compact_cover_without_context(self):
-        message = mb.build_flex_message([story(1, "Only story", "https://one.example/a")], context(calendar_status="skipped"), date(2026, 11, 20))
-        self.assertEqual(mb.validate_flex(message), [])
-        cover = json.dumps(message["contents"]["contents"][0], ensure_ascii=False)
-        self.assertNotIn("ตารางวันนี้", cover)
-        self.assertNotIn("โฟกัสตอนนี้", cover)
-        self.assertIn("ข่าวเด่นวันนี้", cover)
-        self.assertIn("Only story", cover)
+    def test_the_overview_card(self):
+        cover = self.full_message()["contents"]["contents"][0]
+        band = cover["hero"]
+        self.assertEqual(band["backgroundColor"], "#18181B")
+        masthead, thai, english = band["contents"]
+        self.assertEqual(masthead["text"].replace(" ", "").replace(" ", " "), "JARVIS DAILY")
+        self.assertEqual((thai["text"], thai["color"], thai["weight"]), ("วันศุกร์ที่ 20 พฤศจิกายน 2569", "#FFFFFF", "bold"))
+        self.assertEqual(english["text"], "Friday, 20 November 2026 · Bangkok")
+        text = json.dumps(cover, ensure_ascii=False)
+        for words in ("ตารางวันนี้", "และอีก 3 นัดหมาย", "โฟกัสตอนนี้", "TripPlanner · Jarvis", "ข่าวเด่นวันนี้ 2 เรื่อง"):
+            self.assertIn(words, text)
+        self.assertNotIn("Story one", text, "the headlines are on their own cards")
 
-    def test_empty_calendar_shows_only_with_projects(self):
-        quiet = json.dumps(mb.build_flex_message([story(1, "S", "https://one.example/a")], context([]), date(2026, 11, 20)), ensure_ascii=False)
-        self.assertNotIn("ตารางวันนี้", quiet)  # connected, nothing today, nothing else: no box at all
-        busy = mb.build_flex_message([story(1, "S", "https://one.example/a")], context([], ["Jarvis"]), date(2026, 11, 20))
+    def test_projects_without_events_still_make_an_overview(self):
+        busy = mb.build_flex_message(self.stories(), context([], ["Jarvis"]), date(2026, 11, 20))
         self.assertEqual(mb.validate_flex(busy), [])
-        text = json.dumps(busy, ensure_ascii=False)
+        self.assertEqual(len(busy["contents"]["contents"]), 3)
+        text = json.dumps(busy["contents"]["contents"][0], ensure_ascii=False)
         self.assertIn("ไม่มีนัดหมายวันนี้", text)
         self.assertIn("โฟกัสตอนนี้", text)
 
@@ -1019,9 +1037,9 @@ class FlexMessageTests(unittest.TestCase):
 
     def test_worst_case_sizes_stay_under_the_limits(self):
         huge_title = "ก" * 300
-        parts = mb.Summary(["ข" * 400] * 2, ["ข" * 400] * 2, "ข" * 400)
+        parts = mb.Summary(["ข" * 400] * 4, "Z" * 24, "9" * 24)
         image = "https://e.example/" + "i" * (mb.LINE_MAX_IMAGE_URL - len("https://e.example/"))
-        stories = [mb.Story(make_article(i, huge_title, "https://e.example/" + "p" * 900), parts, "article", image) for i in (1, 2)]
+        stories = [mb.Story(make_article(i, huge_title, "https://e.example/" + "p" * 900), parts, "feed", image) for i in (1, 2)]
         events = [mb.Event("09:00", "10:00", "ค" * 70) for _ in range(25)]
         message = mb.build_flex_message(stories, context(events, ["ง" * 60] * 3), date(2026, 11, 20))
         self.assertEqual(mb.validate_flex(message), [])
@@ -1035,19 +1053,25 @@ class FlexMessageTests(unittest.TestCase):
             change(message)
             return mb.validate_flex(message)
 
-        news = lambda m: m["contents"]["contents"][1]  # noqa: E731
-        action = lambda m: news(m)["footer"]["contents"][0]["action"]  # noqa: E731
+        news = lambda m: m["contents"]["contents"][0]  # noqa: E731
+        photo = lambda m: news(m)["hero"]["contents"][0]  # noqa: E731
+        caption = lambda m: news(m)["hero"]["contents"][1]  # noqa: E731
+        action = lambda m: news(m)["footer"]["contents"][1]["contents"][1]["action"]  # noqa: E731
         cases = {
             "empty text": lambda m: news(m)["body"]["contents"].__setitem__(1, {"type": "text", "text": "  "}),
             "bad colour": lambda m: news(m)["styles"]["body"].__setitem__("backgroundColor", "white"),
+            "bad gradient colour": lambda m: caption(m)["background"].__setitem__("endColor", "black"),
+            "gradient type": lambda m: caption(m)["background"].__setitem__("type", "radialGradient"),
+            "gradient angle": lambda m: caption(m)["background"].__setitem__("angle", "400deg"),
+            "position": lambda m: caption(m).__setitem__("position", "fixed"),
             "long label": lambda m: action(m).__setitem__("label", "อ่านข่าวเต็มที่หน้าเว็บของสำนักข่าว"),
             "javascript uri": lambda m: action(m).__setitem__("uri", "javascript:alert(1)"),
-            "http image": lambda m: news(m)["hero"].__setitem__("url", "http://cdn.example/hero.jpg"),
-            "long image url": lambda m: news(m)["hero"].__setitem__("url", "https://cdn.example/" + "i" * 2000),
-            "non-ascii image url": lambda m: news(m)["hero"].__setitem__("url", "https://cdn.example/ภาพ.jpg"),
-            "tall aspect ratio": lambda m: news(m)["hero"].__setitem__("aspectRatio", "1:4"),
-            "aspect ratio format": lambda m: news(m)["hero"].__setitem__("aspectRatio", "wide"),
-            "aspect mode": lambda m: news(m)["hero"].__setitem__("aspectMode", "stretch"),
+            "http image": lambda m: photo(m).__setitem__("url", "http://cdn.example/hero.jpg"),
+            "long image url": lambda m: photo(m).__setitem__("url", "https://cdn.example/" + "i" * 2000),
+            "non-ascii image url": lambda m: photo(m).__setitem__("url", "https://cdn.example/ภาพ.jpg"),
+            "tall aspect ratio": lambda m: photo(m).__setitem__("aspectRatio", "1:4"),
+            "aspect ratio format": lambda m: photo(m).__setitem__("aspectRatio", "wide"),
+            "aspect mode": lambda m: photo(m).__setitem__("aspectMode", "stretch"),
             "hero type": lambda m: news(m).__setitem__("hero", {"type": "picture"}),
             "too many bubbles": lambda m: m["contents"]["contents"].extend([news(m)] * 12),
             "alt text": lambda m: m.__setitem__("altText", "x" * 1501),
@@ -1065,13 +1089,15 @@ class FlexMessageTests(unittest.TestCase):
         self.assertLessEqual(len(fallback["text"]), mb.LINE_MAX_TEXT_MESSAGE)
         self.assertIn("09:00–10:00 Stand-up", fallback["text"])
         short = mb.text_fallback([story(1, "U", "https://two.example/b")], context(), date(2026, 11, 20))["text"]
-        for line in ("01. U (TechCrunch)", "เกิดอะไรขึ้น: ประโยคที่หนึ่ง ประโยคที่สอง", "ทำไมถึงสำคัญ: ประโยคที่สาม", "สิ่งที่น่าจับตา: ประโยคที่สี่", "https://two.example/b"):
+        for line in ("01. AI INFRASTRUCTURE · U (TechCrunch)", "▍$81.3B IPO", "ประโยคที่หนึ่ง ประโยคที่สอง ประโยคที่สาม", "https://two.example/b"):
             self.assertIn(line, short)
+        self.assertNotIn("เกิดอะไรขึ้น", short)
 
     def test_dates(self):
         self.assertEqual(mb.thai_date(date(2026, 11, 20)), "วันศุกร์ที่ 20 พฤศจิกายน 2569")
         self.assertEqual(mb.english_date(date(2026, 11, 20)), "Friday, 20 November 2026")
-        self.assertEqual(mb.thai_short_time(datetime(2026, 11, 19, 14, 30, tzinfo=timezone.utc)), "19 พ.ย. 21:30 น.")
+        self.assertEqual(mb.thai_short_date(datetime(2026, 11, 19, 17, 30, tzinfo=timezone.utc)), "20 พ.ย.")  # 00:30 in Bangkok
+
 
 
 # =====================================================================
@@ -1133,7 +1159,7 @@ class MainRunTests(unittest.TestCase):
                 ("GET", mb.FEEDS[0].url): FakeResponse(200, content=feed),
                 ("POST", "https://oauth2.googleapis.com/token"): FakeResponse(200, {"access_token": "fresh"}),
                 ("GET", mb.CALENDAR_API): FakeResponse(200, {"items": [{"summary": "Dentist appointment", "start": {"dateTime": "2026-11-20T15:00:00+07:00"}, "end": {"dateTime": "2026-11-20T16:00:00+07:00"}}]}),
-                ("GET", "https://img.example/"): image_response(jpeg(1024, 576)),
+                ("HEAD", "https://wsrv.nl/"): FakeResponse(200, headers={"Content-Type": "image/jpeg"}),
                 ("POST", "https://api.line.me/"): line,
             },
             default=FakeResponse(503),
@@ -1157,20 +1183,25 @@ class MainRunTests(unittest.TestCase):
         message = json.loads(out.split("---\n", 1)[1])
         self.assertEqual(mb.validate_flex(message), [])
         self.assertEqual(set(all_uris(message)), {"https://tc.example/eu", "https://tc.example/openai"})
-        first, second = message["contents"]["contents"][1:]
-        self.assertEqual(first["footer"]["contents"][0]["action"]["uri"], "https://tc.example/eu")  # the model's order
-        self.assertEqual((first["hero"]["type"], first["hero"]["url"]), ("image", "https://img.example/eu-hero.jpg"))  # the feed's media:content
-        self.assertEqual(second["hero"]["type"], "box")  # no image anywhere: the accent bar
-        self.assertIn("hero image: https://img.example/eu-hero.jpg", out)
-        self.assertIn("เกิดอะไรขึ้น:", out)
-        probes = [url for method, url, _ in self.session.calls if url.startswith("https://img.example/")]
-        self.assertEqual(probes, ["https://img.example/eu-hero.jpg"])
+        bubbles = message["contents"]["contents"]
+        self.assertEqual(len(bubbles), 2, "no calendar, no projects: no overview card, the photos come first")
+        first, second = bubbles
+        self.assertEqual(first["footer"]["contents"][1]["contents"][1]["action"]["uri"], "https://tc.example/eu")  # the model's order
+        hero = mb.proxied_image_url("https://img.example/eu-hero.jpg")  # the feed's media:content, through wsrv.nl
+        self.assertEqual(first["hero"]["contents"][0]["url"], hero)
+        self.assertEqual(list(components(second, "image")), [])  # no image anywhere: the slate header
+        self.assertEqual(second["hero"]["backgroundColor"], "#18181B")
+        self.assertIn(f"hero image: {hero}", out)
+        self.assertIn("kicker: AI INFRASTRUCTURE | key stat: $81.3B IPO", out)
+        checks = [url for method, url, _ in self.session.calls if method == "HEAD"]
+        self.assertEqual(checks, [hero])
 
     def test_real_send_uses_the_legacy_recipient_name_and_logs_no_secrets(self):
         env = {"OPENAI_API_KEY": "sk-test", "LINE_CHANNEL_ACCESS_TOKEN": "tok-SECRET-123", "LINE_USER_ID": "U-legacy-recipient", "GOOGLE_TOKEN_JSON": json.dumps(TOKEN)}
         code, out, err = self.run_main([], env)
         self.assertEqual(code, 0, err)
         [push] = self.posts
+        self.assertEqual(len(push["body"]["messages"][0]["contents"]["contents"]), 3, "an event today: the overview card leads")
         self.assertEqual(push["url"], mb.LINE_PUSH_URL)
         self.assertEqual(push["body"]["to"], "U-legacy-recipient")
         self.assertEqual(push["headers"]["Authorization"], "Bearer tok-SECRET-123")
