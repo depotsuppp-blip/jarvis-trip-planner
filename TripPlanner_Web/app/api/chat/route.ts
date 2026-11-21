@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { getSessionUserId } from "@/lib/auth";
+import { getSessionUser, getSessionUserId } from "@/lib/auth";
 import {
   CHAT_RATE_LIMIT,
   CHAT_RATE_WINDOW_MS,
@@ -20,7 +20,7 @@ import {
   type ChatTurn,
 } from "@/lib/jarvisBrain";
 import { MAX_DOCUMENT_BYTES, storedUserMessage, type Attachment } from "@/lib/jarvis/attachments";
-import type { DocumentMemory } from "@/lib/jarvis/documentMemory";
+import type { DocumentIngest, DocumentMemory } from "@/lib/jarvis/documentMemory";
 import type { MemoryNote } from "@/lib/jarvis/memoryNote";
 import { speakableAudio, type ReplyAudio } from "@/lib/jarvis/replyAudio";
 import { prisma } from "@/lib/prisma";
@@ -162,19 +162,23 @@ async function readTurn(request: NextRequest): Promise<{ turn: TurnInput } | { r
  *
  * `saveToMemory: "true"` with a file is the dock's "Save to Memory" switch: the brain also reads the
  * file's few key facts (at most 10) into the person's long-term memory, citing the file
- * (lib/jarvisBrain.ts, save_to_memory), while it answers as usual. `savedMemories` lists what was
- * saved, per file ({ sourceFile, count, facts }; lib/jarvis/documentMemory.ts) - left out when
- * nothing was. Saving never fails the turn, and it is not stored either.
+ * (lib/jarvisBrain.ts, save_to_memory) - in the background, once it has answered: `ingest` is that
+ * job ({ jobId, sourceFiles, state: "saving" }; lib/jarvis/documentMemory.ts), and the page asks
+ * GET /api/memory/ingest-status/<jobId> how it went. A file sent with no words (or "save this") is
+ * answered at once. The person's name goes along: in their own résumé it means "me".
+ * `savedMemories` is what a brain from before the jobs saved, per file. Saving never fails the
+ * turn, and none of it is stored.
  *
- * Responses: 200 { conversationId, userMessage, reply, audio?, memory?, savedMemories? }, 400 bad body, 401
+ * Responses: 200 { conversationId, userMessage, reply, audio?, memory?, savedMemories?, ingest? }, 400 bad body, 401
  * signed out, 404 unknown conversation, 413 / 415 / 503 the file (above), 429
  * rate-limited, 502 brain failed, 500 database (or disk) failed, 499 stopped by the person
  * (the reply is not saved). With a file,
  * `userMessage.content` is the stored form: JSON with the text and the file.
  */
 export async function POST(request: NextRequest) {
-  const userId = await getSessionUserId();
-  if (!userId) {
+  const user = await getSessionUser();
+  const userId = user?.id;
+  if (!user || !userId) {
     return NextResponse.json({ error: "Sign in to chat with Jarvis." }, { status: 401 });
   }
 
@@ -248,6 +252,8 @@ export async function POST(request: NextRequest) {
     speak,
     // Only ever with a file: there is nothing else to save.
     saveToMemory: Boolean(saveToMemory) && attachments.length > 0,
+    // In the person's own documents (a résumé) their name means "me" (memory_ingest.person_names).
+    userName: user.name ?? undefined,
   };
 
   if (!wantsStream(request)) {
@@ -313,6 +319,7 @@ interface TurnToAnswer {
   appUrl: string;
   speak?: boolean;
   saveToMemory?: boolean;
+  userName?: string;
 }
 
 type TurnOutcome =
@@ -340,6 +347,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
   let spokenAudioText: string | null = null;
   let memory: MemoryNote | null = null;
   let savedMemories: DocumentMemory[] = [];
+  let ingest: DocumentIngest | null = null;
   try {
     const answer = await askJarvis(turn.message, turn.history, {
       userId: turn.userId,
@@ -347,6 +355,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
       speak: turn.speak,
       attachments: turn.attachments,
       saveToMemory: turn.saveToMemory,
+      userName: turn.userName,
       signal,
       ...hooks,
     });
@@ -356,6 +365,7 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
     spokenAudioText = audio ? answer.spokenText : null;
     memory = answer.memory;
     savedMemories = answer.documentMemories;
+    ingest = answer.ingest;
   } catch (error) {
     if (error instanceof JarvisBrainCancelled || signal.aborted) return { kind: "stopped" };
     console.error(`POST /api/chat: the brain failed for conversation ${conversationId}:`, error);
@@ -382,6 +392,9 @@ async function answerTurn(turn: TurnToAnswer, signal: AbortSignal, hooks: TurnHo
         ...(memory ? { memory } : {}),
         // What Save to Memory read out of the attached file (lib/jarvis/documentMemory.ts); not stored either.
         ...(savedMemories.length ? { savedMemories } : {}),
+        // The Save to Memory job that runs after this reply: the page asks how it went
+        // (GET /api/memory/ingest-status/<jobId>). Not stored either.
+        ...(ingest ? { ingest } : {}),
       },
     };
   } catch (error) {

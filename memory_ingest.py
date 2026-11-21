@@ -28,18 +28,25 @@ while the turn runs, save() only once the reply is ready:
                          A newer document's one-value fact (a deadline, a budget, the backend...)
                          archives the old active value: Spec_v2.pdf's deadline replaces Spec_v1.pdf's.
 
-WHEN IT IS WRITTEN (production, 2026-11-20: a 315 KB PDF took the request past the web app's 120 s and
-still wrote six orphan facts afterwards). prepare() - reading, the model call, the checks - runs beside
-the turn, PREPARE_TIMEOUT_SECONDS per file at most. save() - embeddings and the one database
-transaction - runs only when the reply is ready and about to go out, SAVE_TIMEOUT_SECONDS at most; a
-turn that fails, is stopped, or runs out of time writes nothing, and a cancelled save rolls back.
-api_server.py keeps the whole request inside its own budget and cancels what is not done by then.
+    the person           whose memory it is: their own name - the web app sends the signed-in person's,
+                         and JARVIS_OWNER_NAMES lists the owner's (person_names) - means "me". The
+                         extractor is told it, and an entry named after them is merged into "me" in code
+                         (mcp_memory.fold_person): a résumé's facts link to the person, not to an
+                         orphan entry with their full name (production, 2026-11-21).
 
-The final event of /chat carries what was saved, per file: {source_file, count, facts: [{subject,
-relation, object, status}], ingested_at} - a fact a new value replaced is listed too, archived, with
-"replaced": true. Nothing that goes wrong here fails the chat: a file that cannot be read, a model or
-database failure, or a document with nothing worth keeping simply adds nothing (saved_memories: []),
-and the reason goes to the log - never the document's words.
+WHEN IT IS WRITTEN. In the background, after the chat has answered (ingest_jobs.py, production
+2026-11-21: an 11-page PDF held POST /chat for 47 s while it was read and written). /chat makes a job
+and FastAPI runs it once the reply has gone out: ingest() - prepare(), PREPARE_TIMEOUT_SECONDS per file,
+then save(), SAVE_TIMEOUT_SECONDS per file - and the web hub asks for its state until it is done. A file
+sent with no question (or only "save this") is answered at once without the model (only_saving). A turn
+that fails or is stopped before it answers cancels its job: nothing is written, a cancelled save rolls
+back.
+
+What a job saved, per file: {source_file, count, facts: [{subject, relation, object, status}],
+ingested_at} - a fact a new value replaced is listed too, archived, with "replaced": true. Nothing that
+goes wrong here fails the chat: a file that cannot be read, a model or database failure, or a document
+with nothing worth keeping simply adds nothing, and the reason goes to the log - never the document's
+words.
 
 Runs in api_server.py's process, on its event loop, sharing mcp_memory's connection pool and OpenAI
 client with memory_graph.py (the Memory page). Recall (mcp_memory.recall) then shows each fact's
@@ -50,9 +57,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import re
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Iterable, Optional, Protocol, Sequence
 
 import attachments
 import mcp_filesystem
@@ -76,6 +84,53 @@ INGEST_TIMEOUT_SECONDS = PREPARE_TIMEOUT_SECONDS + SAVE_TIMEOUT_SECONDS
 MAX_FILES = 5
 
 _UPLOAD_PREFIX = re.compile(r"^[0-9a-f]{16}-")  # lib/uploads.ts names a stored file <16 hex>-<name>
+
+# The owner's own names, for the owner's memory ("owner" scope: JARVIS_OWNER_USER_ID on the web, the
+# voice, LINE): "Somchai Jaidee, Somchai, สมชาย ใจดี". Comma- or semicolon-separated.
+OWNER_NAMES_ENV = "JARVIS_OWNER_NAMES"
+
+# A message that only asks to save the attached file - nothing for the model to answer: "", "save this",
+# "remember this file", "บันทึก", "จำไว้นะ". Anything else, a question above all, is a turn as usual.
+_JUST_SAVING = re.compile(
+    r"^(?:(?:please|pls|plz)\s+)?(?:save|remember|store|keep|memori[sz]e|add)"
+    r"(?:\s+(?:this|it|that|these|the|my|file|files|document|documents|doc|pdf|résumé|resume|cv|"
+    r"to|in|into|memory|for|me|please))*$"
+    r"|^(?:ช่วย)?(?:บันทึก|จำ|เซฟ|เก็บ)(?:ไว้|ไฟล์|เอกสาร|นี้|อันนี้|ลง|ใน|ความจำ|ให้|หน่อย|ด้วย|นะ|ครับ|ค่ะ|คะ|จ้า|\s)*$",
+    re.IGNORECASE,
+)
+
+
+def only_saving(prompt: str) -> bool:
+    """True when the message asks nothing but to save its file (see _JUST_SAVING): no model is needed."""
+    text = re.sub(r"[\s.!,~]+", " ", str(prompt or "")).strip()
+    return not text or (len(text) <= 60 and "?" not in text and bool(_JUST_SAVING.match(text)))
+
+
+def saving_reply(source_files: Sequence[str]) -> str:
+    """The chat's answer to a message that only saves its file (api_server.py's /chat, no model)."""
+    named = f"“{source_files[0]}”" if len(source_files) == 1 else f"{len(source_files)} files"
+    return f"Saving the key facts from {named} to your memory in the background. You can keep chatting - I'll show what was saved here."
+
+
+def person_names(scope: str, extra: Iterable[str] = ()) -> list[str]:
+    """
+    What the person whose memory `scope` is is called - their résumé names them, and that name is
+    "me": `extra` (the web app's signed-in person's name), and for the owner JARVIS_OWNER_NAMES too.
+    Deduplicated (mcp_memory.person_key), at most mcp_memory.MAX_PERSON_NAMES.
+    """
+    names = [str(name) for name in extra if isinstance(name, str)]
+    if scope == "owner":
+        names += re.split(r"[,;]", os.environ.get(OWNER_NAMES_ENV, ""))
+    seen: set[str] = set()
+    kept: list[str] = []
+    for name in names:
+        clean = re.sub(r"\s+", " ", name).strip()[: M.MAX_NAME]
+        key = M.person_key(clean)
+        if not key or key in seen or M.key_of(clean) in M._ME_ALIASES:
+            continue
+        seen.add(key)
+        kept.append(clean)
+    return kept[: M.MAX_PERSON_NAMES]
 
 
 class AttachmentLike(Protocol):
@@ -165,18 +220,25 @@ async def _save_text(scope: str, name: str, text: str, cut: bool, when: datetime
     return await _commit(scope, prepared, when) if prepared else None
 
 
-async def _prepare_text(scope: str, name: str, text: str, cut: bool) -> Optional[Prepared]:
+async def _prepare_text(scope: str, name: str, text: str, cut: bool, names: Iterable[str] = ()) -> Optional[Prepared]:
     """
     A document's text (already read, at most MAX_DOCUMENT_CHARS) as the facts to save, checked - or
     None when nothing is worth keeping. Nothing is written here. IngestError when the extraction
     takes longer than EXTRACT_TIMEOUT_SECONDS; mcp_memory.ToolError on a model or database failure.
+    `names`: the signed-in person's own name(s), added to person_names(scope).
     """
     text = M.redact_secrets(text)
+    who = person_names(scope, names)
     known, facts = await M._known_memory(scope)
     try:
-        graph = await asyncio.wait_for(M.extract_document(text, name, known, facts), EXTRACT_TIMEOUT_SECONDS)
+        graph = await asyncio.wait_for(
+            M.extract_document(text, name, known, facts, person_names=who), EXTRACT_TIMEOUT_SECONDS
+        )
     except asyncio.TimeoutError:
         raise IngestError(f"the extraction took longer than {EXTRACT_TIMEOUT_SECONDS:g} s") from None
+    graph, folded = M.fold_person(graph, who)
+    if folded:
+        _log(f"'{name}': the person's own name (as {folded} entr{'ies' if folded != 1 else 'y'}) read as \"me\"")
     graph, misshapen = M.drop_misshapen(graph)
     if misshapen:
         _log(f"'{name}': {misshapen} malformed fact{'s' if misshapen != 1 else ''} from the extractor left out")
@@ -250,13 +312,13 @@ async def ingest_text(
     return result if result and result["count"] else None
 
 
-async def prepare_document(scope: str, attachment: AttachmentLike) -> Optional[Prepared]:
+async def prepare_document(scope: str, attachment: AttachmentLike, person_names: Iterable[str] = ()) -> Optional[Prepared]:
     """One attached file read and its facts extracted and checked, nothing written (see _prepare_text)."""
     # Not set up (no memory database, no OPENAI_API_KEY): said before the file is even opened.
     M.db_settings()
     M._openai_client()
     text, cut = await asyncio.to_thread(document_text, attachment)
-    return await _prepare_text(scope, source_name(attachment), text, cut)
+    return await _prepare_text(scope, source_name(attachment), text, cut, person_names)
 
 
 def _not_saved(name: str, exc: BaseException, seconds: float) -> None:
@@ -269,33 +331,50 @@ def _not_saved(name: str, exc: BaseException, seconds: float) -> None:
         _log(f"'{name}': not saved to memory: {type(exc).__name__}: {exc}")
 
 
-async def prepare(scope: str, files: Sequence[AttachmentLike]) -> list[Prepared]:
+async def prepare(
+    scope: str,
+    files: Sequence[AttachmentLike],
+    *,
+    person_names: Iterable[str] = (),
+    problems: Optional[list[str]] = None,
+) -> list[Prepared]:
     """
-    The first step of Save to Memory, beside the chat turn: every attached file read and its facts
-    extracted and checked, PREPARE_TIMEOUT_SECONDS per file at most. Nothing is written. Never raises
-    (a cancelled request still cancels it): a file that fails just adds nothing.
+    The first step of Save to Memory: every attached file read and its facts extracted and checked,
+    PREPARE_TIMEOUT_SECONDS per file at most. Nothing is written. Never raises (a cancellation still
+    cancels it): a file that fails just adds nothing - and its name goes on `problems`, when given, so
+    a caller can tell a failure from a document with nothing worth keeping. `person_names`: see
+    _prepare_text.
     """
     if not scope or not files:
         return []
+    names = list(person_names)
     ready: list[Prepared] = []
     for attachment in list(files)[:MAX_FILES]:
         try:
-            prepared = await asyncio.wait_for(prepare_document(scope, attachment), PREPARE_TIMEOUT_SECONDS)
+            prepared = await asyncio.wait_for(prepare_document(scope, attachment, names), PREPARE_TIMEOUT_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - nothing here may cost the person their answer
             _not_saved(source_name(attachment), exc, PREPARE_TIMEOUT_SECONDS)
+            if problems is not None:
+                problems.append(source_name(attachment))
             continue
         if prepared:
             ready.append(prepared)
     return ready
 
 
-async def save(scope: str, prepared: Sequence[Prepared], *, now: Optional[datetime.datetime] = None) -> list[dict[str, Any]]:
+async def save(
+    scope: str,
+    prepared: Sequence[Prepared],
+    *,
+    now: Optional[datetime.datetime] = None,
+    problems: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
     """
-    The second step, once the reply is ready: the prepared facts written, SAVE_TIMEOUT_SECONDS per file
-    at most (a cancelled or timed-out write rolls back). What each file saved; files that saved nothing
-    left out. Never raises (a cancelled request still cancels it).
+    The second step: the prepared facts written, SAVE_TIMEOUT_SECONDS per file at most (a cancelled or
+    timed-out write rolls back). What each file saved; files that saved nothing left out. Never raises
+    (a cancellation still cancels it); a file whose write failed goes on `problems`, when given.
     """
     when = now or datetime.datetime.now(datetime.timezone.utc)
     saved: list[dict[str, Any]] = []
@@ -306,16 +385,25 @@ async def save(scope: str, prepared: Sequence[Prepared], *, now: Optional[dateti
             raise
         except Exception as exc:  # noqa: BLE001 - nothing here may cost the person their answer
             _not_saved(item.name, exc, SAVE_TIMEOUT_SECONDS)
+            if problems is not None:
+                problems.append(item.name)
             continue
         if result and result["count"]:
             saved.append(result)
     return saved
 
 
-async def ingest(scope: str, files: Sequence[AttachmentLike]) -> list[dict[str, Any]]:
+async def ingest(
+    scope: str,
+    files: Sequence[AttachmentLike],
+    *,
+    person_names: Iterable[str] = (),
+    problems: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
     """
-    Both steps in one go (prepare, then save) for a caller that has no reply to wait for: what each
-    attached file saved, files that saved nothing left out. Never raises (a cancelled request still
-    cancels it). /chat runs the two steps itself, around its turn.
+    Both steps in one go (prepare, then save) - what a Save to Memory job does (ingest_jobs.py): what
+    each attached file saved, files that saved nothing left out. Never raises (a cancellation still
+    cancels it); `problems` and `person_names` as for prepare().
     """
-    return await save(scope, await prepare(scope, files))
+    ready = await prepare(scope, files, person_names=person_names, problems=problems)
+    return await save(scope, ready, problems=problems)

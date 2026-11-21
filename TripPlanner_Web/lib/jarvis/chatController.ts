@@ -1,6 +1,6 @@
 import { chatApi, type ApiFailure, type ApprovalRequest } from "./chatApi";
 import { demoReply, initialAgents, parseDemoCommand, type DemoTool } from "./demo";
-import { readDocumentMemories } from "./documentMemory";
+import { readDocumentIngest, readDocumentMemories, type DocumentIngest } from "./documentMemory";
 import { readMemoryNote } from "./memoryNote";
 import { toChatMessage, type ServerMessageLike } from "./messageContent";
 import { canSpeak, type ReplyAudio } from "./replyAudio";
@@ -74,6 +74,11 @@ const TOOLS_REFRESH_MS = 60_000;
 
 // The server titles a session with the start of its first message (app/api/chat/route.ts).
 const TITLE_CHARS = 60;
+// Save to Memory runs after the reply (the brain's ingest_jobs.py): asked first after this long, then
+// every INGEST_EVERY_MS, and given up on past INGEST_GIVE_UP_MS (the brain's own budget is 180 s).
+const INGEST_FIRST_MS = 1500;
+const INGEST_EVERY_MS = 2000;
+const INGEST_GIVE_UP_MS = 240_000;
 
 // The person's voice-replies choice. "off" is the only value written; anything else (or no storage) means on.
 const SPEECH_STORAGE_KEY = "jarvis:voice-replies";
@@ -220,6 +225,9 @@ export class ChatController {
   private bootstrapping: Promise<void> = Promise.resolve();
   /** The tool-status refresh (see refreshTools); its own timer, because clearTimers runs on every turn. */
   private toolsTimer: number | null = null;
+  // Save to Memory jobs being watched (watchIngest): their own timers, so a new message - which
+  // clears the turn's timers - never stops one.
+  private readonly ingestTimers = new Set<number>();
   /** The current turn's request to the server: what "Stop generating" aborts. */
   private request: AbortController | null = null;
   /** The composer's ear for Edit (onDraftRequest). */
@@ -275,6 +283,8 @@ export class ChatController {
     this.request = null;
     this.abandonRecording();
     this.clearTimers();
+    for (const id of this.ingestTimers) window.clearTimeout(id);
+    this.ingestTimers.clear();
     this.turn++;
     this.player.stop();
     this.epoch++;
@@ -466,7 +476,7 @@ export class ChatController {
     let toSpeak: SpokenReply | null = null;
     if (result.ok) {
       this.setAgent("brain", "ready");
-      const reply = replyWithMemory(result.data.reply, result.data.memory, result.data.savedMemories);
+      const reply = replyWithMemory(result.data.reply, result.data.memory, result.data.savedMemories, result.data.ingest);
       // The saved copy of what was sent: its real id is what Delete needs.
       const sent = toChatMessage(result.data.userMessage);
       const { conversationId } = result.data;
@@ -488,6 +498,8 @@ export class ChatController {
             ),
           },
         }));
+        // Save to Memory reads the file after this reply: "Saving key facts…" under it until the job is done.
+        if (reply.documentIngest) this.watchIngest(reply.id, reply.documentIngest);
       } else {
         // The person opened another session meanwhile: the reply is saved there, this page just refreshes the list.
         void this.refreshSessions();
@@ -960,6 +972,57 @@ export class ChatController {
     }));
   }
 
+  /**
+   * Asks how a reply's Save to Memory job is going (GET /api/memory/ingest-status/<id>) - first after
+   * INGEST_FIRST_MS, then every INGEST_EVERY_MS - and paints the answer onto that reply: the saved
+   * facts (documentMemories, the DocumentMemoryPill), or "No new facts…" / "Couldn't save…". It gives up
+   * as "Couldn't confirm…" after INGEST_GIVE_UP_MS, or when the brain no longer knows the job (it
+   * restarted). It stops by itself once the reply is gone from the page (another session opened).
+   */
+  private watchIngest(messageId: string, ingest: DocumentIngest): void {
+    const started = Date.now();
+    const paint = (changes: Pick<ChatMessage, "documentIngest" | "documentMemories">) => {
+      this.chat.setState((state) => ({
+        messages: state.messages.map((message) => (message.id === messageId ? { ...message, ...changes } : message)),
+      }));
+    };
+    const ask = async () => {
+      if (this.disposed || !this.chat.getState().messages.some((message) => message.id === messageId)) return;
+      const result = await chatApi.ingestStatus(ingest.jobId);
+      if (this.disposed) return;
+      if (result.ok) {
+        const state = readDocumentIngest({ ...ingest, state: result.data.state })?.state ?? "unknown";
+        const saved = readDocumentMemories(result.data.savedMemories);
+        if (state === "saved" && saved.length) {
+          paint({ documentIngest: undefined, documentMemories: saved });
+          return;
+        }
+        if (state !== "saving") {
+          paint({ documentIngest: { ...ingest, state: state === "saved" ? "nothing" : state } });
+          return;
+        }
+      } else if (result.kind === "not-found" || result.kind === "signed-out") {
+        paint({ documentIngest: { ...ingest, state: "unknown" } });
+        return;
+      }
+      // Still saving - or a moment's failure to ask (the brain busy, the network): ask again, within reason.
+      if (Date.now() - started > INGEST_GIVE_UP_MS) {
+        paint({ documentIngest: { ...ingest, state: "unknown" } });
+        return;
+      }
+      this.askIngestLater(ask, INGEST_EVERY_MS);
+    };
+    this.askIngestLater(ask, INGEST_FIRST_MS);
+  }
+
+  private askIngestLater(fn: () => Promise<void>, ms: number): void {
+    const id = window.setTimeout(() => {
+      this.ingestTimers.delete(id);
+      void fn();
+    }, ms);
+    this.ingestTimers.add(id);
+  }
+
   private later(ms: number, fn: () => void): void {
     this.timers.push(window.setTimeout(fn, ms));
   }
@@ -975,13 +1038,16 @@ export class ChatController {
  * memoryNote.ts) when its memory tool was used, and what Save to Memory read out of the attached
  * file (documentMemory.ts) - both checked again here, as anything the page draws.
  */
-function replyWithMemory(reply: ServerMessageLike, memory: unknown, saved?: unknown): ChatMessage {
+function replyWithMemory(reply: ServerMessageLike, memory: unknown, saved?: unknown, ingest?: unknown): ChatMessage {
   const message = toChatMessage(reply);
   const note = readMemoryNote(memory);
   const documents = readDocumentMemories(saved);
+  // A job that is only starting: whatever state the server named, it is "saving" until asked.
+  const job = readDocumentIngest(ingest);
   return {
     ...message,
     ...(note ? { memory: note } : {}),
     ...(documents.length ? { documentMemories: documents } : {}),
+    ...(job ? { documentIngest: { ...job, state: "saving" } } : {}),
   };
 }

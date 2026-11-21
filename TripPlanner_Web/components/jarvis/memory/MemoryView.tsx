@@ -118,9 +118,15 @@ export function MemoryView() {
   const filterId = useId();
   const legendId = useId();
 
+  // Which load is the latest: an older answer that comes back later is dropped, so the scene is
+  // never handed a second copy of the same graph (React's development mode runs the first-load
+  // effect twice; a "Try again" can overlap one still on its way).
+  const loads = useRef(0);
   const load = useCallback(async () => {
+    const ticket = ++loads.current;
     setStatus({ kind: "loading" });
     const result = await loadMemoryGraph();
+    if (ticket !== loads.current) return;
     if (result.ok) {
       setGraph(toGraph(result.data));
       setStatus({ kind: "ready" });
@@ -135,6 +141,10 @@ export function MemoryView() {
     // The first load, once the page is in the browser.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
+    return () => {
+      // Leaving (or React's development re-run): the answer still on its way is not applied.
+      loads.current += 1;
+    };
   }, [load]);
 
   useEffect(() => {
@@ -275,8 +285,10 @@ export function MemoryView() {
     async (node: GraphNode): Promise<ActionOutcome> => {
       const result = await removeMemoryEntity(node.id);
       if (!result.ok && result.status !== 404) return { ok: false, message: result.message };
-      const links = result.ok ? result.data.links.length : 0;
-      forget(node.id, result.ok ? result.data.links : []);
+      // The relations that went with it, as far as the answer says (forget() drops the rest by their ends).
+      const gone = result.ok && Array.isArray(result.data?.links) ? result.data.links.filter((id) => typeof id === "string") : [];
+      const links = gone.length;
+      forget(node.id, gone);
       setNotice(
         `Deleted “${displayName(node)}”${links ? ` and ${links} relation${links === 1 ? "" : "s"}` : ""}.`,
       );
@@ -297,8 +309,9 @@ export function MemoryView() {
       }
       if (link) {
         // In place, like an entry's words: the line redraws in its new style, the orbits stay.
-        link.status = result.data.link.status;
-        link.updated_at = result.data.link.updated_at;
+        const saved: Partial<typeof link> = result.data?.link ?? {};
+        link.status = RELATION_STATUSES.find((known) => known === saved.status) ?? status;
+        link.updated_at = typeof saved.updated_at === "string" ? saved.updated_at : (link.updated_at ?? null);
         setRevision((value) => value + 1);
         const source = nodeById.get(endId(link.source));
         const target = nodeById.get(endId(link.target));

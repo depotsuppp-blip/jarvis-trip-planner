@@ -2,9 +2,47 @@
 
 import { useId, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, ChevronDown, Sparkles } from "lucide-react";
-import { documentMemoryText, relationWords, type DocumentFact, type DocumentMemory } from "@/lib/jarvis/documentMemory";
+import { ArrowRight, ChevronDown, CircleAlert, CircleHelp, Hourglass, Sparkles } from "lucide-react";
+import {
+  documentIngestText,
+  documentMemoryText,
+  relationWords,
+  type DocumentFact,
+  type DocumentIngest,
+  type DocumentMemory,
+} from "@/lib/jarvis/documentMemory";
 import { focusRing } from "./styles";
+
+/**
+ * A Save to Memory job that has not ended in saved facts (lib/jarvis/documentMemory.ts,
+ * DocumentIngest): the brain reads the file AFTER it has answered, so the reply first carries this.
+ * The DocumentMemoryPill's 28px chip, as plain text (nothing to open yet):
+ *
+ *   saving    an hourglass in Muted (a slow pulse; still under reduced motion) and
+ *             "Saving key facts from CV.pdf…"
+ *   nothing   the sparkle in Muted, "No new facts to save from CV.pdf"
+ *   failed    an alert in rose-700, "Couldn't save CV.pdf to memory"
+ *   unknown   a question mark in Muted, "Couldn't confirm what was saved from CV.pdf"
+ *
+ * Once facts are saved the DocumentMemoryPill ("Saved 6 facts from CV.pdf") takes its place. The
+ * change is announced by MessageBubble's status line, not here.
+ */
+export function DocumentIngestPill({ ingest }: { ingest: DocumentIngest }) {
+  const Icon = ingest.state === "saving" ? Hourglass : ingest.state === "nothing" ? Sparkles : ingest.state === "failed" ? CircleAlert : CircleHelp;
+  return (
+    <div className="mt-2 max-w-full" data-ingest-state={ingest.state}>
+      <span className="inline-flex h-7 max-w-full items-center gap-1.5 rounded-md border border-slate-200 bg-slate-50 px-2 text-xs font-medium text-slate-700 pointer-coarse:h-9">
+        <Icon
+          className={`size-3.5 shrink-0 ${ingest.state === "failed" ? "text-rose-700" : "text-slate-500"} ${
+            ingest.state === "saving" ? "motion-safe:animate-pulse" : ""
+          }`}
+          aria-hidden="true"
+        />
+        <span className="truncate">{documentIngestText(ingest)}</span>
+      </span>
+    </div>
+  );
+}
 
 const STATUS_LABEL: Record<DocumentFact["status"], string> = {
   active: "Active",

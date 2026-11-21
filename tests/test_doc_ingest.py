@@ -4,13 +4,15 @@ Tests for Save to Memory - an attached document's key facts read into Jarvis's m
 
     .venv\\Scripts\\python -m pytest tests/test_doc_ingest.py -v
 
-* the switch - save_to_memory false (the default) never reaches the graph; true saves the
-  signed-in person's file and the final event carries saved_memories
+* the switch - save_to_memory false (the default) never reaches the graph; true answers first and
+  saves the signed-in person's file in a background job (ingest_jobs.py, GET /memory/ingest-status)
+* never blocking - a file with no question is answered at once without the model; with a question the
+  reply goes out before the facts are read; a failed turn cancels its job
+* the person's own name - in their résumé it is "me" (mcp_memory.fold_person, memory_ingest.person_names)
 * the hard cap - at most 10 facts from one document, however many the extractor returns
 * provenance - source_file and ingested_at on every saved fact, shown by recall with a cite hint
 * temporal updates - Spec_v2.pdf's deadline archives Spec_v1.pdf's (one-value relations only)
-* graceful degradation - a failure, or nothing worth keeping, is saved_memories: [] and the reply
-  still arrives
+* graceful degradation - a failure, or nothing worth keeping, saves nothing and the reply still arrives
 * the document's text - PDF / Word / Markdown read by the read_file tool's readers, long ones cut,
   secrets blanked before the extractor sees them
 
@@ -44,6 +46,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import api_server  # noqa: E402
 import attachments  # noqa: E402
+import ingest_jobs  # noqa: E402
 import mcp_memory as M  # noqa: E402
 import memory_ingest  # noqa: E402
 import request_context  # noqa: E402
@@ -132,8 +135,13 @@ class DocCase(KGCase):
         self.doc_args: list[tuple[str, str, list, list]] = []
         self.doc_failure: BaseException | None = None
 
-        async def extract_document(text: str, source_file: str, known: list, facts: list | None = None) -> M.Graph:
+        self.doc_names: list[list[str]] = []
+
+        async def extract_document(
+            text: str, source_file: str, known: list, facts: list | None = None, *, person_names: Any = ()
+        ) -> M.Graph:
             self.doc_args.append((text, source_file, known, facts or []))
+            self.doc_names.append(list(person_names))
             if self.doc_failure is not None:
                 raise self.doc_failure
             return M.graph_from(self.doc_extracted)
@@ -150,6 +158,9 @@ class DocCase(KGCase):
             mock.patch.object(M, "_openai_client", lambda: None),
             mock.patch.object(attachments, "ROOT", self.root),
             mock.patch.object(attachments, "UPLOADS_DIR", os.path.join(self.root, attachments.UPLOADS_FOLDER)),
+            # The "just saving" answer loads .env; the tests never read the real one.
+            mock.patch.object(api_server.llm_brain, "_load_env", lambda: None),
+            mock.patch.dict(ingest_jobs._jobs, {}, clear=True),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -179,7 +190,9 @@ class SwitchTests(DocCase):
         reply: str = "Here is what the spec says.",
         turn: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
-        """POST /chat with a stand-in brain; `turn` (async, given the question) replaces its answer."""
+        """POST /chat with a stand-in brain; `turn` (async, given the question) replaces its answer.
+        TestClient hands the response back once FastAPI's background tasks have run too: a Save to
+        Memory job is finished when this returns."""
         questions: list[str] = []
 
         class Brain:
@@ -210,16 +223,25 @@ class SwitchTests(DocCase):
     def body(self, attachment: api_server.Attachment, **extra: Any) -> dict[str, Any]:
         return {"prompt": "What is the deadline?", "user_id": "u1", "attachments": [attachment.model_dump()], **extra}
 
+    def job(self, final: dict[str, Any], scope: str = "user:u1") -> dict[str, Any]:
+        """The Save to Memory job the final event points at, as GET /memory/ingest-status shows it."""
+        found = ingest_jobs.status(final["ingest_job_id"], scope)
+        self.assertIsNotNone(found, "the job is known to its own scope")
+        return found or {}
+
     def test_save_to_memory_false_skips_graph_writes_completely(self) -> None:
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
         attachment = self.upload("Spec_v2.md", "# Atlas\nDeadline: 2027-03-01")
         with mock.patch.object(memory_ingest, "prepare", wraps=memory_ingest.prepare) as prepare, \
-                mock.patch.object(memory_ingest, "save", wraps=memory_ingest.save) as save:
+                mock.patch.object(memory_ingest, "save", wraps=memory_ingest.save) as save, \
+                mock.patch.object(ingest_jobs, "create", wraps=ingest_jobs.create) as create:
             for body in (self.body(attachment), self.body(attachment, save_to_memory=False)):
                 final, questions = self.chat(body)
                 self.assertEqual(final["message"], "Here is what the spec says.")
                 self.assertEqual(final["saved_memories"], [])
+                self.assertNotIn("ingest_job_id", final)
                 self.assertNotIn(attachments.SAVING_NOTE, questions[0])
+        create.assert_not_called()
         prepare.assert_not_called()
         save.assert_not_called()
         self.assertEqual(self.doc_args, [], "the extractor was never asked")
@@ -229,14 +251,19 @@ class SwitchTests(DocCase):
     def test_the_default_is_off(self) -> None:
         self.assertFalse(api_server.ChatRequest(prompt="hi").save_to_memory)
 
-    def test_save_to_memory_true_saves_and_reports_in_the_final_event(self) -> None:
+    def test_save_to_memory_true_answers_then_saves_in_the_background(self) -> None:
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"), ("me", "working_on", "Atlas"))
         attachment = self.upload("Spec_v2.md", "# Atlas\nDeadline: 2027-03-01")
         final, questions = self.chat(self.body(attachment, save_to_memory=True))
         self.assertEqual(final["message"], "Here is what the spec says.", "the reply is the turn's, as usual")
-        [saved] = final["saved_memories"]
+        self.assertEqual(final["saved_memories"], [], "the final event no longer waits for the facts")
+        self.assertEqual(final["ingest_source_files"], ["Spec_v2.md"])
+        self.assertNotIn("Saving key facts", self.last_response, "no saving step inside the turn any more")
+        job = self.job(final)
+        self.assertEqual(job["state"], "saved")
+        self.assertEqual(job["count"], 2)
+        [saved] = job["saved_memories"]
         self.assertEqual(saved["source_file"], "Spec_v2.md")
-        self.assertEqual(saved["count"], 2)
         self.assertEqual(
             saved["facts"],
             [
@@ -246,9 +273,27 @@ class SwitchTests(DocCase):
         )
         datetime.datetime.fromisoformat(saved["ingested_at"])
         self.assertIn(attachments.SAVING_NOTE, questions[0], "the model is told not to remember the file itself")
-        self.assertIn("Saving key facts from Spec_v2.md to memory...", self.last_response)
         self.assertEqual(len(self.kg.relations), 2)
         self.assertTrue(all(r["scope"] == "user:u1" for r in self.kg.relations.values()), "the signed-in person's memory")
+
+    def test_the_status_endpoint_is_the_signed_in_persons_only(self) -> None:
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        final, _questions = self.chat(self.body(self.upload("Spec.md"), save_to_memory=True))
+        client = TestClient(api_server.app)
+        path = f"/memory/ingest-status/{final['ingest_job_id']}"
+        mine = client.get(path, headers={"X-Jarvis-User-Id": "u1"})
+        self.assertEqual(mine.status_code, 200, mine.text)
+        self.assertEqual((mine.json()["state"], mine.json()["count"], mine.json()["source_files"]), ("saved", 1, ["Spec.md"]))
+        theirs = client.get(path, headers={"X-Jarvis-User-Id": "u2"})
+        self.assertEqual((theirs.status_code, theirs.json()["code"]), (404, "not_found"), "someone else's job is unknown")
+        self.assertEqual(client.get(path).status_code, 401, "nobody named")
+        self.assertEqual(client.get("/memory/ingest-status/nope", headers={"X-Jarvis-User-Id": "u1"}).status_code, 404)
+
+    def test_the_signed_in_persons_name_reaches_the_extractor(self) -> None:
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        final, _questions = self.chat(self.body(self.upload("CV.md"), save_to_memory=True, user_name="Somchai Jaidee"))
+        self.assertEqual(self.job(final)["state"], "saved")
+        self.assertEqual(self.doc_names, [["Somchai Jaidee"]])
 
     def test_no_user_no_saving(self) -> None:
         attachment = self.upload("Spec_v2.md")
@@ -256,45 +301,93 @@ class SwitchTests(DocCase):
             final, questions = self.chat({**self.body(attachment, save_to_memory=True), "user_id": ""})
         spy.assert_not_called()
         self.assertEqual(final["saved_memories"], [])
+        self.assertNotIn("ingest_job_id", final)
         self.assertNotIn(attachments.SAVING_NOTE, questions[0])
 
     def test_no_file_no_saving(self) -> None:
         with mock.patch.object(memory_ingest, "prepare") as spy:
             final, _questions = self.chat({"prompt": "hi", "user_id": "u1", "save_to_memory": True})
         spy.assert_not_called()
-        self.assertEqual(final["saved_memories"], [])
+        self.assertNotIn("ingest_job_id", final)
 
-    def test_a_failed_saving_still_answers(self) -> None:
+    def test_a_failed_saving_still_answers_and_says_failed(self) -> None:
         self.doc_failure = RuntimeError("boom")
-        attachment = self.upload("Spec_v2.md")
-        final, _questions = self.chat(self.body(attachment, save_to_memory=True))
+        final, _questions = self.chat(self.body(self.upload("Spec_v2.md"), save_to_memory=True))
         self.assertEqual(final["message"], "Here is what the spec says.")
-        self.assertEqual(final["saved_memories"], [])
+        self.assertEqual(self.job(final)["state"], "failed")
         self.assertEqual(self.kg.writes(), [])
 
-    def test_a_crash_inside_either_step_is_contained_by_the_server(self) -> None:
+    def test_nothing_worth_keeping_says_nothing(self) -> None:
+        self.doc_extracted = {"entities": [{"name": "Introduction", "type": "other", "description": "x"}], "relations": []}
+        final, _questions = self.chat(self.body(self.upload("Terms.md"), save_to_memory=True))
+        self.assertEqual((self.job(final)["state"], self.job(final)["count"]), ("nothing", 0))
+
+    def test_a_crash_inside_the_job_is_contained(self) -> None:
         async def broken(*args: Any, **kwargs: Any) -> list[Any]:
             raise RuntimeError("a bug")
 
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
-        attachment = self.upload("Spec_v2.md")
-        for step in ("prepare", "save"):
-            with mock.patch.object(memory_ingest, step, broken):
-                final, _questions = self.chat(self.body(attachment, save_to_memory=True))
-            self.assertEqual(final["message"], "Here is what the spec says.", step)
-            self.assertEqual(final["saved_memories"], [], step)
+        with mock.patch.object(memory_ingest, "ingest", broken):
+            final, _questions = self.chat(self.body(self.upload("Spec_v2.md"), save_to_memory=True))
+        self.assertEqual(final["message"], "Here is what the spec says.")
+        self.assertEqual(self.job(final)["state"], "failed")
 
 
 # =====================================================================
-# 1b. The production fix (2026-11-20): bounded, written only with a reply
+# 1b. Never blocking the chat (production, 2026-11-21: an 11-page PDF held /chat for 47 s)
 # =====================================================================
 
 
-class BudgetTests(DocCase):
-    """A 315 KB PDF took /chat past the web app's 120 s and still wrote six orphan facts afterwards."""
+def asgi_post(path: str, body: dict[str, Any]) -> tuple[list[tuple[float, bytes]], float]:
+    """
+    POST straight into the ASGI app - not TestClient, which hands the response back only once the
+    background tasks have run too: when each piece of the body went out (seconds from the start), and
+    when the whole call - background tasks included - was over.
+    """
 
+    async def go() -> tuple[list[tuple[float, bytes]], float]:
+        payload = json.dumps(body).encode("utf-8")
+        given = {"body": False}
+        never = asyncio.Event()
+        chunks: list[tuple[float, bytes]] = []
+        start = time.monotonic()
+
+        async def receive() -> dict[str, Any]:
+            if not given["body"]:
+                given["body"] = True
+                return {"type": "http.request", "body": payload, "more_body": False}
+            await never.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body":
+                chunks.append((time.monotonic() - start, message.get("body", b"")))
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"",
+            "root_path": "", "headers": [(b"content-type", b"application/json"), (b"host", b"127.0.0.1:8000")],
+            "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8000),
+        }
+        await api_server.app(scope, receive, send)
+        return chunks, time.monotonic() - start
+
+    return asyncio.run(go())
+
+
+def final_at(chunks: list[tuple[float, bytes]]) -> tuple[float, dict[str, Any]]:
+    """When the final event went out, and the event."""
+    for at, data in chunks:
+        found = re.search(rb"event: final\ndata: (.+)\n", data)
+        if found:
+            return at, json.loads(found.group(1))
+    raise AssertionError("no final event")
+
+
+class BackgroundTests(DocCase):
     chat = SwitchTests.chat
     body = SwitchTests.body
+    job = SwitchTests.job
 
     def slow_extractor(self, seconds: float) -> dict[str, Any]:
         """The extractor takes `seconds` (and records whether it was cancelled)."""
@@ -315,6 +408,29 @@ class BudgetTests(DocCase):
         self.addCleanup(patcher.stop)
         return record
 
+    def stand_in_brain(self) -> list[str]:
+        """_ready_brain gives a brain that answers at once; the questions it was asked."""
+        questions: list[str] = []
+
+        class Brain:
+            available = True
+            tool_names = ["mcp__local_fs__read_file"]
+
+            def set_history(self, turns: Any) -> None:
+                pass
+
+            async def run(self, question: str, **kwargs: Any):
+                questions.append(question)
+                yield {"type": "final", "node": "Final_Response", "message": "Here is the summary."}
+
+        async def ready() -> Any:
+            return Brain()
+
+        patcher = mock.patch.object(api_server, "_ready_brain", ready)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return questions
+
     def test_the_document_text_is_capped_between_12k_and_15k(self) -> None:
         self.assertTrue(12_000 <= memory_ingest.MAX_DOCUMENT_CHARS <= 15_000)
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
@@ -334,78 +450,120 @@ class BudgetTests(DocCase):
         self.assertTrue(record["cancelled"], "the model call itself was stopped")
         self.assertEqual(self.kg.writes(), [])
 
-    def test_slow_ingestion_never_holds_the_reply_past_the_budget(self) -> None:
+    def test_a_file_with_no_question_is_answered_at_once_without_the_model(self) -> None:
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
-        record = self.slow_extractor(4)
-        attachment = self.upload("tgo CFO.pdf.md")
-        started = time.monotonic()
-        with mock.patch.object(api_server, "SAVE_BUDGET_SECONDS", 0.6):
-            final, _questions = self.chat(self.body(attachment, save_to_memory=True))
-        elapsed = time.monotonic() - started
-        self.assertEqual(final["message"], "Here is what the spec says.", "the reply arrives")
-        self.assertEqual(final["saved_memories"], [])
-        self.assertLess(elapsed, 2.5, f"answered within the budget (took {elapsed:.2f} s)")
-        self.assertTrue(record["cancelled"], "the unfinished ingestion was cancelled")
-        time.sleep(0.3)
-        self.assertEqual(self.kg.writes(), [], "and nothing was written afterwards")
+        self.slow_extractor(1.5)
 
-    def test_the_facts_are_prepared_while_the_turn_runs(self) -> None:
-        # The stand-in turn only ends once the extraction has run: it would time out if they ran one after the other.
+        async def no_brain() -> Any:
+            raise AssertionError("the brain is not needed to save a file")
+
+        attachment = self.upload("Resume.pdf.md")
+        for day, prompt in enumerate(("", "save this", "บันทึกไว้นะ"), start=1):
+            # A new deadline each time, so each save writes something (the same facts again save nothing new).
+            # (Worded dates: spec() describes "2027-03-02" as "2027-03-02 in the Atlas spec", and those
+            # 16 digits in a row pass the card-number check of drop_secrets.)
+            self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", f"{day} March 2027"))
+            with self.subTest(prompt=prompt), mock.patch.object(api_server, "_ready_brain", no_brain):
+                chunks, whole = asgi_post("/chat", self.body(attachment, prompt=prompt, save_to_memory=True))
+                at, final = final_at(chunks)
+                self.assertLess(at, 0.5, f"the answer went out at once ({at:.2f} s)")
+                self.assertGreater(whole, 1.4, "and the save ran after it, in the background")
+                self.assertEqual(final["message"], memory_ingest.saving_reply(["Resume.pdf.md"]))
+                self.assertEqual(final["ingest_source_files"], ["Resume.pdf.md"])
+                self.assertEqual(self.job(final)["state"], "saved")
+
+    def test_with_a_question_the_reply_goes_out_before_the_save(self) -> None:
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
-        attachment = self.upload("Spec.md")
-
-        async def turn(question: str):
-            for _ in range(100):
-                if self.doc_args:
-                    break
-                await asyncio.sleep(0.02)
-            self.assertTrue(self.doc_args, "extraction started during the turn")
-            self.assertEqual(self.kg.writes(), [], "but nothing is written before the reply is ready")
-            yield {"type": "final", "node": "Final_Response", "message": "Done."}
-
-        final, _questions = self.chat(self.body(attachment, save_to_memory=True), turn=turn)
-        self.assertEqual(final["message"], "Done.")
-        self.assertEqual(final["saved_memories"][0]["count"], 1)
+        self.slow_extractor(1.5)
+        questions = self.stand_in_brain()
+        chunks, whole = asgi_post("/chat", self.body(self.upload("Spec.md"), prompt="Summarize it", save_to_memory=True))
+        at, final = final_at(chunks)
+        self.assertEqual(final["message"], "Here is the summary.")
+        self.assertLess(at, 0.5, f"the reply did not wait for the facts ({at:.2f} s)")
+        self.assertGreater(whole, 1.4)
+        self.assertIn(attachments.SAVING_NOTE, questions[0])
+        self.assertEqual(self.job(final)["state"], "saved")
         self.assertEqual(len(self.kg.relations), 1)
 
-    def test_a_turn_that_fails_writes_nothing(self) -> None:
+    def test_a_question_is_not_just_saving(self) -> None:
+        for prompt in ("What is the deadline?", "save this and tell me the budget", "summarize", "สรุปให้หน่อย"):
+            self.assertFalse(memory_ingest.only_saving(prompt), prompt)
+        for prompt in ("", "  ", "Save this.", "please remember this file", "save to memory", "จำไว้", "บันทึกไฟล์นี้ด้วยครับ"):
+            self.assertTrue(memory_ingest.only_saving(prompt), prompt)
+
+    def test_a_turn_that_fails_cancels_the_job(self) -> None:
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
         attachment = self.upload("Spec.md")
+        created: list[ingest_jobs.Job] = []
+        real_create = ingest_jobs.create
+
+        def create(*args: Any, **kwargs: Any) -> ingest_jobs.Job:
+            created.append(real_create(*args, **kwargs))
+            return created[-1]
 
         async def failing(question: str):
-            for _ in range(100):  # let the extraction finish first: it must still not be written
-                if self.doc_args:
-                    break
-                await asyncio.sleep(0.02)
-            await asyncio.sleep(0.1)
             yield {"type": "error", "status": "Failed", "message": "The model is unavailable.", "code": 502}
 
-        final, _questions = self.chat(self.body(attachment, save_to_memory=True), turn=failing)
+        with mock.patch.object(ingest_jobs, "create", create):
+            final, _questions = self.chat(self.body(attachment, save_to_memory=True), turn=failing)
         self.assertEqual(final, {}, "no final event")
         self.assertIn("event: error", self.last_response)
-        self.assertTrue(self.doc_args, "the facts were prepared")
-        time.sleep(0.2)
-        self.assertEqual(self.kg.writes(), [], "and never written")
-        self.assertEqual((self.kg.entities, self.kg.relations), ({}, {}))
+        self.assertEqual(created[0].state, "cancelled")
+        self.assertEqual(self.doc_args, [], "the file was never read")
+        self.assertEqual(self.kg.writes(), [], "and nothing was written")
 
-    def test_a_write_that_runs_out_of_time_is_cancelled(self) -> None:
+    def test_a_job_has_a_budget(self) -> None:
         self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
-        attachment = self.upload("Spec.md")
-        cancelled: list[bool] = []
+        record = self.slow_extractor(5)
+        with mock.patch.object(ingest_jobs, "JOB_BUDGET_SECONDS", 0.3):
+            job = ingest_jobs.create(SCOPE, [self.upload("Spec.md")])
+            started = time.monotonic()
+            asyncio.run(ingest_jobs.run(job.id))
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(job.state, "failed")
+        self.assertTrue(record["cancelled"])
+        self.assertEqual(self.kg.writes(), [])
 
-        async def slow_save(scope: str, graph: M.Graph, **kwargs: Any) -> Any:
-            try:
-                await asyncio.sleep(5)
-            except asyncio.CancelledError:
-                cancelled.append(True)
-                raise
+    def test_cancelling_a_running_job_stops_it(self) -> None:
+        self.doc_extracted = spec("Atlas", ("Atlas", "deadline_is", "2027-03-01"))
+        record = self.slow_extractor(5)
+        job = ingest_jobs.create(SCOPE, [self.upload("Spec.md")])
 
-        started = time.monotonic()
-        with mock.patch.object(M, "save_graph", slow_save), mock.patch.object(api_server, "SAVE_BUDGET_SECONDS", 0.8):
-            final, _questions = self.chat(self.body(attachment, save_to_memory=True))
-        self.assertLess(time.monotonic() - started, 3.0)
-        self.assertEqual(final["saved_memories"], [])
-        self.assertEqual(cancelled, [True])
+        async def go() -> None:
+            task = asyncio.create_task(ingest_jobs.run(job.id))
+            while not record["started"]:
+                await asyncio.sleep(0.01)
+            ingest_jobs.cancel(job.id)
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(go())
+        self.assertEqual(job.state, "cancelled")
+        self.assertTrue(record["cancelled"])
+        self.assertEqual(self.kg.writes(), [])
+
+    def test_a_cancelled_job_never_starts(self) -> None:
+        job = ingest_jobs.create(SCOPE, [self.upload("Spec.md")])
+        ingest_jobs.cancel(job.id)
+        asyncio.run(ingest_jobs.run(job.id))
+        self.assertEqual((job.state, self.doc_args), ("cancelled", []))
+
+    def test_old_jobs_are_forgotten(self) -> None:
+        old = ingest_jobs.create(SCOPE, [self.upload("Old.md")])
+        ingest_jobs.cancel(old.id)
+        assert old.finished is not None
+        old.finished -= ingest_jobs.KEEP_SECONDS + 1
+        self.assertIsNone(ingest_jobs.status(old.id, SCOPE))
+        with mock.patch.object(ingest_jobs, "MAX_JOBS", 3):
+            made = [ingest_jobs.create(SCOPE, [self.upload("x.md")]) for _ in range(5)]
+            ingest_jobs.create(SCOPE, [self.upload("y.md")])
+            self.assertLessEqual(len(ingest_jobs._jobs), 3)
+            self.assertIsNone(ingest_jobs.status(made[0].id, SCOPE), "the oldest went first")
+
+    def test_the_job_id_is_unguessable(self) -> None:
+        ids = {ingest_jobs.create(SCOPE, [self.upload("x.md")]).id for _ in range(20)}
+        self.assertEqual(len(ids), 20)
+        self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9_-]{20,}", job_id) for job_id in ids))
 
 
 # =====================================================================
@@ -742,29 +900,6 @@ class DegradationTests(DocCase):
 
         asyncio.run(run())
 
-    def test_saved_memories_of_a_finished_task(self) -> None:
-        async def run() -> list[list[dict[str, Any]]]:
-            async def ok() -> list[dict[str, Any]]:
-                return [{"source_file": "a.md", "count": 1, "facts": []}]
-
-            async def bad() -> list[dict[str, Any]]:
-                raise RuntimeError("x")
-
-            out = []
-            for coro in (ok(), bad()):
-                task = asyncio.create_task(coro)
-                with contextlib.suppress(BaseException):
-                    await task
-                out.append(api_server._saved_memories(task))
-            cancelled = asyncio.create_task(asyncio.sleep(10))
-            cancelled.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await cancelled
-            out.append(api_server._saved_memories(cancelled))
-            return out
-
-        self.assertEqual(asyncio.run(run()), [[{"source_file": "a.md", "count": 1, "facts": []}], [], []])
-
 
 # =====================================================================
 # 6. The document's text
@@ -829,6 +964,116 @@ class DocumentTextTests(DocCase):
         self.assertEqual(name(api_server.Attachment(path=f"uploads/{PREFIX}Spec_v2.pdf", name="Spec_v2.pdf")), "Spec_v2.pdf")
         self.assertEqual(name(api_server.Attachment(path=f"uploads/{PREFIX}Spec_v2.pdf", name="")), "Spec_v2.pdf")
         self.assertEqual(name(api_server.Attachment(path="uploads/x.pdf", name='My "spec" [v2].pdf')), "My spec v2 .pdf")
+
+
+# =====================================================================
+# 7. The person's own name is "me" (production, 2026-11-21: a résumé's facts were left "not linked")
+# =====================================================================
+
+
+def resume_graph() -> M.Graph:
+    """What the extractor gave for a résumé when it wrote the person's full name instead of "me"."""
+    return M.graph_from({
+        "entities": [
+            {"name": "Somchai Jaidee", "type": "person", "description": "a student"},
+            {"name": "Lantern Quest", "type": "project", "description": "a game Somchai Jaidee built"},
+            {"name": "Kasetsart University", "type": "organization", "description": "where somchai jaidee studies"},
+            {"name": "Riverside Clinic", "type": "organization", "description": "a partner of Lantern Quest"},
+        ],
+        "relations": [
+            {"subject": "Somchai Jaidee", "relation": "building", "object": "Lantern Quest", "status": "active"},
+            {"subject": "Somchai Jaidee", "relation": "studied_at", "object": "Kasetsart University", "status": "active"},
+            {"subject": "Lantern Quest", "relation": "partner_of", "object": "Riverside Clinic", "status": "active"},
+        ],
+    })
+
+
+class PersonTests(DocCase):
+    def test_the_persons_name_is_merged_into_me(self) -> None:
+        graph, merged = M.fold_person(resume_graph(), ["Somchai Jaidee"])
+        self.assertEqual(merged, 1)
+        self.assertNotIn("somchai jaidee", graph.nodes)
+        self.assertEqual((graph.nodes[M.ME].type, graph.nodes[M.ME].description), ("person", M.ME_DESCRIPTION))
+        self.assertEqual(
+            graph.edges,
+            [
+                (M.ME, "building", "lantern quest", "active"),
+                (M.ME, "studied_at", "kasetsart university", "active"),
+                ("lantern quest", "partner_of", "riverside clinic", "active"),
+            ],
+        )
+        self.assertEqual(graph.nodes["lantern quest"].description, "a game the user built")
+        self.assertEqual(graph.nodes["kasetsart university"].description, "where the user studies", "any case")
+
+    def test_spellings_of_one_name(self) -> None:
+        key = M.person_key
+        for spelled in ("Mr. Somchai Jaidee", "JAIDEE, Somchai", "somchai   jaidee", "Jaidee Somchai", "Dr Somchai Jaidee"):
+            self.assertEqual(key(spelled), key("Somchai Jaidee"), spelled)
+        self.assertEqual(key("นายสมชาย ใจดี"), key("สมชาย ใจดี"))
+        self.assertEqual(key("นิพนธ์"), "นิพนธ์", "Thai vowel and tone marks stay in the word")
+        self.assertEqual(key("Mrinal Sen"), "mrinal sen", "a title only with a dot or a space after it")
+        self.assertNotEqual(key("Somchai"), key("Somchai Jaidee"))
+        self.assertNotEqual(key("Somchai Boonmee"), key("Somchai Jaidee"))
+
+    def test_a_first_name_alone_does_not_take_someone_elses_full_name(self) -> None:
+        graph = M.graph_from({"entities": [{"name": "Somchai Boonmee", "type": "person", "description": "a colleague"}],
+                              "relations": [{"subject": "Somchai Boonmee", "relation": "works_at", "object": "Acme", "status": "active"}]})
+        graph, merged = M.fold_person(graph, ["Somchai"])
+        self.assertEqual(merged, 0)
+        self.assertIn("somchai boonmee", graph.nodes)
+
+    def test_no_names_or_me_itself_changes_nothing(self) -> None:
+        for names in ([], ["me"], ["the user", "  "]):
+            graph, merged = M.fold_person(resume_graph(), names)
+            self.assertEqual(merged, 0, names)
+            self.assertIn("somchai jaidee", graph.nodes)
+
+    def test_person_names(self) -> None:
+        with mock.patch.dict(os.environ, {memory_ingest.OWNER_NAMES_ENV: "Somchai Jaidee; Somchai, สมชาย ใจดี ,"}):
+            self.assertEqual(
+                memory_ingest.person_names("owner", ["Jaidee Somchai"]),
+                ["Jaidee Somchai", "Somchai", "สมชาย ใจดี"],
+                "the web's name first; the same name spelled twice once",
+            )
+            self.assertEqual(memory_ingest.person_names("user:x", ["Ann Lee"]), ["Ann Lee"], "the owner's names are the owner's only")
+        self.assertEqual(memory_ingest.person_names("user:x", ["me", " ", 5]), [])  # type: ignore[list-item]
+
+    def test_the_extractor_is_told_who_me_is(self) -> None:
+        captured: list[str] = []
+
+        async def fake(system: str, message: str) -> M.Graph:
+            captured.append(message)
+            return M.Graph()
+
+        with mock.patch.object(M, "_extract_graph", fake):
+            asyncio.run(REAL_EXTRACT_DOCUMENT("CV", "CV.pdf", [], [], person_names=["Somchai Jaidee", "สมชาย"]))
+            asyncio.run(REAL_EXTRACT_DOCUMENT("CV", "CV.pdf", [], []))
+        self.assertIn('The person ("me") is called: "Somchai Jaidee"; "สมชาย". In the document, that name means "me".', captured[0])
+        self.assertNotIn("is called", captured[1])
+
+    def test_the_prompt_says_a_resume_is_about_me(self) -> None:
+        prompt = M.DOCUMENT_EXTRACTION_PROMPT
+        self.assertIn("résumé or CV, portfolio", prompt)
+        self.assertIn("their own name", prompt)
+        self.assertIn('is written "me", never as an entity of its own', prompt)
+
+    def test_a_resume_links_to_me_not_to_an_orphan_name(self) -> None:
+        # The extractor ignored the hint and wrote the full name, as in production: the code folds it.
+        self.doc_extracted = {
+            "entities": [{"name": n.name, "type": n.type, "description": n.description} for n in resume_graph().nodes.values()],
+            "relations": [{"subject": resume_graph().nodes[s].name, "relation": v, "object": resume_graph().nodes[o].name, "status": st}
+                          for s, v, o, st in resume_graph().edges],
+        }
+        with mock.patch.dict(os.environ, {memory_ingest.OWNER_NAMES_ENV: "Somchai Jaidee"}):
+            [saved] = asyncio.run(memory_ingest.ingest("owner", [self.upload("Somchai Jaidee (8).pdf.md", "CV")]))
+        self.assertEqual(self.doc_names, [["Somchai Jaidee"]], "the extractor was told")
+        self.assertEqual(
+            [(f["subject"], f["relation"], f["object"]) for f in saved["facts"]],
+            [("me", "building", "Lantern Quest"), ("me", "studied_at", "Kasetsart University"), ("Lantern Quest", "partner_of", "Riverside Clinic")],
+        )
+        names = {row["name"] for row in self.kg.entities.values()}
+        self.assertNotIn("Somchai Jaidee", names, "no orphan entry with the person's name")
+        self.assertIn("me", names)
 
 
 if __name__ == "__main__":

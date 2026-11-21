@@ -5,7 +5,7 @@
  * (`messageContent.ts`) and the components all speak the same types.
  */
 
-import type { DocumentMemory } from "./documentMemory";
+import type { DocumentIngest, DocumentMemory } from "./documentMemory";
 import type { MemoryNote } from "./memoryNote";
 
 /** What the orb (and so the whole hub) is doing right now. */
@@ -69,6 +69,12 @@ export interface ChatMessage {
    * under the reply (documentMemory.ts). Only on a reply that just arrived, like `memory`.
    */
   documentMemories?: DocumentMemory[];
+  /**
+   * The Save to Memory job that runs after this reply, while it is saving or when it saved nothing
+   * ("Saving key facts from CV.pdf…"); once it has saved, `documentMemories` takes its place. Only on
+   * a reply that just arrived, like `memory`.
+   */
+  documentIngest?: DocumentIngest;
 }
 
 export interface SessionSummary {

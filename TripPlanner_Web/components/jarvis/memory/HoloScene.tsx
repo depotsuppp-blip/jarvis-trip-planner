@@ -148,6 +148,13 @@ export default function HoloScene({
   const fg = useRef<Graph | undefined>(undefined);
   // One visual per entry and shape (kind + size): a new shape is a new object.
   const visuals = useRef(new Map<string, NodeVisual>());
+  // The node object each visual was handed to the library for. The library tracks its objects by
+  // the node OBJECT, not the id: given a fresh copy of the same entry (the graph loaded again), it
+  // builds for the copy and then removes - scene.remove + dispose - the object of the copy it
+  // forgot. Had the copy been handed that same object, every entry would leave the scene (only
+  // the rings stay) and the library's next clean-up would throw "Cannot convert undefined or null
+  // to object" at Map.forEach. So a visual is reused only for the node object it was made for.
+  const owners = useRef(new Map<string, GraphNode>());
   // Styles a freshly built visual the way the latest render would (the library builds them later).
   const styleNode = useRef<(node: GraphNode, visual: NodeVisual) => void>(() => {});
   const orbitsRef = useRef(orbits);
@@ -311,7 +318,7 @@ export default function HoloScene({
       const node = raw as GraphNode;
       const current = orbitsRef.current;
       const key = `${node.id}|${shapeOf(node, current)}`;
-      let visual = visuals.current.get(key);
+      let visual = owners.current.get(key) === node ? visuals.current.get(key) : undefined;
       if (!visual) {
         try {
           visual = createVisual(node.id, current.byId.get(node.id)?.kind ?? "moon", nodeRadius(node, current));
@@ -323,6 +330,7 @@ export default function HoloScene({
           return createFallbackObject(node.id, nodeRadius(node, current));
         }
         visuals.current.set(key, visual);
+        owners.current.set(key, node);
       }
       return visual.group;
     },
@@ -333,7 +341,11 @@ export default function HoloScene({
   useEffect(() => {
     // Forget visuals whose entry or shape is gone (the library has already disposed them).
     const keep = new Set(shapes.split(","));
-    for (const key of visuals.current.keys()) if (!keep.has(key)) visuals.current.delete(key);
+    for (const key of visuals.current.keys()) {
+      if (keep.has(key)) continue;
+      visuals.current.delete(key);
+      owners.current.delete(key);
+    }
   }, [shapes]);
 
   // ---- links ----------------------------------------------------------------------------------------
@@ -357,7 +369,9 @@ export default function HoloScene({
     const api = fg.current;
     if (!mounted || !api) return;
     const scene = api.scene();
-    scene.fog = new FogExp2(OBSIDIAN, 0.0012);
+    // Made once: fit() tunes its density to the camera's distance, and a new fog here (new orbits
+    // after a reload or a delete) would sink the whole system into the dark until the next fit.
+    if (!(scene.fog instanceof FogExp2)) scene.fog = new FogExp2(OBSIDIAN, 0.0012);
     const rings = createRings(orbits);
     scene.add(rings);
     return () => {

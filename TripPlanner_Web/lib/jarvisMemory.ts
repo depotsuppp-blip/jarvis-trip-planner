@@ -8,6 +8,7 @@ import {
   type MemoryNode,
   type RelationStatus,
 } from "@/lib/jarvis/memory";
+import { readIngestStatus, type DocumentMemory, type IngestState } from "@/lib/jarvis/documentMemory";
 import { checkRateLimit } from "@/lib/rateLimit";
 
 /**
@@ -24,6 +25,8 @@ import { checkRateLimit } from "@/lib/rateLimit";
  *   PATCH  {JARVIS_MEMORY_URL}/relations/<id>  { status: "active" | "completed" | "archived" }
  *                                                     -> { link }
  *   DELETE {JARVIS_MEMORY_URL}/relations/<id>        -> { deleted }
+ *   GET    {JARVIS_MEMORY_URL}/ingest-status/<job>   -> { job_id, state, source_files, saved_memories, count }
+ *                                                     a Save to Memory job of the chat (fetchIngestStatus)
  *   errors: { code, detail }   401 no_user, 404 not_found, 409 name_taken, 400 invalid | me_locked |
  *           reserved | refused, 503 not_configured | unavailable | embedding_failed
  *
@@ -120,6 +123,9 @@ const DeletedEntitySchema = z.object({ deleted: Id, links: z.array(Id).max(20000
 const DeletedRelationSchema = z.object({ deleted: Id });
 const UpdatedRelationSchema = z.object({ link: LinkSchema });
 const FailureSchema = z.object({ code: z.string() });
+// The fields are checked one by one in readIngestStatus (lib/jarvis/documentMemory.ts); this only
+// refuses an answer that is not a job at all.
+const IngestStatusSchema = z.looseObject({ job_id: z.string().max(64), state: z.string().max(20) });
 
 const KNOWN = new Set<string>(Object.keys(MEMORY_MESSAGES));
 
@@ -188,6 +194,18 @@ export function updateMemoryEntity(
 /** Deletes an entry and every relation it is in; answers the ids of those relations too. */
 export function deleteMemoryEntity(userId: string, id: string): Promise<{ deleted: string; links: string[] }> {
   return call(`/entities/${segment(id)}`, userId, DeletedEntitySchema, { method: "DELETE", timeoutMs: READ_TIMEOUT_MS });
+}
+
+/**
+ * How a Save to Memory job of the chat is going (the brain's GET /memory/ingest-status/<id>,
+ * ingest_jobs.py): its state and, once saved, what was saved - checked (readIngestStatus). Only the
+ * person's own job: anyone else's is not_found, like one the brain no longer knows (it restarted).
+ */
+export async function fetchIngestStatus(
+  userId: string,
+  jobId: string,
+): Promise<{ state: IngestState; sourceFiles: string[]; savedMemories: DocumentMemory[] }> {
+  return readIngestStatus(await call(`/ingest-status/${segment(jobId)}`, userId, IngestStatusSchema, { timeoutMs: READ_TIMEOUT_MS }));
 }
 
 /** Marks one relation active, completed or archived; its date moves to now. */

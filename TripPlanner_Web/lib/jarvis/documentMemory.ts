@@ -6,9 +6,11 @@
  *
  * The brain reads the file's few high-signal facts - projects, people, the stack, deadlines,
  * budgets, constraints; at most 10 - into the person's memory graph with the file's name on each
- * (memory_ingest.py), side by side with answering the message, and reports them on its final event
- * as `saved_memories` (lib/jarvisBrain.ts). A fact a newer document replaced - Spec_v1.pdf's
+ * (memory_ingest.py), in a background job once it has answered (ingest_jobs.py): the reply comes
+ * with the job (DocumentIngest, below), and the page asks how it went until the facts are saved
+ * (GET /api/memory/ingest-status/<id>). A fact a newer document replaced - Spec_v1.pdf's
  * deadline when Spec_v2.pdf gives a new one - is listed too, archived and marked `replaced`.
+ * (A brain from before the jobs reports the saved facts on its final event, `saved_memories`.)
  *
  * Like the memory note, it is for the response it came with: it is not stored with the message.
  */
@@ -102,4 +104,82 @@ export function documentMemoryText(memory: DocumentMemory): string {
 /** A relation read out: "deadline_is" -> "deadline is". */
 export function relationWords(relation: string): string {
   return relation.replace(/_+/g, " ").trim();
+}
+
+// ---- the background job (the brain's ingest_jobs.py) -------------------------------------------
+
+/**
+ * How a Save to Memory job is going. The brain reads the file AFTER it has answered (production,
+ * 2026-11-21: an 11-page PDF held the chat 47 s), so the reply arrives with the job's id and the page
+ * asks GET /api/memory/ingest-status/<id> until it is done:
+ *
+ *   saving    being read and saved           "Saving key facts from CV.pdf…"
+ *   saved     facts written                  the DocumentMemoryPill(s) take its place
+ *   nothing   read, nothing new worth keeping "No new facts to save from CV.pdf"
+ *   failed    could not be read or saved     "Couldn't save CV.pdf to memory"
+ *   unknown   the brain no longer knows it (restarted), or stopped answering
+ *                                            "Couldn't confirm what was saved from CV.pdf"
+ */
+export type IngestState = "saving" | "saved" | "nothing" | "failed" | "unknown";
+
+export interface DocumentIngest {
+  jobId: string;
+  /** The files' names, as memory cites them. */
+  sourceFiles: string[];
+  state: IngestState;
+}
+
+/** The brain's job ids (secrets.token_urlsafe): letters, digits, "-" and "_". */
+export const INGEST_JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
+const INGEST_STATES: readonly IngestState[] = ["saving", "saved", "nothing", "failed", "unknown"];
+
+function fileNames(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value
+        .slice(0, MAX_FILES)
+        .map((name) => oneLine(name, MAX_NAME_CHARS))
+        .filter(Boolean)
+    : [];
+}
+
+/** The brain's final event (`ingest_job_id`, `ingest_source_files`) as a job just started, or null. */
+export function readIngestStart(jobId: unknown, sourceFiles: unknown): DocumentIngest | null {
+  if (typeof jobId !== "string" || !INGEST_JOB_ID.test(jobId)) return null;
+  return { jobId, sourceFiles: fileNames(sourceFiles), state: "saving" };
+}
+
+/** What the page received from its own server (`ingest`), checked again before it is drawn. */
+export function readDocumentIngest(value: unknown): DocumentIngest | null {
+  if (!value || typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  const started = readIngestStart(item.jobId, item.sourceFiles);
+  if (!started) return null;
+  const state = INGEST_STATES.find((known) => known === item.state) ?? "saving";
+  return { ...started, state };
+}
+
+/** GET /memory/ingest-status's answer (snake_case, from the brain), checked: the state and what was saved. */
+export function readIngestStatus(value: unknown): { state: IngestState; sourceFiles: string[]; savedMemories: DocumentMemory[] } {
+  const item = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const savedMemories = readSavedMemories(item.saved_memories);
+  // "cancelled" (the turn never answered) and anything unknown read as a failure.
+  let state: IngestState = item.state === "saving" || item.state === "nothing" ? item.state : item.state === "saved" ? "saved" : "failed";
+  // Saved, but nothing the page can draw: say so rather than show an empty pill.
+  if (state === "saved" && savedMemories.length === 0) state = "nothing";
+  return { state, sourceFiles: fileNames(item.source_files), savedMemories };
+}
+
+/** The pill's words for a job that has not ended in saved facts. */
+export function documentIngestText(ingest: DocumentIngest): string {
+  const name = ingest.sourceFiles.length === 1 ? ingest.sourceFiles[0] : ingest.sourceFiles.length > 1 ? `${ingest.sourceFiles.length} files` : "the file";
+  switch (ingest.state) {
+    case "saving":
+      return `Saving key facts from ${name}…`;
+    case "nothing":
+      return `No new facts to save from ${name}`;
+    case "failed":
+      return `Couldn't save ${name} to memory`;
+    default:
+      return `Couldn't confirm what was saved from ${name}`;
+  }
 }

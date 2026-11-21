@@ -19,12 +19,9 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                               "memory_events": [{"action": "saved"|"confirmed"|"failed",
                                                  "entries": 2, "facts": 3, "merged": 0,
                                                  "summary": "Nok sister of me; ..."}],
-                              "saved_memories": [{"source_file": "Spec_v2.pdf", "count": 6,
-                                                  "facts": [{"subject": "Atlas", "relation":
-                                                             "deadline_is", "object": "2027-03-01",
-                                                             "status": "active"}, ...],
-                                                  "ingested_at": "2026-11-20T09:15:02+00:00"}]}
-                             once, last
+                              "saved_memories": [],
+                              "ingest_job_id": "q3Jk...", "ingest_source_files": ["Spec_v2.pdf"]}
+                             once, last (the two ingest_ fields only with Save to Memory)
                    error     {"type": "error", "status": "Failed", "message": "...",
                               "code": 502}                    instead of final, last
                    action_required  {"type": "action_required", "approval_id": "...",
@@ -67,13 +64,15 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
                  save_to_memory (default false) is the hub's Save to Memory switch on an
                  attached file: the file's key facts - at most 10: projects, people, the stack,
                  deadlines, budgets, constraints - are also read into the signed-in person's
-                 memory with the file's name on each (memory_ingest.py), while the message is
-                 answered as usual. saved_memories says what was saved, per file; a fact a newer
-                 document's value replaced is listed as "archived" with "replaced": true. It is []
-                 when the switch was off, there was no user_id, or nothing was worth keeping -
-                 a failure there never fails the reply. The facts are prepared beside the turn and
-                 written only once the reply is ready (a failed or stopped turn writes nothing),
-                 and never past SAVE_BUDGET_SECONDS (100 s) from the start of the request.
+                 memory with the file's name on each (memory_ingest.py) - IN THE BACKGROUND, after
+                 the reply (ingest_jobs.py, run by FastAPI's BackgroundTasks): the reply never waits
+                 for them. The final event carries ingest_job_id (and ingest_source_files), and GET
+                 /memory/ingest-status/{job_id} says when the facts are saved and which. A message
+                 that asks nothing but to save its file ("", "save this", "บันทึก") is answered at
+                 once without the model. A turn that fails or is stopped before it answers cancels
+                 its job (nothing is written). user_name (optional) is the signed-in person's own
+                 name: in their documents it means "me" (memory_ingest.person_names). saved_memories
+                 is always [] now (a brain from before the jobs listed the saved facts there).
     POST /voice  multipart/form-data: audio (the file the browser recorded), and optionally
                    history (a JSON list shaped like /chat's), user_id, app_url, speak
               -> { "transcript": "...", "reply": "...", "engine": "openai"|"local",
@@ -155,6 +154,15 @@ HTTP front for the brain, for the Trip Planner web app's Jarvis hub.
     DELETE /memory/relations/{relation_id} -> { "deleted": id }   both entries stay.
                  401 no_user without the header; 503 not_configured / unavailable when the memory
                  database is not set up or cannot be reached.
+    GET    /memory/ingest-status/{job_id} -> { "job_id", "state": "saving"|"saved"|"nothing"|"failed"|
+                                               "cancelled", "source_files": [...], "count": 6,
+                                               "saved_memories": [{ "source_file", "count", "facts":
+                                               [{ "subject", "relation", "object", "status",
+                                               "replaced"? }], "ingested_at" }], "created_at",
+                                               "finished_at" }
+                 a Save to Memory job of /chat (ingest_jobs.py): the hub asks until state is not
+                 "saving". 404 not_found for a job of someone else's, one that never was, or one this
+                 brain no longer knows (finished over an hour ago, or the brain restarted).
 
     GET    /system/topology -> { "generated_at", "viewer": { "owner", "hidden" }, "orchestrator",
                                  "providers": [...], "telemetry": { "status": "optimal"|"degraded",
@@ -271,7 +279,9 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 import approvals
 import attachments
 import chat_sync
+import ingest_jobs
 import line_channel
+import llm_brain
 import mcp_client
 import memory_graph
 import memory_ingest
@@ -299,11 +309,6 @@ MAX_ATTACHMENTS = 5
 # A streamed turn sends a comment line after this long without an event, so nothing in between
 # takes a long tool call for a dead connection.
 HEARTBEAT_SECONDS = 10.0
-# Save to Memory may hold a /chat reply back at most this long from the start of the request: the web
-# app gives up at 120 s (TripPlanner_Web lib/jarvisBrain.ts, BRAIN_TIMEOUT_MS), and a reply must never
-# be lost to facts that are still being read. What is not done by then is cancelled and nothing is
-# written (production, 2026-11-20: a 315 KB PDF took the whole request past 120 s).
-SAVE_BUDGET_SECONDS = 100.0
 # How often a turn checks that its client is still there (and stops it when it is not).
 DISCONNECT_POLL_SECONDS = 0.25
 
@@ -336,8 +341,12 @@ class ChatRequest(BaseModel):
     interactive: bool = True
     attachments: list[Attachment] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
     # Save to Memory: the person switched it on for the attached file, so its key facts also go into
-    # their long-term memory (memory_ingest.py). Off by default: asking about a file never fills it.
+    # their long-term memory (memory_ingest.py, in the background: ingest_jobs.py). Off by default:
+    # asking about a file never fills it.
     save_to_memory: bool = False
+    # The signed-in person's own name (TripPlanner_Web's User.name): in their documents - a résumé -
+    # it means "me" (memory_ingest.person_names). Only used with save_to_memory.
+    user_name: str = Field(default="", max_length=200)
 
     @model_validator(mode="after")
     def _says_something(self) -> "ChatRequest":
@@ -692,35 +701,38 @@ async def _ready_brain() -> LLMBrain:
 
 
 @app.post("/chat")
-async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
+async def chat(body: ChatRequest, request: Request, background: BackgroundTasks) -> StreamingResponse:
     """
     One typed turn, answered as server-sent events (see the top of this file). Errors found
     before the turn starts are plain HTTP errors (422, 503); once the stream is open, a turn
     that fails says so in an `error` event.
 
-    With save_to_memory and a file, the file's key facts are read into the person's memory
-    (memory_ingest.py) in two steps: prepared (read, extracted, checked) side by side with the
-    turn, then written only once the reply is ready - a turn that fails, is stopped or runs out of
-    time writes nothing. The final event says what was saved (saved_memories). That never fails or
-    holds up the turn past SAVE_BUDGET_SECONDS from the start of the request: what is not done by
-    then is cancelled, and the reply goes out with saved_memories [].
+    With save_to_memory and a file, the file's key facts are read into the person's memory by a
+    background job (ingest_jobs.py, memory_ingest.py) that FastAPI starts once the reply has gone
+    out: the reply never waits for it (production, 2026-11-21: an 11-page PDF held this request 47 s).
+    The final event carries ingest_job_id; GET /memory/ingest-status/{job_id} says how it went. A
+    message that only asks to save its file is answered at once, without the model or the brain's
+    turn lock (memory_ingest.only_saving). A turn that fails or is stopped before its final event
+    cancels the job, so nothing is written.
     """
+    saving = body.save_to_memory and bool(body.attachments)
+    if saving and memory_ingest.only_saving(body.prompt):
+        # The scope (JARVIS_OWNER_USER_ID) and the job (OPENAI_API_KEY, the database) read .env, which is
+        # otherwise only loaded with the brain - and this answer must not wait for the brain to start.
+        llm_brain._load_env()
+        job = _start_saving(body, background)
+        if job is not None:
+            return _event_stream(_saving_only(job))
     brain = await _ready_brain()
-    # Whose memory: the signed-in person's (mcp_client.web_scope); nobody's without a user_id.
-    scope = mcp_client.web_scope(body.user_id) if body.save_to_memory and body.attachments else ""
+    job = _start_saving(body, background) if saving else None
 
     async def stream() -> AsyncIterator[str]:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + SAVE_BUDGET_SECONDS
-        preparing: Optional[asyncio.Task[list[memory_ingest.Prepared]]] = None
-        saving: Optional[asyncio.Task[list[dict[str, Any]]]] = None
-        if scope:
-            preparing = asyncio.create_task(memory_ingest.prepare(scope, body.attachments), name="jarvis-save-to-memory")
+        delivered = False
         try:
             async with aclosing(
                 _turn(
                     request, brain, body.prompt, body.history, body.user_id, body.app_url, body.speak, body.attachments,
-                    interactive=body.interactive, saving=preparing is not None,
+                    interactive=body.interactive, saving=job is not None,
                 )
             ) as events:
                 async for event in events:
@@ -741,25 +753,6 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
                     if spoken and reply_audio.enabled():
                         yield _sse({"type": "progress", "status": "Recording the spoken reply..."})
                     audio = await asyncio.to_thread(_audio_for, spoken, body.speak)
-                    saved: list[dict[str, Any]] = []
-                    if preparing is not None:
-                        # The reply is ready: the facts (prepared meanwhile) are written now, inside the budget.
-                        name = memory_ingest.source_name(body.attachments[0])
-                        if not preparing.done() or _saved_memories(preparing):
-                            yield _sse({"type": "progress", "status": f"Saving key facts from {name} to memory..."})
-                        async for beat in _heartbeats_until(preparing, deadline):
-                            yield beat
-                        prepared = _saved_memories(preparing) if preparing.done() else []
-                        if not preparing.done():
-                            print(f"[API] Save to Memory: '{name}' was not ready in time; nothing was saved.")
-                        elif prepared and loop.time() < deadline:
-                            saving = asyncio.create_task(memory_ingest.save(scope, prepared), name="jarvis-save-to-memory-write")
-                            async for beat in _heartbeats_until(saving, deadline):
-                                yield beat
-                            if saving.done():
-                                saved = _saved_memories(saving)
-                            else:
-                                print(f"[API] Save to Memory: writing '{name}' ran out of time; nothing was saved.")
                     yield _sse({
                         "type": "final",
                         "node": event.get("node"),
@@ -769,51 +762,66 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse:
                         "spoken_audio_text": spoken or None,
                         "audio": audio.model_dump() if audio else None,
                         "memory_events": event.get("memory_events") or [],
-                        # What Save to Memory wrote from the attached files: [] when it was off or saved nothing.
-                        "saved_memories": saved,
+                        # Save to Memory runs after this reply (ingest_jobs.py): the job to ask about.
+                        "saved_memories": [],
+                        **_ingest_fields(job),
                     })
+                    # Past the yield: the final event went out.
+                    delivered = True
                     return
         finally:
-            # Not done when the reply went out, or the turn failed or was stopped: nothing more is written
-            # (a cancelled write rolls back).
-            for task in (preparing, saving):
-                if task is not None and not task.done():
-                    task.cancel()
+            if job is not None and not delivered:
+                # The turn failed or was stopped before it answered: its file is not saved either.
+                ingest_jobs.cancel(job.id)
 
+    return _event_stream(stream())
+
+
+def _event_stream(events: AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(
-        stream(),
+        events,
         media_type="text/event-stream",
         # No caching, and no buffering by a proxy in between: each event is meant to arrive as it happens.
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-async def _heartbeats_until(task: "asyncio.Task[Any]", deadline: float) -> AsyncIterator[str]:
+def _start_saving(body: ChatRequest, background: BackgroundTasks) -> Optional[ingest_jobs.Job]:
     """
-    Waits for `task` until the loop's clock reaches `deadline`, with a keep-alive comment line after
-    every HEARTBEAT_SECONDS of waiting so nothing in between takes the quiet for a dead connection.
-    The task is left as it is: the caller reads it, or cancels it when it is not done.
+    The Save to Memory job for this message's files, handed to FastAPI's BackgroundTasks (it runs once
+    the response has gone out) - or None when there is nobody to save for (no user_id).
     """
-    loop = asyncio.get_running_loop()
-    while not task.done():
-        left = deadline - loop.time()
-        if left <= 0:
-            return
-        await asyncio.wait({task}, timeout=min(HEARTBEAT_SECONDS, left))
-        if not task.done() and deadline - loop.time() > 0:
-            yield _sse({"type": "heartbeat"})
+    # Whose memory: the signed-in person's (mcp_client.web_scope); nobody's without a user_id.
+    scope = mcp_client.web_scope(body.user_id)
+    if not scope:
+        return None
+    names = [body.user_name] if body.user_name.strip() else []
+    job = ingest_jobs.create(scope, body.attachments, person_names=names)
+    background.add_task(ingest_jobs.run, job.id)
+    print(f"[API] Save to Memory: job {job.id[:8]} for {', '.join(job.source_files)} runs after the reply.")
+    return job
 
 
-def _saved_memories(task: "asyncio.Task[list[Any]]") -> list[Any]:
-    """What a finished Save to Memory step gave (prepared facts, or what was saved); [] for one that
-    failed or was cancelled (memory_ingest's steps never should fail)."""
-    if task.cancelled():
-        return []
-    failure = task.exception()
-    if failure is not None:
-        print(f"[API] Save to Memory failed: {type(failure).__name__}: {failure}")
-        return []
-    return task.result()
+def _ingest_fields(job: Optional[ingest_jobs.Job]) -> dict[str, Any]:
+    """The final event's pointer to a Save to Memory job (nothing without one)."""
+    return {"ingest_job_id": job.id, "ingest_source_files": list(job.source_files)} if job is not None else {}
+
+
+async def _saving_only(job: ingest_jobs.Job) -> AsyncIterator[str]:
+    """The whole answer to a message that only saves its file: one final event, at once, no model."""
+    text = memory_ingest.saving_reply(job.source_files)
+    yield _sse({
+        "type": "final",
+        "node": "Final_Response",
+        "status": "Done",
+        "message": text,
+        "chat_text": text,
+        "spoken_audio_text": None,
+        "audio": None,
+        "memory_events": [],
+        "saved_memories": [],
+        **_ingest_fields(job),
+    })
 
 
 @app.post("/approvals/{approval_id}")
@@ -902,6 +910,22 @@ async def memory_relation_update(relation_id: str, body: RelationUpdate, user_id
 @app.delete("/memory/relations/{relation_id}")
 async def memory_relation_delete(relation_id: str, user_id: MemoryUser = "") -> Any:
     return await _memory(lambda scope: memory_graph.delete_relation(scope, relation_id), user_id)
+
+
+@app.get("/memory/ingest-status/{job_id}")
+async def memory_ingest_status(job_id: str, user_id: MemoryUser = "") -> Any:
+    """
+    A Save to Memory job of /chat (ingest_jobs.py), for the person named by X-Jarvis-User-Id: its state
+    and, once saved, what was saved. Only that person's own job: anyone else's is a 404, like a job this
+    brain no longer knows. Read from this process's memory - no database call.
+    """
+    scope = mcp_client.web_scope(user_id)
+    if not scope:
+        return JSONResponse(status_code=401, content={"code": "no_user", "detail": "Say whose memory this is (X-Jarvis-User-Id)."})
+    found = ingest_jobs.status(job_id[:64], scope)
+    if found is None:
+        return JSONResponse(status_code=404, content={"code": "not_found", "detail": "That save is not known here."})
+    return found
 
 
 # ---- The System Topology page (system_topology.py) ---------------------------

@@ -18,6 +18,7 @@ import type { ReplyAudio } from "./replyAudio";
  *   POST /api/chat/voice (multipart: audio, conversationId?, newConversation?, speak?)   one spoken turn
  *   GET  /api/chat/tools                    the manager's model, the specialist agents and the tool servers
  *   DELETE /api/chat/messages/<id>          deletes one saved message (the person's own)
+ *   GET  /api/memory/ingest-status/<jobId>  how a reply's Save to Memory job is going (`ingestStatus`)
  *
  * `speak: true` asks for the reply to come back with audio too (`audio` in the answer)
  * when it is short enough to be read aloud - see replyAudio.ts.
@@ -66,7 +67,16 @@ export interface TurnData {
   spokenAudioText?: string | null;
   /** What Jarvis's memory really wrote during the turn (memoryNote.ts). Not stored: for this response only. */
   memory?: unknown;
-  /** What Save to Memory read out of the attached file (documentMemory.ts). Not stored: for this response only. */
+  /** What Save to Memory read out of the attached file - from a brain from before the background jobs (documentMemory.ts). */
+  savedMemories?: unknown;
+  /** The Save to Memory job that runs after this reply ({ jobId, sourceFiles, state }; documentMemory.ts). Not stored. */
+  ingest?: unknown;
+}
+
+/** GET /api/memory/ingest-status/<jobId>: how that job is going (checked again by the controller). */
+export interface IngestStatusData {
+  state?: unknown;
+  sourceFiles?: unknown;
   savedMemories?: unknown;
 }
 
@@ -292,6 +302,13 @@ export const chatApi = {
   deleteMessage: (id: string) =>
     request<{ deleted: string }>(`/api/chat/messages/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+    }),
+
+  // A Save to Memory job of a reply: asked every couple of seconds until it is done (chatController.watchIngest).
+  ingestStatus: (jobId: string) =>
+    request<IngestStatusData>(`/api/memory/ingest-status/${encodeURIComponent(jobId)}`, {
+      cache: "no-store",
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     }),
 
