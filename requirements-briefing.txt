@@ -10,7 +10,7 @@
 #
 # Upper bounds on the major version on purpose: this runs unattended every
 # morning, and a breaking major release should fail a pull of the pin, not the
-# 08:00 briefing.
+# 07:05 briefing.
 
 # RSS / Atom feeds (Step 1). The script downloads each feed itself (requests,
 # with a timeout) and hands the bytes to feedparser, which has no timeout of its own.

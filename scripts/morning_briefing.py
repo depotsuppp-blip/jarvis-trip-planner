@@ -11,7 +11,7 @@ today's calendar and current focus, sent to the owner's LINE as one Flex carouse
 
 It runs on its own - no api_server.py, no localhost:8000, nothing from the rest of
 Jarvis is imported - so GitHub Actions can run it every morning while the PC is off
-(.github/workflows/morning-briefing.yml, 08:00 Asia/Bangkok). Dependencies:
+(.github/workflows/morning-briefing.yml, 07:05 Asia/Bangkok). Dependencies:
 requirements-briefing.txt.
 
 THE PIPELINE

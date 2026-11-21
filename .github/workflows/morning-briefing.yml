@@ -1,5 +1,5 @@
 # Jarvis Morning Briefing: Tech & AI news in Thai + today's calendar, pushed to LINE
-# at 08:00 Asia/Bangkok - on GitHub's runners, so the PC can be off.
+# at 07:05 Asia/Bangkok - on GitHub's runners, so the PC can be off.
 # The script and its settings: scripts/morning_briefing.py (docstring at the top).
 #
 # Secrets (Settings -> Secrets and variables -> Actions -> New repository secret):
@@ -18,10 +18,13 @@ name: Morning Briefing
 
 on:
   schedule:
-    # 01:00 UTC = 08:00 in Bangkok (UTC+7 all year). GitHub may start a scheduled
-    # run some minutes late at busy times, and pauses schedules in a public repo
-    # after 60 days without commits (re-enable it on the Actions tab).
-    - cron: '0 1 * * *'
+    # GitHub reads cron in UTC: 00:05 UTC = 07:05 in Bangkok (UTC+7 all year). Five
+    # past, not on the hour: the top of the hour is when GitHub's scheduler is busiest.
+    # It still starts scheduled runs late at busy times, and very late now and then
+    # (2026-11-21: the 01:00 UTC run started at 08:05 UTC, 15:05 in Bangkok), may drop
+    # one, and pauses schedules in a public repo after 60 days without commits
+    # (re-enable it on the Actions tab).
+    - cron: '5 0 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
