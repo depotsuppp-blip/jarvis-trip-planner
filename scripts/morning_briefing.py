@@ -16,10 +16,13 @@ requirements-briefing.txt.
 
 THE PIPELINE
 ------------
-1. News. Every feed in FEEDS is downloaded (requests, with a timeout - feedparser
-   has none) and parsed by feedparser. Items older than WINDOW_HOURS (or undated)
-   are dropped, duplicates are merged by URL and by title, the publishers' own
-   feeds winning over the aggregator (Hacker News). Feeds that time out are
+1. News. Every feed in FEEDS - open-access publishers only, no paywalls - is
+   downloaded (requests, with a timeout - feedparser has none) and parsed by
+   feedparser. Items older than WINDOW_HOURS (or undated) are dropped, and so is
+   every item the reader could not open: a link to a paywalled site
+   (PAYWALL_DOMAINS - Hacker News links anywhere) or feed text that says
+   "subscribers only". Duplicates are merged by URL and by title, the publishers'
+   own feeds winning over the aggregator (Hacker News). Feeds that time out are
    tried once more; a feed that still fails is skipped.
 2. Selection. gpt-4o-mini ranks the candidates and answers with their numbers
    only (a strict JSON schema of integers). Numbers that are not on the list are
@@ -27,9 +30,17 @@ THE PIPELINE
    the model never writes a link. If OpenAI fails, a keyword + recency heuristic
    picks instead.
 3. Summary. Each pick's page is downloaded (timeout, size cap) and trafilatura
-   extracts the article. Paywalled or blocked pages fall back to the feed's own
-   text (Blognone's feed carries the whole article; most carry a teaser) - the
-   card says which one the summary was written from. gpt-4o-mini writes, from that
+   extracts the article. A page behind a paywall is never used, not even through
+   its feed text - "อ่านต่อ" would open the wall: HTTP 402, a 401/403 whose page
+   asks the reader to subscribe or sign in, a redirect to a paywalled site, a
+   page marked not free (schema.org isAccessibleForFree, article:content_tier),
+   one whose visible text says "subscribe to continue reading", "this article is
+   for subscribers"..., or one that asks "already a subscriber?" over a short
+   teaser instead of the article (paywall_signal); the next pick is tried
+   instead. Other blocked pages fall back to the feed's own text (Blognone's
+   page answers 403 to every script, but its feed carries the whole article;
+   most carry a teaser) - the card says which one the summary was written
+   from. gpt-4o-mini writes, from that
    text alone and like a human columnist rather than a template, a kicker (a 2-3
    word beat tag such as AI INFRASTRUCTURE), an optional key stat ("$2B IPO") and
    3-4 natural Thai sentences. Every sentence with a number that is not in the
@@ -137,6 +148,7 @@ FEED_FULL_TEXT_CHARS = 1500  # a feed text this long is the article itself, not 
 MAX_ARTICLE_CHARS = 12000  # what the summary model is given
 MAX_HTML_BYTES = 3_000_000
 PAGE_HEAD_BYTES = 1_000_000  # og:image is looked for in this much of the page (its <head>)
+REFUSAL_BYTES = 262_144      # what is read of a 401/403 page: enough to tell a paywall from a bot wall
 MAX_EVENTS_SHOWN = 5
 MAX_PROJECTS = 3
 
@@ -231,6 +243,14 @@ class Feed:
     kind: str = "publisher"   # "publisher" | "hn" (an aggregator: links to other sites, no text of its own)
 
 
+# Open-access publishers only: every card's "อ่านต่อ" must open the article. Removed 2026-11-23:
+# WIRED and MIT Technology Review (readers hit their metered paywalls) and The Verge (it marks its
+# articles isAccessibleForFree false). Added, each measured free that day: SiliconANGLE (3 AI items in
+# 48 h, full pages), IEEE Spectrum (the whole article in its feed), the Hugging Face blog and Simon
+# Willison's weblog (everything: his posts and link notes - his long entries alone are about one a
+# week). VentureBeat was the spec's first suggestion, but its feeds answer this script HTTP 429
+# (Vercel's bot check), so it is not here. The Decoder stays: it now has THE DECODER+, but marks
+# those articles isAccessibleForFree false (2 of its 10 newest), and paywall_signal drops them.
 # Publishers first: when two feeds carry the same story, the earlier feed's item is kept.
 # Google News is NOT here on purpose (measured 2026-11-20): its links are news.google.com
 # redirects no HTTP client can follow to the article, its descriptions only repeat the
@@ -238,11 +258,12 @@ class Feed:
 # from real text, and the selection model kept picking them. The Decoder replaces it.
 FEEDS: tuple[Feed, ...] = (
     Feed("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/"),
-    Feed("The Verge", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
     Feed("Ars Technica", "https://arstechnica.com/ai/feed/"),
-    Feed("MIT Technology Review", "https://www.technologyreview.com/topic/artificial-intelligence/feed"),
     Feed("The Decoder", "https://the-decoder.com/feed/"),
-    Feed("WIRED", "https://www.wired.com/feed/tag/ai/latest/rss"),
+    Feed("SiliconANGLE", "https://siliconangle.com/category/ai/feed/"),
+    Feed("IEEE Spectrum", "https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss"),
+    Feed("Hugging Face", "https://huggingface.co/blog/feed.xml"),
+    Feed("Simon Willison", "https://simonwillison.net/atom/everything/"),
     Feed("Blognone", "https://www.blognone.com/atom.xml"),
     Feed("Hacker News", "https://hnrss.org/frontpage?points=100", kind="hn"),
 )
@@ -284,6 +305,149 @@ def bangkok_zone() -> tzinfo:
         return ZoneInfo("Asia/Bangkok")
     except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError, or no zoneinfo at all
         return timezone(timedelta(hours=7), "ICT")
+
+
+# =====================================================================
+# Paywalls - a story the reader cannot open is never sent
+# =====================================================================
+
+# Hard and metered paywalls. Hacker News links anywhere, and a metered site's page usually carries
+# the whole article in its HTML - the wall is drawn by script in the reader's browser - so neither the
+# download nor trafilatura notices it. Measured 2026-11-23: WIRED's pages say isAccessibleForFree
+# true and article:content_tier free, MIT Technology Review's carry no such markup at all, and
+# trafilatura read 6-8k characters from each. Only the host gives them away: these hosts (and their
+# subdomains) are left out before the selection model ever sees them.
+PAYWALL_DOMAINS = frozenset(
+    {
+        "wired.com", "wired.co.uk", "technologyreview.com", "theverge.com",
+        "nytimes.com", "wsj.com", "ft.com", "bloomberg.com", "economist.com", "washingtonpost.com",
+        "theinformation.com", "businessinsider.com", "newyorker.com", "theatlantic.com", "barrons.com",
+        "marketwatch.com", "hbr.org", "newscientist.com", "scientificamerican.com", "fortune.com",
+        "theathletic.com", "latimes.com", "bostonglobe.com", "telegraph.co.uk", "thetimes.co.uk",
+        "thetimes.com", "nikkei.com", "scmp.com", "nymag.com", "stratechery.com", "puck.news",
+        "foreignpolicy.com", "foreignaffairs.com", "seekingalpha.com",
+    }
+)
+
+# What a paywall says to the reader (lower case, straight apostrophes, single spaces). Looked for in
+# the page's VISIBLE text only - never in scripts, where free sites keep their sign-in dialogs.
+# Each of these says the article itself is locked: one is enough.
+PAYWALL_PHRASES = (
+    "subscribe to continue reading",
+    "subscribe to keep reading",
+    "subscribe to read the full",
+    "subscribe now to continue reading",
+    "continue reading with",          # The Decoder's wall: "Continue reading with THE DECODER+"
+    "sign in to continue reading",
+    "log in to continue reading",
+    "this article is for subscribers",
+    "this article is only available to subscribers",
+    "this story is for subscribers",
+    "this content is for subscribers",
+    "this post is for subscribers",
+    "this post is for paid subscribers",
+    "this post is for paying subscribers",
+    "available to subscribers only",
+    "for subscribers only",
+    "member-only story",
+    "you have reached your free article limit",
+    "you've reached your free article limit",
+    "you have reached your limit of free articles",
+    "free articles remaining",
+    "free article remaining",
+)
+# These only invite the reader to sign in or subscribe, and free pages print them too: every page of
+# The Decoder, free or not, ends on a THE DECODER+ offer with "Already a subscriber? Sign in"
+# (measured 2026-11-23, 10 of 10 pages; 8 of them carried the whole article). So one counts only
+# where the page does not carry the article: a 401/403 page, or extracted text shorter than
+# WALL_TEASER_CHARS (The Decoder's walls: 816 and 822 characters; its shortest free items: 1456, 1524).
+SUBSCRIBER_PROMPTS = (
+    "already a subscriber",
+    "sign in to read",
+    "log in to read",
+)
+WALL_TEASER_CHARS = 1200
+
+
+def _phrases(phrases: Sequence[str]) -> re.Pattern[str]:
+    return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in phrases) + r")\b")
+
+
+_PAYWALL_PHRASE = _phrases(PAYWALL_PHRASES)
+_SUBSCRIBER_PROMPT = _phrases(SUBSCRIBER_PROMPTS)
+_INVISIBLE = re.compile(r"<!--.*?-->|<(script|style|template|svg|noembed)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+# schema.org's paywall markup (Google's "subscription and paywalled content"): "isAccessibleForFree": false
+_NOT_FREE = re.compile(r"""["']?isAccessibleForFree["']?\s*:\s*["']?(?:false|no)\b""", re.IGNORECASE)
+_META_TAG = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_ATTRIBUTE = re.compile(r"""([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""")
+
+
+def paywalled_host(url: str) -> str:
+    """The PAYWALL_DOMAINS entry `url`'s host belongs to (a subdomain counts), or ""."""
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    return next((domain for domain in PAYWALL_DOMAINS if host == domain or host.endswith("." + domain)), "")
+
+
+def _normal(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").replace("’", "'").replace("‘", "'")).casefold()
+
+
+def paywall_phrase(text: str) -> str:
+    """The paywall phrase (PAYWALL_PHRASES) in a piece of plain text - a page's visible text, a
+    feed's teaser - or ""."""
+    match = _PAYWALL_PHRASE.search(_normal(text))
+    return match.group(0) if match else ""
+
+
+def visible_text(markup: str) -> str:
+    """What a reader sees of a page: no comments, scripts, styles, templates or SVG; no tags."""
+    return html.unescape(re.sub(r"<[^>]+>", " ", _INVISIBLE.sub(" ", markup)))
+
+
+def paywall_signal(raw: bytes | str, article_chars: Optional[int] = 0) -> str:
+    """Why a downloaded page is behind a paywall, or "" when nothing on it says so.
+
+    Strongest first: the publisher's own markup (schema.org isAccessibleForFree false in JSON-LD or
+    microdata, article:content_tier locked or metered), then a wall's words in the visible text
+    ("subscribe to continue reading", "this article is for subscribers" - PAYWALL_PHRASES), then a
+    subscriber prompt ("already a subscriber", "sign in to read" - SUBSCRIBER_PROMPTS) on a page
+    that does not carry the article. `article_chars` is how much article text the page gave
+    (trafilatura): a prompt counts below WALL_TEASER_CHARS; 0 means none (a 401/403 page); None
+    means not known (trafilatura missing), and then a prompt alone never counts.
+    Cautious on purpose, like same_event: a free page wrongly taken for a paywall only costs the
+    next pick on the shortlist; a card whose "อ่านต่อ" opens a wall is the bug."""
+    markup = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    if _NOT_FREE.search(markup):
+        return "marked isAccessibleForFree false"
+    for tag in _META_TAG.findall(markup):
+        values = {m[0].lower(): (m[1] or m[2] or m[3]).strip().lower() for m in _ATTRIBUTE.findall(tag)}
+        key = values.get("property") or values.get("name") or values.get("itemprop") or ""
+        content = values.get("content", "")
+        if key == "isaccessibleforfree" and content in ("false", "no"):
+            return "marked isAccessibleForFree false"
+        if key == "article:content_tier" and content in ("locked", "metered"):
+            return f"content tier {content}"
+    seen = _normal(visible_text(markup))
+    phrase = _PAYWALL_PHRASE.search(seen)
+    if phrase:
+        return f'says "{phrase.group(0)}"'
+    prompt = _SUBSCRIBER_PROMPT.search(seen) if article_chars is not None and article_chars < WALL_TEASER_CHARS else None
+    if prompt:
+        return f'says "{prompt.group(0)}"' + (f" over a {article_chars}-character teaser" if article_chars else "")
+    return ""
+
+
+def feed_paywall(article: "Article") -> str:
+    """Why a feed item would open a paywall, before any page is downloaded: its link is on a
+    paywalled site, or its own text says so. "" when neither."""
+    domain = paywalled_host(article.url)
+    if domain:
+        return f"paywalled site {domain}"
+    phrase = paywall_phrase(f"{article.description} {article.feed_text}")
+    return f'feed text says "{phrase}"' if phrase else ""
 
 
 # =====================================================================
@@ -428,7 +592,7 @@ def fetch_feed(session: Any, feed: Feed, attempts: int = 2) -> Optional[bytes]:
 
 def collect_articles(session: Any, feeds: Sequence[Feed], now: datetime) -> tuple[list[Article], dict[str, int]]:
     raw: list[Article] = []
-    stats = {"feeds_ok": 0, "feeds_failed": 0, "recent": 0}
+    stats = {"feeds_ok": 0, "feeds_failed": 0, "recent": 0, "paywalled": 0}
     for feed in feeds:
         content = fetch_feed(session, feed)
         if content is None:
@@ -443,7 +607,15 @@ def collect_articles(session: Any, feeds: Sequence[Feed], now: datetime) -> tupl
         stats["feeds_ok"] += 1
         raw.extend(items)
     stats["recent"] = len(raw)
-    candidates = number_candidates(dedupe(raw))
+    readable: list[Article] = []
+    for article in raw:
+        reason = feed_paywall(article)
+        if reason:
+            stats["paywalled"] += 1
+            log(f"left out, {reason}: {article.source} | {article.title}")
+        else:
+            readable.append(article)
+    candidates = number_candidates(dedupe(readable))
     stats["candidates"] = len(candidates)
     return candidates, stats
 
@@ -456,6 +628,8 @@ def collect_articles(session: Any, feeds: Sequence[Feed], now: datetime) -> tupl
 # media:content (its pages answer 405), WIRED a media:thumbnail (and a media:content with no
 # URL), TechCrunch / The Verge / MIT Technology Review / The Decoder only og:image, Blognone only
 # <img> tags inside its Atom content (its pages answer 403). Every og:image was 1200-1456 px wide.
+# (WIRED, MIT Technology Review and The Verge are no longer read - see FEEDS.) 2026-11-23: SiliconANGLE,
+# IEEE Spectrum and Hugging Face pages each gave an og:image; Simon Willison's link notes none.
 
 _URL_SAFE = ":/?#[]@!$&'()*+,;=%~"
 _EXTENSION = re.compile(r"\.((?=[a-z0-9]*[a-z])[a-z0-9]{2,5})$")
@@ -817,14 +991,19 @@ def select_story_ids(client: Any, model: str, articles: Sequence[Article], now: 
 @dataclass
 class Page:
     """An article page: its main text (None when blocked, paywalled, not HTML or too short to be
-    the article) and its og:image / twitter:image candidates."""
+    the article), its og:image / twitter:image candidates, and why it is behind a paywall ("" when
+    nothing says so) - a paywalled page is never summarised, not even from its feed text."""
 
     text: Optional[str] = None
     images: tuple[str, ...] = ()
+    paywall: str = ""
 
 
 def extract_article(session: Any, url: str) -> Page:
-    """Downloads the page once: trafilatura's main text and the page's hero image candidates."""
+    """Downloads the page once: trafilatura's main text and the page's hero image candidates - or
+    only why it is paywalled (paywall_signal): HTTP 402, a redirect to a paywalled site, a 401/403
+    whose page is a subscribe / sign-in wall (a 403 without one is a bot wall, as Blognone's, and
+    the feed text may still stand in), or a 200 page that is marked or worded as a paywall."""
     try:
         import trafilatura
     except ImportError:
@@ -837,32 +1016,45 @@ def extract_article(session: Any, url: str) -> Page:
     try:
         response = session.get(url, timeout=ARTICLE_TIMEOUT, stream=True, allow_redirects=True)
         try:
-            if response.status_code != 200 or "html" not in (response.headers.get("Content-Type") or "").lower():
+            status = response.status_code
+            final_url = str(response.url or url)
+            if status == 402:
+                return Page(paywall="HTTP 402 Payment Required")
+            domain = paywalled_host(final_url)
+            if domain:
+                return Page(paywall=f"redirected to paywalled site {domain}")
+            if status not in (200, 401, 403) or "html" not in (response.headers.get("Content-Type") or "").lower():
                 return Page()
+            limit = MAX_HTML_BYTES if status == 200 else REFUSAL_BYTES
             chunks, total = [], 0
             for chunk in response.iter_content(65536):
                 chunks.append(chunk)
                 total += len(chunk)
-                if total > MAX_HTML_BYTES or time.monotonic() - started > ARTICLE_DEADLINE:
+                if total > limit or time.monotonic() - started > ARTICLE_DEADLINE:
                     break
-            final_url = str(response.url or url)
         finally:
             response.close()
     except Exception as exc:  # noqa: BLE001 - any failure means "use the feed text"
         log(f"article download failed: {type(exc).__name__}")
         return Page()
     raw = b"".join(chunks)
-    images = page_images(raw, final_url)
+    if status != 200:
+        signal = paywall_signal(raw, 0)  # a refusal carries no article: a sign-in prompt on it is the wall
+        return Page(paywall=f"HTTP {status}, {signal}") if signal else Page()
     if trafilatura is None:
         log("trafilatura is not installed; summaries use the feed text")
-        return Page(None, images)
+        signal = paywall_signal(raw, None)
+        return Page(paywall=signal) if signal else Page(None, page_images(raw, final_url))
     try:
         text = trafilatura.extract(raw, url=final_url, include_comments=False, include_tables=False, favor_precision=True, deduplicate=True)
     except Exception as exc:  # noqa: BLE001
         log(f"article extraction failed: {type(exc).__name__}")
         text = None
     text = (text or "").strip()
-    return Page(text[:MAX_ARTICLE_CHARS] if len(text) >= MIN_ARTICLE_CHARS else None, images)
+    signal = paywall_signal(raw, len(text))
+    if signal:
+        return Page(paywall=signal)
+    return Page(text[:MAX_ARTICLE_CHARS] if len(text) >= MIN_ARTICLE_CHARS else None, page_images(raw, final_url))
 
 
 ImageCheck = Callable[[Any, str], tuple[bool, str]]
@@ -1068,8 +1260,9 @@ def build_stories(
 ) -> list[Story]:
     """Walks the shortlist in rank order: picks with the full text first, then the best of the rest
     that at least has a feed description. A pick with neither (a Hacker News link that would not
-    open) is left out: a summary of a bare headline would be invented. The chosen stories then get
-    their hero image (choose_image)."""
+    open) is left out: a summary of a bare headline would be invented; so is a pick whose page is
+    behind a paywall (Page.paywall), whatever its feed carries. The chosen stories then get their
+    hero image (choose_image)."""
     extract = extract or extract_article
     by_id = {article.id: article for article in articles}
     pages: dict[int, Page] = {}
@@ -1084,6 +1277,10 @@ def build_stories(
             log(f"#{article.id} {article.source}: same event as #{twin.id}, skipped")
             continue
         page = extract(session, article.url) or Page()
+        if page.paywall:
+            # Not even from the feed text: the card's link would open the wall.
+            log(f"#{article.id} {article.source}: paywall ({page.paywall}), skipped")
+            continue
         pages[article.id] = page
         body = page.text
         if not body and len(article.feed_text) >= FEED_FULL_TEXT_CHARS:
@@ -1793,7 +1990,8 @@ def print_report(stories: Sequence[Story], context: DailyContext, message: dict,
     out.write(f"=== {message['altText']} (dry run: nothing sent) ===\n")
     out.write(
         f"feeds ok {stats.get('feeds_ok', 0)}, failed {stats.get('feeds_failed', 0)}; "
-        f"{stats.get('recent', 0)} recent items, {stats.get('candidates', 0)} after de-duplication; "
+        f"{stats.get('recent', 0)} recent items, {stats.get('paywalled', 0)} paywalled, "
+        f"{stats.get('candidates', 0)} after de-duplication; "
         f"picked by {stats.get('picked_by', '-')}\n\n"
     )
     for number, story in enumerate(stories, start=1):
@@ -1862,7 +2060,10 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
     session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9,th;q=0.8"})
 
     articles, stats = collect_articles(session, FEEDS, now)
-    log(f"feeds ok {stats['feeds_ok']}, failed {stats['feeds_failed']}; {stats['recent']} recent items, {stats['candidates']} candidates")
+    log(
+        f"feeds ok {stats['feeds_ok']}, failed {stats['feeds_failed']}; {stats['recent']} recent items, "
+        f"{stats['paywalled']} paywalled, {stats['candidates']} candidates"
+    )
     ranked, picked_by = select_story_ids(client, model, articles, now)
     stats["picked_by"] = picked_by
     log(f"shortlist ({picked_by}): {ranked}")

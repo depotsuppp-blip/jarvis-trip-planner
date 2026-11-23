@@ -14,6 +14,12 @@ What is checked:
 - RSS / Atom parsing: the recency window, undated and non-http items dropped, HTML cleaned,
   Hacker News text dropped, full-text feeds, de-duplication publishers-first, one retry
   for a feed that timed out.
+- Paywalls: the feed list holds open-access publishers only (no WIRED, MIT Technology
+  Review or The Verge); links to paywalled sites and "subscribers only" feed teasers never
+  reach the selection; a page that is HTTP 402, a 401/403 sign-in wall, a redirect to a
+  paywalled site, marked not free (isAccessibleForFree, article:content_tier) or worded as a
+  wall is skipped - even when its feed carries the whole text - while a 403 bot wall and a free
+  page with a subscription offer on it (The Decoder's) are not taken for paywalls.
 - URL integrity: the model can only answer with numbers; made-up numbers, URLs, bools are
   dropped; every link in the Flex message is a URL a feed gave; summary sentences with a
   link or an unverifiable number are removed.
@@ -556,6 +562,199 @@ class ImageTests(unittest.TestCase):
             page = mb.extract_article(session, "https://news.example/story")
             self.assertEqual(page, mb.Page(None, ("https://cdn.example/og.jpg",)))
             self.assertEqual(mb.extract_article(FakeSession(), "https://gone.example/"), mb.Page())
+
+
+# =====================================================================
+# Paywalls - a story the reader cannot open is never sent
+# =====================================================================
+
+
+def html_response(status: int, body: str, url: str = "") -> FakeResponse:
+    return FakeResponse(status, content=body.encode("utf-8"), headers={"Content-Type": "text/html; charset=utf-8"}, url=url)
+
+
+def article_page(head: str = "", body: str = "") -> str:
+    return f"<html><head><title>A story</title>{head}</head><body><article><p>{LONG_TEXT}</p></article>{body}</body></html>"
+
+
+# The Decoder's free pages, as measured 2026-11-23: the whole article, then a THE DECODER+ offer.
+DECODER_OFFER = (
+    "<div class='plus-box'><h3>THE DECODER+</h3><p>AI News Without the Hype – Curated by Humans</p>"
+    "<ul><li>Every Plus article and the full archive</li><li>No ad banners</li></ul>"
+    "<a href='/plus'>Subscribe monthly</a><p>Already a subscriber? <a href='/login'>Sign in</a></p></div>"
+)
+
+
+class PaywallTests(unittest.TestCase):
+    def test_the_feed_list_is_open_access_only(self):
+        names = [feed.name for feed in mb.FEEDS]
+        for gone in ("WIRED", "MIT Technology Review", "The Verge"):
+            self.assertNotIn(gone, names)
+        for kept in ("TechCrunch", "The Decoder", "Ars Technica", "Blognone", "Hacker News", "Hugging Face", "Simon Willison"):
+            self.assertIn(kept, names)
+        self.assertEqual(len(set(names)), len(names))
+        for feed in mb.FEEDS:
+            self.assertTrue(feed.url.startswith("https://"), feed.name)
+            self.assertEqual(mb.paywalled_host(feed.url), "", feed.name)
+        self.assertEqual([feed.kind for feed in mb.FEEDS].count("hn"), 1)
+        self.assertEqual(mb.FEEDS[-1].kind, "hn")  # publishers first: dedupe keeps the earlier feed's item
+
+    def test_paywalled_hosts(self):
+        cases = {
+            "https://www.wired.com/story/banks-are-cracking-down-on-ai-agents/": "wired.com",
+            "https://www.technologyreview.com/2026/11/20/1149399/x/": "technologyreview.com",
+            "https://www.theverge.com/tech/1039851/major-tech-outages": "theverge.com",
+            "https://www.nytimes.com/2026/11/20/technology/x.html": "nytimes.com",
+            "https://WWW.WSJ.COM/tech/x": "wsj.com",
+            "https://on.ft.com/3xyz": "ft.com",                 # a subdomain counts
+            "https://www.microsoft.com/en-us/research/x": "",   # ends in "ft.com", is not ft.com
+            "https://notwired.com/x": "",
+            "https://techcrunch.com/2026/11/20/x/": "",
+            "https://the-decoder.com/x/": "",
+            "not a url": "",
+            "http://[::1": "",
+        }
+        for url, domain in cases.items():
+            self.assertEqual(mb.paywalled_host(url), domain, url)
+
+    def test_a_walls_words_in_the_visible_text(self):
+        for words, phrase in (
+            ("Subscribe to continue reading.", "subscribe to continue reading"),
+            ("<h3>THE DECODER+</h3><p>Continue reading with THE DECODER+</p>", "continue reading with"),
+            ("This article is for <b>subscribers</b> only", "this article is for subscribers"),
+            ("You’ve reached your free article limit", "you've reached your free article limit"),  # curly apostrophe
+            ("You have 2 free&nbsp;articles remaining", "free articles remaining"),
+            ("Member-only story", "member-only story"),
+            ("THIS POST IS FOR PAID SUBSCRIBERS", "this post is for paid subscribers"),
+        ):
+            # Even on a page that carries the whole text: a metered page sends it all and hides it.
+            self.assertEqual(mb.paywall_signal(article_page(body=f"<div>{words}</div>").encode(), len(LONG_TEXT)), f'says "{phrase}"', words)
+
+    def test_the_publishers_own_markup(self):
+        for head in (
+            "<script type='application/ld+json'>{\"@type\":\"NewsArticle\",\"isAccessibleForFree\":false}</script>",
+            "<script type=\"application/ld+json\">{\"isAccessibleForFree\": \"False\", \"hasPart\": {\"cssSelector\": \".paywall\"}}</script>",
+            "<meta itemprop='isAccessibleForFree' content='false'>",
+            "<meta property=\"article:content_tier\" content=\"locked\">",
+            "<meta content='metered' property='article:content_tier'>",
+        ):
+            self.assertNotEqual(mb.paywall_signal(article_page(head), len(LONG_TEXT)), "", head)
+        for head in (
+            "<script type='application/ld+json'>{\"isAccessibleForFree\":true}</script>",
+            "<meta property='article:content_tier' content='free'>",
+        ):
+            self.assertEqual(mb.paywall_signal(article_page(head), len(LONG_TEXT)), "", head)
+
+    def test_a_subscriber_prompt_counts_only_where_the_article_is_missing(self):
+        free_with_offer = article_page(body=DECODER_OFFER).encode()
+        self.assertEqual(mb.paywall_signal(free_with_offer, 4198), "")  # The Decoder's free article
+        self.assertEqual(mb.paywall_signal(free_with_offer, mb.WALL_TEASER_CHARS), "")
+        self.assertEqual(mb.paywall_signal(free_with_offer, 822), 'says "already a subscriber" over a 822-character teaser')
+        self.assertEqual(mb.paywall_signal(free_with_offer, 0), 'says "already a subscriber"')
+        self.assertEqual(mb.paywall_signal(free_with_offer, None), "")  # how much text it had is not known
+        login = article_page(body="<p>Sign in to read the rest of this story.</p>")
+        self.assertEqual(mb.paywall_signal(login, 300), 'says "sign in to read" over a 300-character teaser')
+
+    def test_words_outside_the_visible_text_do_not_count(self):
+        page = article_page(
+            head=(
+                "<script>window.dialog = 'Already a subscriber? Subscribe to continue reading';</script>"
+                "<style>.wall:after { content: 'This article is for subscribers'; }</style>"
+            ),
+            body="<!-- Subscribe to continue reading --><template><p>Member-only story</p></template>"
+            "<aside>Subscribe to our newsletter for the week's AI news.</aside>",
+        )
+        self.assertEqual(mb.paywall_signal(page.encode(), 0), "")
+        self.assertEqual(mb.paywall_signal(b"", 0), "")
+
+    def test_extract_article_reports_the_wall_instead_of_the_text(self):
+        cases = {
+            "https://a.example/": (FakeResponse(402), "HTTP 402 Payment Required"),
+            "https://b.example/": (
+                html_response(403, "<html><body><h1>Already a subscriber?</h1><p>Sign in.</p></body></html>"),
+                'HTTP 403, says "already a subscriber"',
+            ),
+            "https://c.example/": (html_response(401, "<html><body>Sign in to read this article</body></html>"), 'HTTP 401, says "sign in to read"'),
+            "https://d.example/": (html_response(200, article_page(body="<div>Subscribe to continue reading</div>")), 'says "subscribe to continue reading"'),
+            "https://e.example/": (
+                html_response(200, article_page("<script type='application/ld+json'>{\"isAccessibleForFree\":false}</script>")),
+                "marked isAccessibleForFree false",
+            ),
+            "https://f.example/": (html_response(200, article_page(), url="https://www.nytimes.com/2026/11/20/x.html"), "redirected to paywalled site nytimes.com"),
+        }
+        session = FakeSession({("GET", url): answer for url, (answer, _) in cases.items()})
+        with contextlib.redirect_stderr(io.StringIO()):
+            for url, (_, reason) in cases.items():
+                page = mb.extract_article(session, url + "story")
+                self.assertEqual(page.paywall, reason, url)
+                self.assertIsNone(page.text, url)
+
+    def test_a_bot_wall_or_a_free_page_is_not_a_paywall(self):
+        # Blognone's pages answer 403 to scripts; its feed carries the article, so the feed text stands in.
+        challenge = "<html><head><title>Just a moment...</title></head><body>Checking your browser before accessing.</body></html>"
+        paragraphs = "".join(f"<p>Part {n} of the story. {LONG_TEXT[:300]}</p>" for n in range(1, 9))
+        free_page = f"<html><head><title>A free story</title></head><body><article>{paragraphs}</article>{DECODER_OFFER}</body></html>"
+        session = FakeSession(
+            {
+                ("GET", "https://www.blognone.com/"): html_response(403, challenge),
+                ("GET", "https://the-decoder.com/"): html_response(200, free_page),
+            }
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(mb.extract_article(session, "https://www.blognone.com/node/1"), mb.Page())
+            page = mb.extract_article(session, "https://the-decoder.com/free-story/")
+        self.assertEqual(page.paywall, "")
+        if importlib.util.find_spec("trafilatura") is not None:
+            self.assertIn("81.3 billion dollars", page.text or "")
+
+    @needs_feedparser
+    def test_paywalled_links_and_teasers_never_reach_the_selection(self):
+        publisher = rss(
+            [
+                {"title": "Open models get a new benchmark", "link": "https://pub.example/bench", "published": NOW - timedelta(hours=1), "description": "Agents everywhere, and a long story about them."},
+                {"title": "Inside the model race", "link": "https://pub.example/race", "published": NOW - timedelta(hours=3), "description": "This article is for subscribers only. Subscribe today."},
+                {"title": "A free story with an offer", "link": "https://pub.example/offer", "published": NOW - timedelta(hours=4), "description": "The story. Already a subscriber? Sign in."},
+            ]
+        )
+        aggregator = rss(
+            [
+                {"title": "Chip export rules tighten", "link": "https://www.wsj.com/tech/chips-123", "published": NOW - timedelta(hours=2)},
+                {"title": "Banks crack down on AI agents", "link": "https://www.wired.com/story/banks/", "published": NOW - timedelta(hours=2)},
+                {"title": "Show HN: a free tool", "link": "https://github.com/someone/tool", "published": NOW - timedelta(hours=5)},
+            ]
+        )
+        session = FakeSession(
+            {("GET", "https://pub.example/feed"): FakeResponse(200, content=publisher), ("GET", "https://hn.example/feed"): FakeResponse(200, content=aggregator)}
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            candidates, stats = mb.collect_articles(
+                session, [mb.Feed("Test", "https://pub.example/feed"), mb.Feed("Hacker News", "https://hn.example/feed", kind="hn")], NOW
+            )
+        self.assertEqual(
+            sorted(a.url for a in candidates),
+            ["https://github.com/someone/tool", "https://pub.example/bench", "https://pub.example/offer"],  # an offer in a teaser is not a wall
+        )
+        self.assertEqual((stats["recent"], stats["paywalled"], stats["candidates"]), (6, 3, 3))
+        log = err.getvalue()
+        self.assertIn("left out, paywalled site wsj.com: Hacker News | Chip export rules tighten", log)
+        self.assertIn('left out, feed text says "this article is for subscribers": Test | Inside the model race', log)
+
+    def test_build_stories_skips_a_paywalled_pick_even_with_its_whole_text_in_the_feed(self):
+        articles = [
+            make_article(1, "OpenAI ships a reasoning model", "https://plus.example/1", feed_text=LONG_TEXT * 2),
+            make_article(2, "EU passes AI liability rules", "https://free.example/2"),
+            make_article(3, "Nvidia unveils a faster chip", "https://free.example/3"),
+        ]
+
+        def extract(session: Any, url: str) -> Any:
+            return mb.Page(paywall="marked isAccessibleForFree false") if url.startswith("https://plus.example/") else mb.Page(LONG_TEXT)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            stories = mb.build_stories(None, None, "m", articles, [1, 2, 3], 2, extract=extract, check=lambda s, u: (False, "no"))
+        self.assertEqual([s.article.id for s in stories], [2, 3])
+        self.assertIn("#1 TechCrunch: paywall (marked isAccessibleForFree false), skipped", err.getvalue())
 
 
 
@@ -1166,13 +1365,28 @@ class MainRunTests(unittest.TestCase):
         )
         self.client = FakeOpenAI(selection={"ids": [2, 1]}, summary=SUMMARY)
 
-    def run_main(self, argv: list[str], env: dict) -> tuple[int, str, str]:
+    def run_main(self, argv: list[str], env: dict, extract: Optional[Callable[[Any, str], Any]] = None) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(mb.requests, "Session", return_value=self.session), mock.patch.object(
             mb, "make_openai_client", return_value=self.client
-        ), mock.patch.object(mb, "extract_article", return_value=mb.Page(LONG_TEXT)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        ), mock.patch.object(mb, "extract_article", side_effect=extract or (lambda session, url: mb.Page(LONG_TEXT))), contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(err):
             code = mb.main(argv, env=env)
         return code, out.getvalue(), err.getvalue()
+
+    def test_a_paywalled_top_pick_never_reaches_the_message(self):
+        # The model ranks the EU story first; its page turns out to be a wall, so only the other story goes out.
+        def extract(session: Any, url: str) -> Any:
+            return mb.Page(paywall='says "subscribe to continue reading"') if url == "https://tc.example/eu" else mb.Page(LONG_TEXT)
+
+        code, out, err = self.run_main(["--dry-run"], {"OPENAI_API_KEY": "sk-test"}, extract)
+        self.assertEqual(code, 0, err)
+        self.assertIn('#2 TechCrunch: paywall (says "subscribe to continue reading"), skipped', err)
+        message = json.loads(out[out.index("{", out.index("--- LINE Flex Message")):])
+        self.assertEqual(list(all_uris(message)), ["https://tc.example/openai"] * 2)  # the photo block and "อ่านต่อ →"
+        self.assertNotIn("tc.example/eu", out)
+        self.assertIn("0 paywalled", out)
 
     def test_dry_run_with_no_optional_settings(self):
         code, out, err = self.run_main(["--dry-run"], {"OPENAI_API_KEY": "sk-test"})
